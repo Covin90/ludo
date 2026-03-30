@@ -5075,7 +5075,11 @@ class AutoSyncManager:
                         if network_responding:
                             # Use content path from GET_STATUS (instant, no race condition)
                             # Fall back to history file if GET_STATUS didn't include a path
+                            self.log(f"🔍 DEBUG: network_content_path='{network_content_path}'")
+
                             current_content = network_content_path or self.get_retroarch_current_game()
+                            self.log(f"🔍 DEBUG: current_content (after fallback)='{current_content}'")
+
                             if current_content:
                                 # For display: use filename if path, strip CRC if content label
                                 display_name = Path(current_content).name if '/' in current_content else current_content.split(',crc32=')[0]
@@ -5229,23 +5233,36 @@ class AutoSyncManager:
         Expected format: "GET_STATUS PLAYING corename,/path/to/content"
         """
         try:
+            # DEBUG: Log the raw response
+            self.log(f"🔍 DEBUG: GET_STATUS response: '{status_response}'")
+
             # Split into parts: ["GET_STATUS", "PLAYING", "corename,/path/to/content"]
             parts = status_response.split(' ', 2)
+            self.log(f"🔍 DEBUG: Split parts: {parts}")
+
             if len(parts) < 3:
+                self.log(f"🔍 DEBUG: Not enough parts ({len(parts)} < 3)")
                 return None
 
             core_and_path = parts[2]
+            self.log(f"🔍 DEBUG: core_and_path: '{core_and_path}'")
+
             # Split on first comma: core name vs content path
             comma_idx = core_and_path.find(',')
             if comma_idx < 0:
+                self.log(f"🔍 DEBUG: No comma found in core_and_path")
                 return None
 
             content_path = core_and_path[comma_idx + 1:].strip()
+            self.log(f"🔍 DEBUG: Extracted content_path: '{content_path}'")
+
             if not content_path or content_path == 'N/A':
+                self.log(f"🔍 DEBUG: content_path is empty or N/A")
                 return None
 
             return content_path
-        except Exception:
+        except Exception as e:
+            self.log(f"🔍 DEBUG: Exception in _parse_content_path_from_status: {e}")
             return None
 
     def get_retroarch_current_game(self):
@@ -5324,13 +5341,27 @@ class AutoSyncManager:
             games = self.get_games()
             matching_game = None
 
+            # DEBUG: Log what we're trying to match
+            self.log(f"🔍 DEBUG: Matching ROM - is_content_label={is_content_label}, rom_filename={rom_filename}, rom_stem={rom_stem}")
+
             for game in games:
                 game_filename = game.get('file_name', '')
                 game_stem = Path(game_filename).stem if game_filename else ''
+                game_name = game.get('name', '')
+
+                # DEBUG: Log comparison for each game
+                if is_content_label:
+                    self.log(f"🔍 DEBUG:   Checking game: file_name='{game_filename}', stem='{game_stem}', name='{game_name}'")
+                    self.log(f"🔍 DEBUG:   Comparing rom_stem '{rom_stem}' vs game_stem '{game_stem}': {game_stem == rom_stem}")
+                    self.log(f"🔍 DEBUG:   Comparing rom_stem '{rom_stem}' vs game_name '{game_name}': {game_name == rom_stem}")
+
                 if rom_filename and (game_filename == rom_filename or game_stem == rom_stem):
+                    self.log(f"✅ DEBUG: Matched via file_name/stem!")
                     matching_game = game
                     break
                 elif is_content_label and (game_stem == rom_stem or game.get('name', '') == rom_stem):
+                    match_type = "game_stem" if game_stem == rom_stem else "game_name (IGDB)"
+                    self.log(f"✅ DEBUG: Matched via {match_type}!")
                     matching_game = game
                     break
 
@@ -5587,38 +5618,157 @@ class AutoSyncManager:
             games = self.get_games()
             if not games:
                 return None
-            
+
             save_basename = file_path.stem
-            
+
             # Remove timestamps and clean up filename
             import re
             clean_basename = re.sub(r'\s*\[.*?\]', '', save_basename)
-            
-            # Try to match against game library
+
+            # DEBUG: Log what we're trying to match
+            self.log(f"🔍 DEBUG: find_rom_id_for_save_file - save_basename='{save_basename}', clean_basename='{clean_basename}'")
+
+            # TIER 1: Try exact match with fs_name_no_ext
             for game in games:
                 if not game.get('rom_id') or not game.get('romm_data'):
                     continue
-                
-                # Try exact match with fs_name_no_ext
+
                 rom_data = game['romm_data']
                 fs_name_no_ext = rom_data.get('fs_name_no_ext', '')
-                
+
                 if fs_name_no_ext and (fs_name_no_ext == save_basename or fs_name_no_ext == clean_basename):
+                    self.log(f"✅ DEBUG: Exact match found with fs_name_no_ext!")
                     return game['rom_id']
-                
-                # Try fuzzy match (remove region tags)
+
+            # TIER 2: Try region-aware matching (NEW)
+            # Extract region tag from save filename
+            save_region = self._extract_region_tag(clean_basename)
+
+            if save_region:
+                self.log(f"🔍 DEBUG: Extracted region from save: '{save_region}'")
+
+                # Get base name (without region tag) from save file
+                save_base_name = re.sub(r'\s*\(.*?\)', '', clean_basename).strip()
+
+                # Find all games matching base name
+                region_candidates = []
+                for game in games:
+                    if not game.get('rom_id') or not game.get('romm_data'):
+                        continue
+
+                    rom_data = game['romm_data']
+                    fs_name_no_ext = rom_data.get('fs_name_no_ext', '')
+
+                    if not fs_name_no_ext:
+                        continue
+
+                    # Get base name from game (without region tags)
+                    game_base_name = re.sub(r'\s*\(.*?\)', '', fs_name_no_ext).strip()
+
+                    # If base names match (case-insensitive), this is a candidate
+                    if game_base_name.lower() == save_base_name.lower():
+                        game_region = self._extract_region_tag(fs_name_no_ext)
+                        region_candidates.append({
+                            'game': game,
+                            'region': game_region,
+                            'fs_name_no_ext': fs_name_no_ext
+                        })
+
+                # If we have candidates, prefer region match
+                if region_candidates:
+                    self.log(f"🔍 DEBUG: Found {len(region_candidates)} region candidates")
+
+                    # First pass: exact region match
+                    for candidate in region_candidates:
+                        if candidate['region'] == save_region:
+                            self.log(f"✅ DEBUG: Region match found! save='{save_region}', game='{candidate['region']}'")
+                            return candidate['game']['rom_id']
+
+                    # Second pass: if no exact region match, use first candidate
+                    self.log(f"⚠️ DEBUG: No exact region match, using first candidate")
+                    return region_candidates[0]['game']['rom_id']
+
+            # TIER 3: Fuzzy match fallback (unchanged)
+            for game in games:
+                if not game.get('rom_id') or not game.get('romm_data'):
+                    continue
+
+                rom_data = game['romm_data']
+                fs_name_no_ext = rom_data.get('fs_name_no_ext', '')
+
+                # Remove all parenthetical content for fuzzy matching
                 clean_game_name = re.sub(r'\s*\(.*?\)', '', fs_name_no_ext).strip()
                 clean_save_name = re.sub(r'\s*\(.*?\)', '', clean_basename).strip()
-                
+
+                self.log(f"🔍 DEBUG:   Fuzzy: clean_game_name='{clean_game_name}' vs clean_save_name='{clean_save_name}'")
+
                 if clean_game_name and clean_game_name.lower() == clean_save_name.lower():
+                    self.log(f"✅ DEBUG: Fuzzy match found!")
                     return game['rom_id']
-            
+
+            self.log(f"❌ DEBUG: No match found for save file '{save_basename}'")
             return None
-            
+
         except Exception as e:
             self.log(f"ROM matching error: {e}")
             return None
-    
+
+    def _extract_region_tag(self, filename):
+        """
+        Extract region tag from ROM/save filename.
+
+        Recognizes patterns like:
+        - (USA)
+        - (Europe)
+        - (Japan)
+        - (World)
+        - (Europe) (En,Fr,De,Es,It)  # Takes first region tag
+        - (USA) (Rev 1)               # Takes first region tag
+        - (USA, Europe)               # Takes first region
+
+        Returns: Normalized region string (e.g., 'USA', 'Europe', 'Japan')
+                 or None if no recognized region tag found
+        """
+        import re
+
+        # Extract all parenthetical groups
+        paren_groups = re.findall(r'\(([^)]+)\)', filename)
+
+        if not paren_groups:
+            return None
+
+        # Known region tags (case-insensitive)
+        known_regions = {
+            'usa': 'USA',
+            'europe': 'Europe',
+            'japan': 'Japan',
+            'world': 'World',
+            'asia': 'Asia',
+            'china': 'China',
+            'korea': 'Korea',
+            'brazil': 'Brazil',
+            'australia': 'Australia',
+            'germany': 'Germany',
+            'france': 'France',
+            'spain': 'Spain',
+            'italy': 'Italy',
+            'netherlands': 'Netherlands',
+            'sweden': 'Sweden',
+            'uk': 'UK',
+        }
+
+        # Check each parenthetical group for region tags
+        for group in paren_groups:
+            # Split on comma to handle "(USA, Europe)" style
+            parts = [p.strip() for p in group.split(',')]
+
+            for part in parts:
+                part_lower = part.lower()
+                if part_lower in known_regions:
+                    return known_regions[part_lower]
+
+        return None
+
     def upload_saves_for_game_session(self, game_name):
         """Upload saves for a game that was just closed"""
         # TODO: Find and upload recent save files for this game
