@@ -14,7 +14,7 @@ try:
         SettingsManager, RomMClient, RetroArchInterface,
         AutoSyncManager, CollectionSyncManager,
         GameListPollingManager, BiosTrackingManager,
-        SteamShortcutManager,
+        SteamShortcutManager, CoverArtManager,
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
     )
     SYNC_CORE_AVAILABLE = True

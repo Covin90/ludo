@@ -33,6 +33,23 @@ This will:
 
 The output zip is at the **repo root**: `romm-sync-monitor.zip`
 
+### Release Naming Convention
+
+For GitHub releases, rename the ZIP to follow the project's naming convention:
+
+```
+RomM-RetroArch-Sync-v<VERSION>-decky.zip
+```
+
+Example: `RomM-RetroArch-Sync-v1.5-decky.zip`
+
+After building, rename with:
+```bash
+mv romm-sync-monitor.zip RomM-RetroArch-Sync-v1.5-decky.zip
+```
+
+This matches the AppImage naming pattern: `RomM-RetroArch-Sync-v<VERSION>.AppImage`
+
 ---
 
 ## Required files in the ZIP
@@ -85,7 +102,7 @@ romm-sync-monitor/
 
 ## Installation on SteamOS
 
-1. Transfer `romm-sync-monitor.zip` to the SteamOS device
+1. Transfer the ZIP file (e.g., `RomM-RetroArch-Sync-v1.5-decky.zip`) to the SteamOS device
 2. In Decky Loader: **gear icon → "Install plugin from ZIP"**
 3. Select the zip file
 
@@ -96,10 +113,10 @@ Do **not** restart Decky Loader after installation — use the Decky QAM reload 
 If `sshpass` is installed and the Deck is reachable, you can send the zip directly:
 
 ```bash
-sshpass -p "<password>" scp romm-sync-monitor.zip deck@<deck-ip>:~/
+sshpass -p "<password>" scp RomM-RetroArch-Sync-v1.5-decky.zip deck@<deck-ip>:~/
 ```
 
-Then install from `~/romm-sync-monitor.zip` on the Deck via Decky Loader.
+Then install from `~/RomM-RetroArch-Sync-v1.5-decky.zip` on the Deck via Decky Loader.
 
 ---
 

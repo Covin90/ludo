@@ -87,14 +87,20 @@ class GameDataCache:
         # CRITICAL: Load platform mapping FIRST so it's available when processing cached games
         self.platform_mapping = self.load_platform_mapping()
         self.filename_mapping = self.load_filename_mapping()
-        self.cached_games = self.load_games_cache()
+        self.original_total = 0  # Initialize BEFORE load_games_cache (will be set by load)
+        self.cached_games = self.load_games_cache()  # This sets original_total from cache
     
-    def save_games_data(self, games_data):
-        """Non-blocking cache save with memory optimization"""
+    def save_games_data(self, games_data, original_total=None):
+        """Non-blocking cache save with memory optimization
+
+        Args:
+            games_data: List of game dictionaries (after grouping)
+            original_total: Optional original ungrouped ROM count from server
+        """
         import threading
         import time
         import gc  # Add this import
-        
+
         def save_in_background():
             try:
                 start_time = time.time()
@@ -114,14 +120,16 @@ class GameDataCache:
                         'local_size': game.get('local_size', 0),
                         'romm_data': game.get('romm_data', {}),  # Already cleaned by step 1
                         'is_multi_disc': game.get('is_multi_disc', False),  # Preserve multi-disc flag
-                        'discs': game.get('discs', [])  # Preserve disc data for multi-disc games
+                        'discs': game.get('discs', []),  # Preserve disc data for multi-disc games
+                        '_sibling_files': game.get('_sibling_files', [])  # Preserve regional variants
                     }
                     processed_games.append(clean_game)
                 
                 cache_data = {
                     'timestamp': time.time(),
                     'games': processed_games,  # Use cleaned data
-                    'count': len(processed_games)
+                    'count': len(processed_games),
+                    'original_total': original_total if original_total is not None else len(processed_games)
                 }
                 
                 # Force garbage collection
@@ -164,6 +172,25 @@ class GameDataCache:
 
             games = cache_data.get('games', [])
 
+            # Load original ungrouped count from cache (for accurate server comparison)
+            self.original_total = cache_data.get('original_total', len(games))
+            print(f"🔍 CACHE LOAD: Read original_total={self.original_total} from cache, len(games)={len(games)}")
+
+            # Detect old/invalid cache: if original_total equals grouped count AND
+            # the cache doesn't explicitly have an original_total field (old cache format)
+            # Only force refresh if original_total field is MISSING from cache
+            has_original_total_field = 'original_total' in cache_data
+            if not has_original_total_field and len(games) > 0:
+                # Old cache format (before fix) - no original_total field
+                print(f"⚠️ Old cache format detected (no original_total field) - marking for refresh")
+                self.original_total = 0  # Force refresh by making count check fail
+                print(f"🔍 CACHE LOAD: Set original_total to 0 (forced refresh)")
+            elif has_original_total_field and self.original_total == len(games):
+                # Only warn if original_total equals grouped count but is suspicious
+                # (This could be valid if there are no regional variants)
+                print(f"ℹ️ Cache has original_total == grouped count ({self.original_total})")
+                # Don't force refresh - this could be valid (no regional variants)
+
             # CRITICAL: Always resolve platform names from platform_slug using the mapping
             # This ensures cached games display proper names even if they were cached with slugs
             for game in games:
@@ -173,7 +200,7 @@ class GameDataCache:
                         # Use mapping to get proper platform name (fallback mapping always available)
                         game['platform'] = self.get_platform_name(platform_slug)
 
-            print(f"📂 Loaded {len(games)} games from cache")
+            print(f"📂 Loaded {len(games)} games from cache (original total: {self.original_total})")
             return games
             
         except Exception as e:
@@ -755,7 +782,7 @@ class SettingsManager:
                 'device_name': socket.gethostname(),
                 'device_platform': 'Linux',
                 'client': 'RomM-RetroArch-Sync',
-                'client_version': '1.4',
+                'client_version': '1.5',
                 'sync_enabled': 'true'
             }
             self.config['Steam'] = {
@@ -782,7 +809,7 @@ class SettingsManager:
             'device_name': socket.gethostname(),
             'device_platform': 'Linux',
             'client': 'RomM-RetroArch-Sync',
-            'client_version': '1.4',
+            'client_version': '1.5',
             'sync_enabled': 'true'
         }
 
@@ -1396,7 +1423,7 @@ class RomMClient:
                 'name': device_name or socket.gethostname(),
                 'platform': platform or sys_platform.system(),
                 'client': client or 'RomM-RetroArch-Sync',
-                'client_version': client_version or '1.4',
+                'client_version': client_version or '1.5',
                 'hostname': socket.gethostname(),
                 'allow_existing': True,
                 'allow_duplicate': False
@@ -1636,11 +1663,8 @@ class RomMClient:
                 data = response.json()
                 items = data.get('items', [])
 
-                # Debug: Check for Final Fantasy in collections
-                for rom in items:
-                    rom_name = rom.get('name', '') or rom.get('fs_name', '')
-
-                return items
+                # Group sibling ROMs using shared method
+                return self._group_sibling_roms(items)
             else:
                 print(f"Failed to get collection ROMs: {response.status_code}")
                 return []
@@ -1648,6 +1672,84 @@ class RomMClient:
         except Exception as e:
             print(f"Error fetching collection ROMs: {e}")
             return []
+
+    def _group_sibling_roms(self, items):
+        """Group sibling ROMs (regional variants) under a main ROM
+
+        Args:
+            items: List of ROM dicts from API
+
+        Returns:
+            List of ROMs with siblings grouped under _sibling_files
+        """
+        # Group sibling ROMs (regional variants, etc.) under a main ROM
+        # ROMs with 'siblings' arrays are related regional/language variants
+        sibling_groups = {}  # Map of group_key -> list of ROMs in that group
+        standalone_roms = []  # ROMs without siblings
+
+        # First pass: build sibling groups
+        for rom in items:
+            siblings_list = rom.get('siblings', [])
+            rom_id = rom.get('id')
+
+            if siblings_list:
+                # This ROM has siblings - create a group key from all related ROM IDs
+                all_related_ids = sorted([rom_id] + [s['id'] for s in siblings_list])
+                group_key = tuple(all_related_ids)
+
+                if group_key not in sibling_groups:
+                    sibling_groups[group_key] = []
+                sibling_groups[group_key].append(rom)
+            else:
+                # Standalone ROM (no siblings)
+                standalone_roms.append(rom)
+
+        # Second pass: pick a "main" ROM for each sibling group and attach others
+        result_roms = []
+        for group_key, group_roms in sibling_groups.items():
+            if len(group_roms) <= 1:
+                # Single ROM in group (sibling not in this collection)
+                result_roms.extend(group_roms)
+                continue
+
+            # Pick the "main" ROM - prefer ROM without file extension (folder)
+            # or use is_main_sibling flag if available
+            main_rom = None
+            sibling_files = []
+
+            for rom in group_roms:
+                fs_extension = rom.get('fs_extension', '')
+                is_main = rom.get('rom_user', {}).get('is_main_sibling', False)
+
+                # Folder ROMs have no extension or empty extension
+                if not fs_extension or is_main:
+                    if main_rom is None:
+                        main_rom = rom
+                    else:
+                        sibling_files.append(rom)
+                else:
+                    sibling_files.append(rom)
+
+            # If no folder ROM found, use the first one as main
+            if main_rom is None:
+                main_rom = group_roms[0]
+                sibling_files = group_roms[1:]
+
+            # Attach siblings to the main ROM
+            if sibling_files:
+                main_rom['_sibling_files'] = sibling_files
+                rom_name = main_rom.get('name', '') or main_rom.get('fs_name', '')
+                print(f"Grouped ROM '{rom_name}' with {len(sibling_files)} regional variant(s)")
+
+            result_roms.append(main_rom)
+
+        # Add standalone ROMs
+        result_roms.extend(standalone_roms)
+
+        if len(items) != len(result_roms):
+            print(f"Grouped {len(items)} API ROMs → {len(result_roms)} display ROMs ({len(items) - len(result_roms)} variants grouped)")
+
+        return result_roms
 
     def _fetch_all_games_chunked(self, progress_callback):
         """Fetch all games using parallel requests"""
@@ -1697,7 +1799,7 @@ class RomMClient:
                 timer.checkpoint(f"Parallel fetch complete: {time.time() - fetch_start:.2f}s")
                 timer.checkpoint(f"Total fetch time: {time.time() - count_start:.2f}s")
 
-                return all_games, len(all_games)
+                return all_games, total_games  # Return ungrouped count for cache comparison
 
         except Exception as e:
             print(f"❌ Parallel fetch error: {e}")
@@ -1728,7 +1830,7 @@ class RomMClient:
                     params={
                         'limit': page_size,
                         'offset': offset,
-                        'fields': 'id,name,fs_name,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small'
+                        'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,siblings,rom_user'
                     },
                     timeout=60
                 )
@@ -1784,7 +1886,7 @@ class RomMClient:
                 progress_callback('batch', {
                     'items': [],  # Don't send items for UI updates during fetch
                     'total': total_items,
-                    'accumulated_games': final_games[:],  # Send all accumulated games for progressive UI
+                    'accumulated_games': [],  # Don't send ungrouped games - grouping happens at the end
                     'batch_completed': batch_start,
                     'total_batches': (pages_needed + batch_size - 1) // batch_size
                 })
@@ -1797,12 +1899,16 @@ class RomMClient:
         # Handle remaining chunk
         if current_chunk:
             final_games.extend(current_chunk)
-        
+
         print(f"✓ Fetch complete: {len(final_games):,} games loaded with optimized memory usage")
-        
+
+        # Group sibling ROMs (regional variants) before returning
+        final_games = self._group_sibling_roms(final_games)
+
+        # Return just the grouped games (total_games is tracked by caller)
         return final_games
         
-    def download_rom(self, rom_id, rom_name, download_path, progress_callback=None, cancellation_checker=None):
+    def download_rom(self, rom_id, rom_name, download_path, progress_callback=None, cancellation_checker=None, file_ids=None):
         """Download a ROM file with progress tracking
 
         Args:
@@ -1811,6 +1917,7 @@ class RomMClient:
             download_path: Path to save the download
             progress_callback: Optional callback for progress updates
             cancellation_checker: Optional callable that returns True if download should be cancelled
+            file_ids: Optional comma-separated list of file IDs to download (for multi-file ROMs)
         """
         if not self.ensure_authenticated():
             return False, "Not authenticated"
@@ -1862,29 +1969,54 @@ class RomMClient:
 
             if is_folder:
                 folder_name = rom_details.get('fs_name', filename)
-                download_path = download_path.parent / folder_name
-                download_path.mkdir(parents=True, exist_ok=True)
+                folder_path = download_path.parent / folder_name
+                folder_path.mkdir(parents=True, exist_ok=True)
 
-            # Use same API endpoint for both files and folders
-            # URL-encode the filename to handle spaces and special characters
-            encoded_filename = quote(filename)
-            api_endpoint = f'/api/roms/{rom_id}/content/{encoded_filename}'
+                # When downloading specific files (file_ids), save inside the folder
+                # When downloading entire folder, use the folder as download_path
+                if file_ids:
+                    # Individual file download - rom_name contains the filename
+                    download_path = folder_path / rom_name
+                    print(f"Downloading individual file to: {download_path}")
+                else:
+                    # Entire folder download (as zip)
+                    download_path = folder_path
+
+            if file_ids:
+                encoded_filename = quote(filename)
+                api_endpoint = f'/api/roms/{rom_id}/content/{encoded_filename}'
+                params = {'file_ids': file_ids}
+                print(f"Downloading specific file from folder '{filename}', file_ids: {file_ids}")
+                print(f"Individual file will be saved as: {rom_name}")
+            else:
+                encoded_filename = quote(filename)
+                api_endpoint = f'/api/roms/{rom_id}/content/{encoded_filename}'
+                params = {}
+                print(f"Downloading entire ROM: {filename}")
+
             full_url = urljoin(self.base_url, api_endpoint)
             print(f"Requesting ROM download: {full_url}")
+            if params:
+                print(f"With params: {params}")
 
             response = self.session.get(
                 full_url,
+                params=params if params else None,
                 stream=True,
                 timeout=30
             )
 
+            print(f"Response status: {response.status_code}")
+            print(f"Response headers: {dict(response.headers)}")
+            
             if response.status_code != 200:
                 print(f"ROM download failed with status {response.status_code}")
-                print(f"Response headers: {dict(response.headers)}")
                 return False, f"API download failed: HTTP {response.status_code}"
             
             # Check if we're getting HTML (error page) instead of a ROM file
             content_type = response.headers.get('content-type', '').lower()
+            print(f"Content-Type: {content_type}")
+            print(f"Response headers: {dict(response.headers)}")
             if 'text/html' in content_type:
                 sample = response.content[:200]
                 print(f"Got HTML response: {sample}")
@@ -1894,11 +2026,14 @@ class RomMClient:
             total_size = int(response.headers.get('content-length', 0))
 
             # For folders, use ROM metadata size for progress tracking
-            if is_folder:
+            # BUT only if downloading the entire folder, not individual files
+            if is_folder and not file_ids:
                 metadata_size = rom_details.get('fs_size_bytes', 0)
                 if metadata_size > 0:
                     total_size = metadata_size
                     print(f"Using ROM metadata size for folder: {total_size} bytes")
+            elif file_ids:
+                print(f"Using actual response size for individual file: {total_size} bytes")
             
             # Create progress tracker
             if progress_callback:
@@ -1910,8 +2045,10 @@ class RomMClient:
             # Download with progress tracking
             actual_downloaded = 0
             start_time = time.time()
-            
-            if is_folder:
+
+            # When using file_ids, we're downloading specific files (not a zip)
+            # even if the parent ROM is a folder
+            if is_folder and not file_ids:
                 # For folders, download as zip then extract
                 import io
                 import zipfile
@@ -5075,10 +5212,7 @@ class AutoSyncManager:
                         if network_responding:
                             # Use content path from GET_STATUS (instant, no race condition)
                             # Fall back to history file if GET_STATUS didn't include a path
-                            self.log(f"🔍 DEBUG: network_content_path='{network_content_path}'")
-
                             current_content = network_content_path or self.get_retroarch_current_game()
-                            self.log(f"🔍 DEBUG: current_content (after fallback)='{current_content}'")
 
                             if current_content:
                                 # For display: use filename if path, strip CRC if content label
@@ -5233,36 +5367,27 @@ class AutoSyncManager:
         Expected format: "GET_STATUS PLAYING corename,/path/to/content"
         """
         try:
-            # DEBUG: Log the raw response
-            self.log(f"🔍 DEBUG: GET_STATUS response: '{status_response}'")
-
             # Split into parts: ["GET_STATUS", "PLAYING", "corename,/path/to/content"]
             parts = status_response.split(' ', 2)
-            self.log(f"🔍 DEBUG: Split parts: {parts}")
 
             if len(parts) < 3:
-                self.log(f"🔍 DEBUG: Not enough parts ({len(parts)} < 3)")
                 return None
 
             core_and_path = parts[2]
-            self.log(f"🔍 DEBUG: core_and_path: '{core_and_path}'")
 
             # Split on first comma: core name vs content path
             comma_idx = core_and_path.find(',')
             if comma_idx < 0:
-                self.log(f"🔍 DEBUG: No comma found in core_and_path")
                 return None
 
             content_path = core_and_path[comma_idx + 1:].strip()
-            self.log(f"🔍 DEBUG: Extracted content_path: '{content_path}'")
 
             if not content_path or content_path == 'N/A':
-                self.log(f"🔍 DEBUG: content_path is empty or N/A")
                 return None
 
             return content_path
         except Exception as e:
-            self.log(f"🔍 DEBUG: Exception in _parse_content_path_from_status: {e}")
+            logging.debug(f"Exception in _parse_content_path_from_status: {e}")
             return None
 
     def get_retroarch_current_game(self):
@@ -5342,28 +5467,50 @@ class AutoSyncManager:
             matching_game = None
 
             # DEBUG: Log what we're trying to match
-            self.log(f"🔍 DEBUG: Matching ROM - is_content_label={is_content_label}, rom_filename={rom_filename}, rom_stem={rom_stem}")
+            
 
             for game in games:
                 game_filename = game.get('file_name', '')
                 game_stem = Path(game_filename).stem if game_filename else ''
                 game_name = game.get('name', '')
 
-                # DEBUG: Log comparison for each game
-                if is_content_label:
-                    self.log(f"🔍 DEBUG:   Checking game: file_name='{game_filename}', stem='{game_stem}', name='{game_name}'")
-                    self.log(f"🔍 DEBUG:   Comparing rom_stem '{rom_stem}' vs game_stem '{game_stem}': {game_stem == rom_stem}")
-                    self.log(f"🔍 DEBUG:   Comparing rom_stem '{rom_stem}' vs game_name '{game_name}': {game_name == rom_stem}")
-
                 if rom_filename and (game_filename == rom_filename or game_stem == rom_stem):
-                    self.log(f"✅ DEBUG: Matched via file_name/stem!")
                     matching_game = game
                     break
                 elif is_content_label and (game_stem == rom_stem or game.get('name', '') == rom_stem):
-                    match_type = "game_stem" if game_stem == rom_stem else "game_name (IGDB)"
-                    self.log(f"✅ DEBUG: Matched via {match_type}!")
                     matching_game = game
                     break
+                
+                # Check regional variants (_sibling_files)
+                if game.get('_sibling_files'):
+                    for sibling in game['_sibling_files']:
+                        sibling_fs_name = sibling.get('fs_name', '')
+                        sibling_fs_extension = sibling.get('fs_extension', '')
+                        
+                        # Build full filename
+                        if sibling_fs_name:
+                            if sibling_fs_extension and not sibling_fs_name.lower().endswith(f'.{sibling_fs_extension.lower()}'):
+                                sibling_filename = f"{sibling_fs_name}.{sibling_fs_extension}"
+                            else:
+                                sibling_filename = sibling_fs_name
+                        else:
+                            sibling_filename = sibling.get('name', 'Unknown')
+                        
+                        sibling_stem = Path(sibling_filename).stem if sibling_filename else ''
+                        
+                        # Match against the variant filename
+                        if rom_filename and sibling_filename == rom_filename:
+                            matching_game = game
+                            # Store the specific variant ROM ID for save sync
+                            game['_matched_variant_rom_id'] = sibling.get('id')
+                            break
+                        elif is_content_label and (sibling_stem == rom_stem or sibling.get('name', '') == rom_stem):
+                            matching_game = game
+                            game['_matched_variant_rom_id'] = sibling.get('id')
+                            break
+                    
+                    if matching_game:
+                        break
 
             if matching_game:
                 self.log(f"📥 Syncing saves for: {matching_game.get('name')}")
@@ -5578,7 +5725,7 @@ class AutoSyncManager:
             # Upload the file with thumbnail and emulator info
             slot_info = f" [slot={slot}, autocleanup={autocleanup_limit}]" if slot else ""
             file_size = file_path.stat().st_size
-            size_str = f"{file_size / 1024:.1f}KB" if file_size < 1048576 else f"{file_size / 1048576:.1f}MB"
+            size_str = f"{file_size / 1000:.1f}KB" if file_size < 1000000 else f"{file_size / 1000000:.1f}MB"
             if thumbnail_path:
                 self.log(f"⬆️ Uploading {file_path.name} ({size_str}) with screenshot...{slot_info}")
             else:
@@ -5626,7 +5773,7 @@ class AutoSyncManager:
             clean_basename = re.sub(r'\s*\[.*?\]', '', save_basename)
 
             # DEBUG: Log what we're trying to match
-            self.log(f"🔍 DEBUG: find_rom_id_for_save_file - save_basename='{save_basename}', clean_basename='{clean_basename}'")
+            
 
             # TIER 1: Try exact match with fs_name_no_ext
             for game in games:
@@ -5637,15 +5784,36 @@ class AutoSyncManager:
                 fs_name_no_ext = rom_data.get('fs_name_no_ext', '')
 
                 if fs_name_no_ext and (fs_name_no_ext == save_basename or fs_name_no_ext == clean_basename):
-                    self.log(f"✅ DEBUG: Exact match found with fs_name_no_ext!")
                     return game['rom_id']
+                
+                # Check regional variants (_sibling_files)
+                if game.get('_sibling_files'):
+                    for sibling in game['_sibling_files']:
+                        sibling_fs_name = sibling.get('fs_name', '')
+                        sibling_fs_extension = sibling.get('fs_extension', '')
+                        
+                        # Build filename and stem
+                        if sibling_fs_name:
+                            if sibling_fs_extension and not sibling_fs_name.lower().endswith(f'.{sibling_fs_extension.lower()}'):
+                                sibling_filename = f"{sibling_fs_name}.{sibling_fs_extension}"
+                            else:
+                                sibling_filename = sibling_fs_name
+                        else:
+                            sibling_filename = sibling.get('name', 'Unknown')
+                        
+                        # Use fs_name_no_ext if available, otherwise stem
+                        sibling_fs_name_no_ext = sibling.get('fs_name_no_ext') or (Path(sibling_filename).stem if sibling_filename else '')
+                        
+                        if sibling_fs_name_no_ext and (sibling_fs_name_no_ext == save_basename or sibling_fs_name_no_ext == clean_basename):
+                            # Return the variant's ROM ID, not the parent's
+                            return sibling.get('id')
 
             # TIER 2: Try region-aware matching (NEW)
             # Extract region tag from save filename
             save_region = self._extract_region_tag(clean_basename)
 
             if save_region:
-                self.log(f"🔍 DEBUG: Extracted region from save: '{save_region}'")
+                
 
                 # Get base name (without region tag) from save file
                 save_base_name = re.sub(r'\s*\(.*?\)', '', clean_basename).strip()
@@ -5671,22 +5839,41 @@ class AutoSyncManager:
                         region_candidates.append({
                             'game': game,
                             'region': game_region,
-                            'fs_name_no_ext': fs_name_no_ext
+                            'fs_name_no_ext': fs_name_no_ext,
+                            'rom_id': game['rom_id']
                         })
+                
+                # Also check regional variants for region matching
+                if game.get('_sibling_files'):
+                    for sibling in game['_sibling_files']:
+                        sibling_fs_name = sibling.get('fs_name', '')
+                        sibling_fs_name_no_ext = sibling.get('fs_name_no_ext') or (Path(sibling_fs_name).stem if sibling_fs_name else '')
+                        
+                        if not sibling_fs_name_no_ext:
+                            continue
+                        
+                        # Get base name from variant (without region tags)
+                        variant_base_name = re.sub(r'\s*\(.*?\)', '', sibling_fs_name_no_ext).strip()
+                        
+                        # If base names match, this variant is a candidate
+                        if variant_base_name.lower() == save_base_name.lower():
+                            variant_region = self._extract_region_tag(sibling_fs_name_no_ext)
+                            region_candidates.append({
+                                'game': game,
+                                'region': variant_region,
+                                'fs_name_no_ext': sibling_fs_name_no_ext,
+                                'rom_id': sibling.get('id')  # Use variant's ROM ID
+                            })
 
                 # If we have candidates, prefer region match
                 if region_candidates:
-                    self.log(f"🔍 DEBUG: Found {len(region_candidates)} region candidates")
-
                     # First pass: exact region match
                     for candidate in region_candidates:
                         if candidate['region'] == save_region:
-                            self.log(f"✅ DEBUG: Region match found! save='{save_region}', game='{candidate['region']}'")
-                            return candidate['game']['rom_id']
+                            return candidate['rom_id']  # Return variant ROM ID if matched
 
                     # Second pass: if no exact region match, use first candidate
-                    self.log(f"⚠️ DEBUG: No exact region match, using first candidate")
-                    return region_candidates[0]['game']['rom_id']
+                    return region_candidates[0]['rom_id']  # Return variant ROM ID if matched
 
             # TIER 3: Fuzzy match fallback (unchanged)
             for game in games:
@@ -5700,13 +5887,11 @@ class AutoSyncManager:
                 clean_game_name = re.sub(r'\s*\(.*?\)', '', fs_name_no_ext).strip()
                 clean_save_name = re.sub(r'\s*\(.*?\)', '', clean_basename).strip()
 
-                self.log(f"🔍 DEBUG:   Fuzzy: clean_game_name='{clean_game_name}' vs clean_save_name='{clean_save_name}'")
+                
 
                 if clean_game_name and clean_game_name.lower() == clean_save_name.lower():
-                    self.log(f"✅ DEBUG: Fuzzy match found!")
                     return game['rom_id']
 
-            self.log(f"❌ DEBUG: No match found for save file '{save_basename}'")
             return None
 
         except Exception as e:
@@ -5819,7 +6004,9 @@ class AutoSyncManager:
         try:
             from urllib.parse import urljoin
             import datetime
-            rom_id = game['rom_id']
+            
+            # Use variant ROM ID if matched, otherwise use parent ROM ID
+            rom_id = game.get('_matched_variant_rom_id') or game['rom_id']
             game_name = game.get('name', 'Unknown')
 
             # Check if we have device-aware sync data to skip unnecessary downloads
@@ -5836,7 +6023,7 @@ class AutoSyncManager:
                         limit=50
                     )
                     device_saves_to_skip = {s.get('id') for s in device_saves if s.get('id')}
-                    self.log(f"🔍 DEBUG: Found {len(device_saves_to_skip)} saves from this device")
+                    
                     for save in device_saves:
                         self.log(f"   Save ID: {save.get('id')}, file: {save.get('file_name')}, updated: {save.get('updated_at')}")
 
@@ -5847,7 +6034,7 @@ class AutoSyncManager:
                         limit=50
                     )
                     device_states_to_skip = {s.get('id') for s in device_states if s.get('id')}
-                    self.log(f"🔍 DEBUG: Found {len(device_states_to_skip)} states from this device")
+                    
                     for state in device_states:
                         self.log(f"   State ID: {state.get('id')}, file: {state.get('file_name')}, updated: {state.get('updated_at')}")
 
