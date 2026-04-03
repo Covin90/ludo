@@ -906,14 +906,27 @@ function Content() {
                 <PanelSectionRow>
                   <ToggleField
                     label={
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <div style={{
-                          width: '6px',
-                          height: '6px',
-                          borderRadius: '50%',
-                          backgroundColor: getDotColor()
-                        }} />
-                        <span>{collection.name}</span>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <div style={{
+                            width: '6px',
+                            height: '6px',
+                            borderRadius: '50%',
+                            backgroundColor: getDotColor()
+                          }} />
+                          <span>{collection.name}</span>
+                        </div>
+                        {status.steam_available && hasCount && (
+                          <div
+                            onClick={(e: React.MouseEvent<HTMLDivElement>) => { e.stopPropagation(); handleToggleSteamSync(collection.name, !collection.steam_sync); }}
+                            title={collection.steam_sync
+                              ? (collection.steam_shortcut_count > 0 ? `${collection.steam_shortcut_count} Steam shortcuts` : 'Remove from Steam')
+                              : 'Add to Steam'}
+                            style={{ display: 'flex', alignItems: 'center', padding: '2px 4px', borderRadius: '4px', cursor: 'pointer' }}
+                          >
+                            <FaSteam size={16} color={collection.steam_sync ? '#66c0f4' : '#6b7280'} />
+                          </div>
+                        )}
                       </div>
                     }
                     description={(() => {
@@ -955,24 +968,6 @@ function Content() {
                         )}
                       </div>
                     </div>
-                  </PanelSectionRow>
-                )}
-                {/* Steam shortcut toggle */}
-                {status.steam_available && hasCount && (
-                  <PanelSectionRow>
-                    <ToggleField
-                      label={
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                          <FaSteam size={14} color={collection.steam_sync ? '#66c0f4' : '#6b7280'} />
-                          <span style={{ fontSize: '0.85em' }}>Add to Steam</span>
-                        </div>
-                      }
-                      description={collection.steam_sync && collection.steam_shortcut_count > 0
-                        ? `${collection.steam_shortcut_count} shortcuts`
-                        : undefined}
-                      checked={!!collection.steam_sync}
-                      onChange={(value: boolean) => handleToggleSteamSync(collection.name, value)}
-                    />
                   </PanelSectionRow>
                 )}
               </div>

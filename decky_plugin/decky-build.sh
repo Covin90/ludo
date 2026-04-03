@@ -17,7 +17,7 @@ pip download Pillow \
     --only-binary :all: \
     -d "$PILLOW_TMP" \
     --quiet
-PILLOW_WHL=$(ls "$PILLOW_TMP"/Pillow-*.whl 2>/dev/null | head -1)
+PILLOW_WHL=$(ls "$PILLOW_TMP"/[Pp]illow-*.whl 2>/dev/null | head -1)
 if [ -z "$PILLOW_WHL" ]; then
     echo "ERROR: Failed to download Pillow wheel for Python 3.11" >&2
     rm -rf "$PILLOW_TMP"
