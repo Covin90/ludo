@@ -134,3 +134,12 @@ Then install from `~/RomM-RetroArch-Sync-v1.5-decky.zip` on the Deck via Decky L
 - The `_root` flag in `plugin.json` silently blocks ZIP installation (no error shown in UI)
 - `package.json` and `LICENSE` are not used at runtime but are required by the Decky validator
 - The symlink at `py_modules/sync_core.py` must not be committed as a regular file
+- **Decky Loader's Python is 3.11** (AppImage bundles its own interpreter at `/tmp/_MEI*/`). Pillow and any other bundled wheels with C extensions **must be compiled for Python 3.11**, not the SteamOS system Python (3.13). To refresh `py_modules/PIL/` and `py_modules/pillow.libs/`:
+  ```bash
+  pip download Pillow --python-version 3.11 --platform manylinux_2_28_x86_64 --only-binary :all: -d /tmp/pillow-311/
+  cd /tmp/pillow-311 && unzip -q pillow-*.whl -d extracted/
+  rm -rf decky_plugin/py_modules/PIL decky_plugin/py_modules/pillow.libs decky_plugin/py_modules/pillow-*.dist-info
+  cp -r extracted/PIL decky_plugin/py_modules/PIL
+  cp -r extracted/pillow.libs decky_plugin/py_modules/pillow.libs
+  cp -r extracted/pillow-*.dist-info decky_plugin/py_modules/
+  ```

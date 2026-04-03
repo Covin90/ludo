@@ -7,6 +7,34 @@ PLUGIN_NAME="romm-sync-monitor"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_ZIP="${SCRIPT_DIR}/../${PLUGIN_NAME}.zip"
 
+echo "==> Refreshing Pillow for Python 3.11 (Decky Loader's Python)..."
+# Decky Loader is a PyInstaller AppImage running Python 3.11 — NOT the system Python.
+# Pillow's C extensions must match Python 3.11 or they silently fail to import.
+PILLOW_TMP=$(mktemp -d)
+pip download Pillow \
+    --python-version 3.11 \
+    --platform manylinux_2_28_x86_64 \
+    --only-binary :all: \
+    -d "$PILLOW_TMP" \
+    --quiet
+PILLOW_WHL=$(ls "$PILLOW_TMP"/Pillow-*.whl 2>/dev/null | head -1)
+if [ -z "$PILLOW_WHL" ]; then
+    echo "ERROR: Failed to download Pillow wheel for Python 3.11" >&2
+    rm -rf "$PILLOW_TMP"
+    exit 1
+fi
+unzip -q "$PILLOW_WHL" -d "$PILLOW_TMP/extracted"
+rm -rf "${SCRIPT_DIR}/py_modules/PIL" \
+       "${SCRIPT_DIR}/py_modules/pillow.libs" \
+       "${SCRIPT_DIR}/py_modules/pillow-"*.dist-info
+cp -r "$PILLOW_TMP/extracted/PIL"          "${SCRIPT_DIR}/py_modules/PIL"
+cp -r "$PILLOW_TMP/extracted/pillow.libs"  "${SCRIPT_DIR}/py_modules/pillow.libs"
+# dist-info not strictly needed at runtime but keeps the directory consistent
+EXTRACTED_DISTINFO=$(ls -d "$PILLOW_TMP/extracted/pillow-"*.dist-info 2>/dev/null | head -1)
+[ -n "$EXTRACTED_DISTINFO" ] && cp -r "$EXTRACTED_DISTINFO" "${SCRIPT_DIR}/py_modules/"
+rm -rf "$PILLOW_TMP"
+echo "    Pillow $(ls "${SCRIPT_DIR}/py_modules/PIL/_imaging"*.so 2>/dev/null | grep -o 'cpython-[0-9]*') bundled OK"
+
 echo "==> Building frontend..."
 cd "$SCRIPT_DIR"
 pnpm run build

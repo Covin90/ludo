@@ -26,6 +26,17 @@ from watchdog.events import FileSystemEventHandler
 import queue
 from collections import defaultdict
 
+# PIL is optional - used for Steam grid image generation
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError as e:
+    import sys
+    print(f"[ROMM-SYNC] PIL import failed: {e}", file=sys.stderr)
+    print(f"[ROMM-SYNC] sys.path: {sys.path}", file=sys.stderr)
+    PIL_AVAILABLE = False
+    Image = None
+
 # Fix SSL certificate path for AppImage environment
 import ssl
 os.environ['REQUESTS_CA_BUNDLE'] = '/etc/ssl/certs/ca-certificates.crt'
@@ -1023,10 +1034,17 @@ class SteamGridImageGenerator:
         Returns:
             Tuple of (success: bool, generated_count: int, message: str)
         """
-        try:
-            from PIL import Image
-        except ImportError:
-            return False, 0, "Pillow not installed (pip install Pillow)"
+        # Try importing PIL directly if not available at module level
+        global PIL_AVAILABLE, Image
+        if not PIL_AVAILABLE:
+            try:
+                from PIL import Image as PILImage
+                Image = PILImage
+                PIL_AVAILABLE = True
+                logging.info("[PIL] Successfully imported PIL inside generate_grid_images")
+            except ImportError as e:
+                logging.error(f"[PIL] PIL import failed in generate_grid_images: {e}")
+                return False, 0, f"Pillow not installed (pip install Pillow) - {e}"
 
         if not Path(source_image_path).exists():
             return False, 0, "Source image not found"
@@ -1154,10 +1172,17 @@ class SteamGridImageGenerator:
         Returns:
             Tuple of (success: bool, message: str)
         """
-        try:
-            from PIL import Image
-        except ImportError:
-            return False, "Pillow not installed"
+        # Try importing PIL directly if not available at module level
+        global PIL_AVAILABLE, Image
+        if not PIL_AVAILABLE:
+            try:
+                from PIL import Image as PILImage
+                Image = PILImage
+                PIL_AVAILABLE = True
+                logging.info("[PIL] Successfully imported PIL inside generate_square_icon")
+            except ImportError as e:
+                logging.error(f"[PIL] PIL import failed in generate_square_icon: {e}")
+                return False, f"Pillow not installed - {e}"
 
         if not Path(source_image_path).exists():
             return False, "Source image not found"

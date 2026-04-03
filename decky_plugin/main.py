@@ -3,11 +3,38 @@ import logging
 import sys
 import threading
 import time
+import os
+import ctypes
 from datetime import datetime, timezone
 from pathlib import Path
 
 # Add py_modules to path so sync_core is importable
 sys.path.insert(0, str(Path(__file__).parent / "py_modules"))
+
+# Preload Pillow shared libraries for bundled wheel
+# This is needed because the .so files in the wheel need to find their dependencies
+pillow_libs_dir = Path(__file__).parent / "py_modules" / "pillow.libs"
+if pillow_libs_dir.exists():
+    try:
+        # Preload all shared libraries from pillow.libs
+        for lib_file in sorted(pillow_libs_dir.glob("*.so*")):
+            try:
+                ctypes.CDLL(str(lib_file))
+                logging.debug(f"[PIL] Preloaded library: {lib_file.name}")
+            except Exception as e:
+                logging.debug(f"[PIL] Could not preload {lib_file.name}: {e}")
+    except Exception as e:
+        logging.warning(f"[PIL] Error preloading pillow libraries: {e}")
+
+# Import PIL early to ensure C extensions are loaded correctly
+# This must be done before sync_core imports it at module level
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+    logging.info(f"[PIL] PIL imported successfully from: {Image.__file__}")
+except ImportError as e:
+    PIL_AVAILABLE = False
+    logging.error(f"[PIL] PIL import failed: {e}")
 
 try:
     from sync_core import (
