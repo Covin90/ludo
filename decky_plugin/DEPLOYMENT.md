@@ -18,20 +18,32 @@ real file during the build step. Never commit the resolved copy — the symlink 
 
 ## Build & Package
 
-Run the build script from the `decky_plugin/` directory:
+Run the following from the **repo root**:
 
 ```bash
-cd decky_plugin
-./decky-build.sh
+# Step 1: Build frontend
+cd decky_plugin && pnpm run build && cd ..
+
+# Step 2: Package into zip
+PLUGIN_NAME="romm-sync-monitor"
+PLUGIN_DIR="decky_plugin"
+OUT_ZIP="${PLUGIN_NAME}.zip"
+TMP_DIR=$(mktemp -d)
+mkdir -p "${TMP_DIR}/${PLUGIN_NAME}/dist" "${TMP_DIR}/${PLUGIN_NAME}/assets"
+cp "${PLUGIN_DIR}/plugin.json" "${PLUGIN_DIR}/package.json" "${PLUGIN_DIR}/LICENSE" "${PLUGIN_DIR}/main.py" "${TMP_DIR}/${PLUGIN_NAME}/"
+cp "${PLUGIN_DIR}/dist/index.js" "${PLUGIN_DIR}/dist/index.js.map" "${TMP_DIR}/${PLUGIN_NAME}/dist/"
+cp -rL "${PLUGIN_DIR}/py_modules" "${TMP_DIR}/${PLUGIN_NAME}/"
+cp "${PLUGIN_DIR}/assets/logo.png" "${TMP_DIR}/${PLUGIN_NAME}/assets/"
+(cd "$TMP_DIR" && zip -r "$OUT_ZIP" "${PLUGIN_NAME}/")
+mv "$TMP_DIR/$OUT_ZIP" .
+rm -rf "$TMP_DIR"
 ```
 
-This will:
-1. Run `pnpm run build`:
-   - **prebuild**: copies `../src/sync_core.py` → `py_modules/sync_core.py` (resolves the symlink)
-   - **build**: runs rollup → `dist/index.js` + `dist/index.js.map`
-2. Package everything into `../romm-sync-monitor.zip`
+The output zip is at the **repo root**: `romm-sync-monitor.zip` (~8 MB with bundled libs).
 
-The output zip is at the **repo root**: `romm-sync-monitor.zip`
+**Why `cp -rL`?** `py_modules/sync_core.py` and `py_modules/bios_manager.py` are symlinks in
+the dev tree. The `-L` flag dereferences all symlinks so real file content goes into the zip.
+Without it, the zip contains broken symlinks and the plugin fails to load.
 
 ### Release Naming Convention
 
@@ -64,10 +76,12 @@ Decky Loader's installer validates all of these. **Any missing file causes silen
 | `main.py` | YES | Python backend entrypoint |
 | `dist/index.js` | YES | Compiled frontend |
 | `dist/index.js.map` | YES | Source map |
-| `py_modules/sync_core.py` | YES | Sync daemon logic |
+| `py_modules/sync_core.py` | YES | Sync daemon logic (symlink in dev — must be real file in zip) |
+| `py_modules/bios_manager.py` | YES | BIOS management logic (symlink in dev — must be real file in zip) |
 | `py_modules/requests/` | YES | Bundled dependency (not on SteamOS) |
 | `py_modules/watchdog/` | YES | Bundled dependency (not on SteamOS) |
 | `py_modules/PIL/` | YES | Bundled dependency (Pillow for image processing) |
+| `py_modules/pillow.libs/` | YES | Bundled shared libs for Pillow C extensions |
 | `py_modules/urllib3/`, `certifi/`, `charset_normalizer/`, `idna/` | YES | Transitive deps of requests |
 | `assets/logo.png` | NO | Plugin icon |
 
@@ -85,7 +99,16 @@ romm-sync-monitor/
     index.js
     index.js.map
   py_modules/
-    sync_core.py
+    sync_core.py        ← real file (symlink dereferenced by cp -rL)
+    bios_manager.py     ← real file (symlink dereferenced by cp -rL)
+    requests/
+    watchdog/
+    PIL/
+    pillow.libs/
+    urllib3/
+    certifi/
+    charset_normalizer/
+    idna/
   assets/
     logo.png
 ```
@@ -130,10 +153,16 @@ Then install from `~/RomM-RetroArch-Sync-v1.5-decky.zip` on the Deck via Decky L
 
 ## Known gotchas
 
-- `zip --prefix` is not supported on this system — `decky-build.sh` uses a temp dir instead
+- `zip --prefix` is not supported on this system — the packaging command uses a temp dir instead
 - The `_root` flag in `plugin.json` silently blocks ZIP installation (no error shown in UI)
 - `package.json` and `LICENSE` are not used at runtime but are required by the Decky validator
-- The symlink at `py_modules/sync_core.py` must not be committed as a regular file
+- The symlinks at `py_modules/sync_core.py` and `py_modules/bios_manager.py` must not be
+  committed as regular files — use `cp -rL` when packaging to dereference them. Using `cp -r`
+  alone copies symlinks as-is, which become broken inside the zip (no error at zip time, but
+  the plugin fails with `ModuleNotFoundError` at load time)
+- Missing `py_modules/requests/` (and other bundled libs) causes `No module named 'requests'`
+  on a fresh Decky install — always copy the entire `py_modules/` directory, not just
+  `sync_core.py`
 - **Decky Loader's Python is 3.11** (AppImage bundles its own interpreter at `/tmp/_MEI*/`). Pillow and any other bundled wheels with C extensions **must be compiled for Python 3.11**, not the SteamOS system Python (3.13). To refresh `py_modules/PIL/` and `py_modules/pillow.libs/`:
   ```bash
   pip download Pillow --python-version 3.11 --platform manylinux_2_28_x86_64 --only-binary :all: -d /tmp/pillow-311/

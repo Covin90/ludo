@@ -1021,6 +1021,7 @@ class SteamGridImageGenerator:
     GRID_PORTRAIT = (600, 900)    # Vertical cover for library
     GRID_LANDSCAPE = (920, 430)   # Horizontal grid view
     GRID_HERO = (1920, 620)       # Hero/banner for big picture mode
+    GRID_ICON = (256, 256)        # Square icon for overlay/search
 
     @staticmethod
     def generate_grid_images(source_image_path, output_dir, appid):
@@ -1094,6 +1095,15 @@ class SteamGridImageGenerator:
                 SteamGridImageGenerator.GRID_HERO
             )
             hero.save(hero_path, 'PNG', optimize=True)
+            generated += 1
+
+            # Generate square icon (256x256) - for Steam overlay and search
+            icon_path = output_dir / f"{unsigned_appid}_icon.png"
+            icon = SteamGridImageGenerator._resize_and_pad(
+                source.copy(),
+                SteamGridImageGenerator.GRID_ICON
+            )
+            icon.save(icon_path, 'PNG', optimize=True)
             generated += 1
 
             return True, generated, f"Generated {generated} grid images"
@@ -4056,6 +4066,48 @@ class RetroArchInterface:
             print(f"❌ Failed to send RetroArch notification: {e}")
             return False
     
+    def get_retroarch_config_setting(self, key, default=None):
+        """Read a single setting value from retroarch.cfg, returning default if not found."""
+        config_dir = self.find_retroarch_config_dir()
+        if not config_dir:
+            return default
+        config_file = config_dir / 'retroarch.cfg'
+        if not config_file.exists():
+            return default
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(f'{key} = '):
+                        return line.split('=', 1)[1].strip().strip('"')
+        except Exception:
+            pass
+        return default
+
+    def get_save_subdir_mode(self, save_type='saves'):
+        """Return the folder-sorting mode RetroArch uses for saves or states.
+
+        Reads sort_save(files|states)_enable and sort_save(files|states)_by_content_enable
+        from retroarch.cfg.
+
+        Returns:
+            'core'    — subdirectory per core name (sort_*_enable = true)
+            'content' — subdirectory mirrors ROM directory name (sort_*_by_content_enable = true)
+            'flat'    — no subdirectory
+        """
+        if save_type == 'saves':
+            enable_key = 'sort_savefiles_enable'
+            content_key = 'sort_savefiles_by_content_enable'
+        else:
+            enable_key = 'sort_savestates_enable'
+            content_key = 'sort_savestates_by_content_enable'
+
+        if self.get_retroarch_config_setting(enable_key, 'false').lower() == 'true':
+            return 'core'
+        if self.get_retroarch_config_setting(content_key, 'false').lower() == 'true':
+            return 'content'
+        return 'flat'
+
     def parse_retroarch_save_dirs_from_config(self, config_dir):
         """Parse savefile_directory and savestate_directory from retroarch.cfg
 
@@ -5766,8 +5818,22 @@ class AutoSyncManager:
             )
 
             if result == 'conflict':
-                self.log(f"⚠️ Server returned 409 Conflict for {file_path.name} — server has newer version, download it first")
+                self.log(f"⚠️ Server returned 409 Conflict for {file_path.name} — server has newer version, triggering download")
                 self.retroarch.send_notification(f"Sync conflict: {file_path.name}")
+                # Trigger download so the newer server version lands locally.
+                # Next play session will start with the correct save.
+                conflict_rom_id = rom_id
+                conflict_games = self.get_games()
+                conflict_game = next(
+                    (g for g in conflict_games if g.get('rom_id') == conflict_rom_id),
+                    None
+                )
+                if conflict_game:
+                    threading.Thread(
+                        target=self.download_saves_for_specific_game,
+                        args=(conflict_game,),
+                        daemon=True
+                    ).start()
             elif result:
                 # Record successful upload fingerprint to avoid duplicate uploads
                 self.last_uploaded[str(file_path)] = current_fingerprint
@@ -5998,7 +6064,8 @@ class AutoSyncManager:
             'mame': 'arcade',
             'stella': 'atari2600',
         }
-        return core_to_platform.get(romm_emulator, romm_emulator)
+        normalized = romm_emulator.lower().replace('-', '_')
+        return core_to_platform.get(normalized, romm_emulator)
 
     def sync_before_launch(self, game):
         """Sync saves before launching a specific game"""
@@ -6282,7 +6349,6 @@ class AutoSyncManager:
                 latest_save = get_latest_file(user_saves, "save")
 
                 if latest_save:
-                    save_id = latest_save.get('id')
                     original_filename = latest_save.get('file_name', '')
                     romm_emulator = latest_save.get('emulator', 'unknown')
 
@@ -6290,20 +6356,23 @@ class AutoSyncManager:
                     final_path = None
                     emulator_save_dir = None
                     if original_filename:
-                        folder_structure = self.retroarch.detect_save_folder_structure()
-                        if folder_structure == 'platform_slugs':
-                            platform_slug = self.get_platform_slug_from_emulator(romm_emulator)
-                            emulator_save_dir = save_base_dir / platform_slug
+                        subdir_mode = self.retroarch.get_save_subdir_mode('saves')
+                        if subdir_mode == 'core':
+                            emulator_save_dir = save_base_dir / self.retroarch.get_retroarch_directory_name(romm_emulator)
+                        elif subdir_mode == 'content':
+                            emulator_save_dir = save_base_dir / self.get_platform_slug_from_emulator(romm_emulator)
                         else:
-                            retroarch_emulator_dir = self.retroarch.get_retroarch_directory_name(romm_emulator)
-                            emulator_save_dir = save_base_dir / retroarch_emulator_dir
+                            emulator_save_dir = save_base_dir
                         if emulator_save_dir:
                             retroarch_filename = self.retroarch.convert_to_retroarch_filename(
                                 original_filename, 'saves', emulator_save_dir
                             )
                             final_path = emulator_save_dir / retroarch_filename
 
-                    # Only skip download if the local file actually exists
+                    # Only skip download if the local file actually exists AND
+                    # the API confirms this device has the current version.
+                    # Do NOT skip based on device_saves_to_skip — that only tracks
+                    # what this device uploaded and misses newer versions from other devices.
                     skip = False
                     if final_path and final_path.exists():
                         device_id = self.settings.get('Device', 'device_id', '') or None
@@ -6316,10 +6385,6 @@ class AutoSyncManager:
 
                         if device_has_current:
                             self.log(f"  ⏭️ Skipping save (device has current version): {latest_save.get('file_name', 'unknown')}")
-                            skip = True
-                            skipped_count += 1
-                        elif save_id in device_saves_to_skip:
-                            self.log(f"  ⏭️ Skipping save (already on device): {latest_save.get('file_name', 'unknown')}")
                             skip = True
                             skipped_count += 1
 
@@ -6405,20 +6470,25 @@ class AutoSyncManager:
                     final_path = None
                     emulator_state_dir = None
                     if original_filename:
-                        folder_structure = self.retroarch.detect_save_folder_structure()
-                        if folder_structure == 'platform_slugs':
-                            platform_slug = self.get_platform_slug_from_emulator(romm_emulator)
-                            emulator_state_dir = state_base_dir / platform_slug
+                        subdir_mode = self.retroarch.get_save_subdir_mode('states')
+                        config_dir_used = self.retroarch.find_retroarch_config_dir()
+                        self.log(f"  [DEBUG] states subdir_mode={subdir_mode!r}, config_dir={config_dir_used}, romm_emulator={romm_emulator!r}")
+                        if subdir_mode == 'core':
+                            emulator_state_dir = state_base_dir / self.retroarch.get_retroarch_directory_name(romm_emulator)
+                        elif subdir_mode == 'content':
+                            emulator_state_dir = state_base_dir / self.get_platform_slug_from_emulator(romm_emulator)
                         else:
-                            retroarch_emulator_dir = self.retroarch.get_retroarch_directory_name(romm_emulator)
-                            emulator_state_dir = state_base_dir / retroarch_emulator_dir
+                            emulator_state_dir = state_base_dir
                         if emulator_state_dir:
                             retroarch_filename = self.retroarch.convert_to_retroarch_filename(
                                 original_filename, 'states', emulator_state_dir, slot=state_slot
                             )
                             final_path = emulator_state_dir / retroarch_filename
+                            self.log(f"  [DEBUG] state final_path={final_path}")
 
-                    # Skip logic
+                    # Skip logic — only skip if API confirms this device has current version.
+                    # Do NOT skip based on device_states_to_skip (uploaded-by-this-device set):
+                    # another device may have uploaded a newer version of the same state ID.
                     skip = False
                     if final_path and final_path.exists():
                         device_id = self.settings.get('Device', 'device_id', '') or None
@@ -6431,10 +6501,6 @@ class AutoSyncManager:
 
                         if device_has_current:
                             self.log(f"  ⏭️ Skipping state (device has current version): {latest_state.get('file_name', 'unknown')}")
-                            skip = True
-                            skipped_count += 1
-                        elif state_id in device_states_to_skip:
-                            self.log(f"  ⏭️ Skipping state (already on device): {latest_state.get('file_name', 'unknown')}")
                             skip = True
                             skipped_count += 1
 
@@ -7925,14 +7991,24 @@ class SteamShortcutManager:
 
         Returns (exe, launch_options) tuple, or (None, None) if no core found.
         """
-        if not self.retroarch or not self.retroarch.retroarch_executable:
+        if not self.retroarch:
+            return None, None
+
+        # RetroDECK: detect via is_retrodeck_installation() which uses directory/flatpak
+        # checks as fallbacks when retroarch_executable is None or lacks 'retrodeck'.
+        # Use '"flatpak"' (quoted short name, no full path) to match the exact exe format
+        # that Steam itself uses for flatpak shortcuts. Steam's overlay recalculates the
+        # artwork appid from exe+name at display time, so the exe format here must match
+        # what Steam expects — using the full path produces a different appid and the
+        # overlay can't find the grid images.
+        if self.retroarch.is_retrodeck_installation():
+            self.log(f"  RetroDECK detected, using: \"flatpak\" run net.retrodeck.retrodeck")
+            return '"flatpak"', f'run net.retrodeck.retrodeck "{rom_path}"'
+
+        if not self.retroarch.retroarch_executable:
             return None, None
 
         exe = self.retroarch.retroarch_executable
-
-        # RetroDECK: different launch pattern
-        if 'retrodeck' in exe.lower():
-            return 'flatpak', f'run net.retrodeck.retrodeck --pass-args "{rom_path}"'
 
         # Find the right core
         core_name, core_path = self.retroarch.suggest_core_for_platform(platform_name)
