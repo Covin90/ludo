@@ -4302,22 +4302,12 @@ class RetroArchInterface:
             self._is_retrodeck_cache = True
             return True
 
-        # Method 2: Check if RetroDECK directories exist
-        retrodeck_paths = [
-            Path.home() / 'retrodeck',
-            Path.home() / '.var/app/net.retrodeck.retrodeck'
-        ]
-
-        for path in retrodeck_paths:
-            if path.exists():
-                self._is_retrodeck_cache = True
-                return True
-
-        # Method 3: Check save directories for RetroDECK structure
-        for save_type, directory in self.save_dirs.items():
-            if 'retrodeck' in str(directory).lower():
-                self._is_retrodeck_cache = True
-                return True
+        # Method 2: Check the RetroDECK flatpak data directory — this only exists when
+        # RetroDECK is actually installed as a flatpak, unlike ~/retrodeck which can be
+        # any user-created directory (e.g., a ROM storage folder).
+        if (Path.home() / '.var/app/net.retrodeck.retrodeck').exists():
+            self._is_retrodeck_cache = True
+            return True
 
         # Method 4: Check Flatpak list
         try:
@@ -8257,8 +8247,16 @@ class SteamShortcutManager:
         download_dir = Path(download_dir)
 
         for rom in roms:
+            # Skip folder-container ROMs (no extension, has child files).
+            # Their individual variant files are handled as separate ROM entries.
+            if not rom.get('fs_extension', '') and rom.get('files', []):
+                continue
+
             rom_id = rom.get('id')
-            rom_name = rom.get('name', rom.get('fs_name', 'Unknown'))
+            fs_name = rom.get('fs_name', '')
+            # Use filename stem as display name (includes region tag for variants),
+            # matching the process_single_rom convention so all variants get unique names.
+            rom_name = Path(fs_name).stem if fs_name else rom.get('name', 'Unknown')
             platform_name = rom.get('platform_name', rom.get('platform_slug', 'Unknown'))
             platform_slug = rom.get('platform_slug', 'Unknown')
 
@@ -8278,7 +8276,7 @@ class SteamShortcutManager:
                         disc_name = disc_file.get('filename', disc_file.get('file_name', f'disc_{disc_idx}'))
                     else:
                         disc_name = f'disc_{disc_idx}'
-                    
+
                     local_path = download_dir / platform_slug / rom.get('fs_name', rom_name) / disc_name
                     if not is_path_validly_downloaded(local_path):
                         continue
@@ -8291,11 +8289,27 @@ class SteamShortcutManager:
                         shortcuts.append(entry)
                         added += 1
             else:
-                # Single ROM
-                file_name = rom.get('fs_name') or f"{rom_name}.rom"
-                local_path = download_dir / platform_slug / file_name
+                # Single ROM (including regional variants stored in a parent subfolder)
+                file_name = fs_name or f"{rom_name}.rom"
+                platform_dir = download_dir / platform_slug
+                local_path = platform_dir / file_name
                 if not is_path_validly_downloaded(local_path):
-                    continue
+                    # Regional variant files land inside a parent-named subdirectory.
+                    # Scan one level of subdirectories before giving up.
+                    found_in_sub = False
+                    if platform_dir.exists():
+                        try:
+                            for sub in platform_dir.iterdir():
+                                if sub.is_dir():
+                                    candidate = sub / file_name
+                                    if is_path_validly_downloaded(candidate):
+                                        local_path = candidate
+                                        found_in_sub = True
+                                        break
+                        except (OSError, PermissionError):
+                            pass
+                    if not found_in_sub:
+                        continue
                 entry = self.build_shortcut_entry(
                     rom_name, str(local_path), platform_name, collection_name,
                     rom_id=rom_id, platform_slug=platform_slug, cover_url=cover_url
@@ -8433,8 +8447,14 @@ class SteamShortcutManager:
         desired_names = set()
 
         for rom in current_roms:
+            # Skip folder-container ROMs (no extension, has child files).
+            # Their individual variant files are handled as separate ROM entries.
+            if not rom.get('fs_extension', '') and rom.get('files', []):
+                continue
+
             rom_id = rom.get('id')
-            rom_name = rom.get('name', rom.get('fs_name', 'Unknown'))
+            fs_name = rom.get('fs_name', '')
+            rom_name = Path(fs_name).stem if fs_name else rom.get('name', 'Unknown')
             platform_name = rom.get('platform_name', rom.get('platform_slug', 'Unknown'))
             platform_slug = rom.get('platform_slug', 'Unknown')
 
@@ -8453,7 +8473,7 @@ class SteamShortcutManager:
                         disc_name = disc_file.get('filename', disc_file.get('file_name', f'disc_{disc_idx}'))
                     else:
                         disc_name = f'disc_{disc_idx}'
-                    
+
                     local_path = download_dir / platform_slug / rom.get('fs_name', rom_name) / disc_name
                     if not is_path_validly_downloaded(local_path):
                         continue
@@ -8466,10 +8486,27 @@ class SteamShortcutManager:
                         desired.append(entry)
                         desired_names.add(entry['AppName'])
             else:
-                file_name = rom.get('fs_name') or f"{rom_name}.rom"
-                local_path = download_dir / platform_slug / file_name
+                # Single ROM (including regional variants stored in a parent subfolder)
+                file_name = fs_name or f"{rom_name}.rom"
+                platform_dir = download_dir / platform_slug
+                local_path = platform_dir / file_name
                 if not is_path_validly_downloaded(local_path):
-                    continue
+                    # Regional variant files land inside a parent-named subdirectory.
+                    # Scan one level of subdirectories before giving up.
+                    found_in_sub = False
+                    if platform_dir.exists():
+                        try:
+                            for sub in platform_dir.iterdir():
+                                if sub.is_dir():
+                                    candidate = sub / file_name
+                                    if is_path_validly_downloaded(candidate):
+                                        local_path = candidate
+                                        found_in_sub = True
+                                        break
+                        except (OSError, PermissionError):
+                            pass
+                    if not found_in_sub:
+                        continue
                 entry = self.build_shortcut_entry(
                     rom_name, str(local_path), platform_name, collection_name,
                     rom_id=rom_id, platform_slug=platform_slug, cover_url=cover_url
