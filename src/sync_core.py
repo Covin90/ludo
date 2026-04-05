@@ -1690,7 +1690,11 @@ class RomMClient:
 
         try:
             response = self.session.get(
-                urljoin(self.base_url, f'/api/roms?collection_id={collection_id}'),
+                urljoin(self.base_url, '/api/roms'),
+                params={
+                    'collection_id': collection_id,
+                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,siblings,rom_user'
+                },
                 timeout=30
             )
 
@@ -1698,8 +1702,10 @@ class RomMClient:
                 data = response.json()
                 items = data.get('items', [])
 
-                # Group sibling ROMs using shared method
-                return self._group_sibling_roms(items)
+                # Return items as-is: in the collection view each ROM the user
+                # added is shown as its own entry (children are NOT grouped under
+                # their parent folder ROM — that is a platform-view concern).
+                return items
             else:
                 print(f"Failed to get collection ROMs: {response.status_code}")
                 return []
@@ -1747,12 +1753,22 @@ class RomMClient:
                 result_roms.extend(group_roms)
                 continue
 
-            # Pick the "main" ROM - prefer ROM without file extension (folder)
-            # or use is_main_sibling flag if available
+            # Pick the "main" ROM - prefer the folder ROM (parent that contains all
+            # variant files).  The folder ROM has the most entries in its `files`
+            # array (one per variant); individual file ROMs typically have 1 or 0.
+            # Fall back to the original extension / is_main_sibling logic when no
+            # `files` data is available (e.g. older API responses).
             main_rom = None
             sibling_files = []
 
-            for rom in group_roms:
+            has_files_data = any(rom.get('files') for rom in group_roms)
+            candidates = (
+                sorted(group_roms, key=lambda r: len(r.get('files', [])), reverse=True)
+                if has_files_data
+                else group_roms
+            )
+
+            for rom in candidates:
                 fs_extension = rom.get('fs_extension', '')
                 is_main = rom.get('rom_user', {}).get('is_main_sibling', False)
 
@@ -1765,10 +1781,10 @@ class RomMClient:
                 else:
                     sibling_files.append(rom)
 
-            # If no folder ROM found, use the first one as main
+            # If no folder ROM found, use the first candidate as main
             if main_rom is None:
-                main_rom = group_roms[0]
-                sibling_files = group_roms[1:]
+                main_rom = candidates[0]
+                sibling_files = [r for r in group_roms if r is not main_rom]
 
             # Attach siblings to the main ROM
             if sibling_files:
