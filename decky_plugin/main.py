@@ -137,6 +137,9 @@ class Plugin:
     _bios_tracking: 'BiosTrackingManager' = None
     _steam_manager: 'SteamShortcutManager' = None
 
+    # Collections currently running a Steam shortcut sync (add/remove in progress)
+    _syncing_steam_collections: set = None
+
     # -----------------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------------
@@ -146,6 +149,7 @@ class Plugin:
         self._romm_collections = None
         self._connection_attempted = False
         self._platform_slug_to_name = {}
+        self._syncing_steam_collections = set()
         logging.info("RomM Sync Monitor starting...")
         self._start_sync()
         return await self.get_service_status()
@@ -556,6 +560,10 @@ class Plugin:
             collection_count       = status.get('collection_count', 0)
             actively_syncing_count = status.get('actively_syncing_count', 0)
             bios_status            = status.get('bios_status', {})
+
+            syncing_set = self._syncing_steam_collections or set()
+            for col in collections:
+                col['is_syncing_steam'] = col.get('name') in syncing_set
 
             # Show "Fetching games..." until initial fetch completes
             if self._last_full_fetch_time is None:
@@ -1323,33 +1331,39 @@ class Plugin:
                 steam_collections.discard(collection_name)
             self._steam_manager.set_steam_sync_collections(steam_collections)
 
-            if enabled:
-                # Find collection ID and fetch ROMs
-                collection_id = None
-                for col in (self._romm_collections or []):
-                    if col.get('name') == collection_name:
-                        collection_id = col.get('id')
-                        break
+            if self._syncing_steam_collections is None:
+                self._syncing_steam_collections = set()
+            self._syncing_steam_collections.add(collection_name)
+            try:
+                if enabled:
+                    # Find collection ID and fetch ROMs
+                    collection_id = None
+                    for col in (self._romm_collections or []):
+                        if col.get('name') == collection_name:
+                            collection_id = col.get('id')
+                            break
 
-                if collection_id is None:
-                    return {'success': False, 'message': f"Collection '{collection_name}' not found"}
+                    if collection_id is None:
+                        return {'success': False, 'message': f"Collection '{collection_name}' not found"}
 
-                client = self._romm_client
-                if not client or not client.authenticated:
-                    return {'success': False, 'message': 'Not connected to RomM'}
+                    client = self._romm_client
+                    if not client or not client.authenticated:
+                        return {'success': False, 'message': 'Not connected to RomM'}
 
-                collection_roms = client.get_collection_roms(collection_id)
-                download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                        '~/RomMSync/roms')).expanduser()
+                    collection_roms = client.get_collection_roms(collection_id)
+                    download_dir = Path(self._settings.get('Download', 'rom_directory',
+                                                            '~/RomMSync/roms')).expanduser()
 
-                added, msg = self._steam_manager.add_collection_shortcuts(
-                    collection_name, collection_roms, str(download_dir))
-                logging.info(f"Steam sync enabled for '{collection_name}': {msg}")
-                return {'success': True, 'message': msg, 'shortcuts_added': added}
-            else:
-                removed, msg = self._steam_manager.remove_collection_shortcuts(collection_name)
-                logging.info(f"Steam sync disabled for '{collection_name}': {msg}")
-                return {'success': True, 'message': msg, 'shortcuts_removed': removed}
+                    added, msg = self._steam_manager.add_collection_shortcuts(
+                        collection_name, collection_roms, str(download_dir))
+                    logging.info(f"Steam sync enabled for '{collection_name}': {msg}")
+                    return {'success': True, 'message': msg, 'shortcuts_added': added}
+                else:
+                    removed, msg = self._steam_manager.remove_collection_shortcuts(collection_name)
+                    logging.info(f"Steam sync disabled for '{collection_name}': {msg}")
+                    return {'success': True, 'message': msg, 'shortcuts_removed': removed}
+            finally:
+                self._syncing_steam_collections.discard(collection_name)
 
         except Exception as e:
             logging.error(f"toggle_collection_steam_sync error: {e}", exc_info=True)

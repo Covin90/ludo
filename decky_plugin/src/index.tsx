@@ -494,6 +494,7 @@ function Content() {
   const [status, setStatus] = useState<any>({ status: 'loading', message: 'Loading...' });
   const [loading, setLoading] = useState(false);
   const [togglingCollection, setTogglingCollection] = useState<string | null>(null);
+  const [steamSyncingCollection, setSteamSyncingCollection] = useState<string | null>(null);
   const [configured, setConfigured] = useState<boolean | null>(null);
   const configuredRef = useRef<boolean | null>(null);
   const intervalRef = useRef<any>(null);
@@ -671,6 +672,7 @@ function Content() {
   };
 
   const handleToggleSteamSync = async (collectionName: string, enabled: boolean) => {
+    setSteamSyncingCollection(collectionName);
     try {
       const result = await toggleCollectionSteamSync(collectionName, enabled);
       if (result?.success) {
@@ -689,6 +691,8 @@ function Content() {
       await refreshStatus();
     } catch (error) {
       console.error('Failed to toggle Steam sync:', error);
+    } finally {
+      setSteamSyncingCollection(null);
     }
   };
 
@@ -918,13 +922,18 @@ function Content() {
                         </div>
                         {status.steam_available && hasCount && (
                           <div
-                            onClick={(e: React.MouseEvent<HTMLDivElement>) => { e.stopPropagation(); handleToggleSteamSync(collection.name, !collection.steam_sync); }}
-                            title={collection.steam_sync
-                              ? (collection.steam_shortcut_count > 0 ? `${collection.steam_shortcut_count} Steam shortcuts` : 'Remove from Steam')
-                              : 'Add to Steam'}
-                            style={{ display: 'flex', alignItems: 'center', padding: '2px 4px', borderRadius: '4px', cursor: 'pointer' }}
+                            onClick={(e: React.MouseEvent<HTMLDivElement>) => { e.stopPropagation(); if (steamSyncingCollection !== collection.name && !collection.is_syncing_steam) handleToggleSteamSync(collection.name, !collection.steam_sync); }}
+                            title={steamSyncingCollection === collection.name || collection.is_syncing_steam
+                              ? 'Syncing Steam shortcuts...'
+                              : (collection.steam_sync
+                                ? (collection.steam_shortcut_count > 0 ? `${collection.steam_shortcut_count} Steam shortcuts` : 'Remove from Steam')
+                                : 'Add to Steam')}
+                            style={{ display: 'flex', alignItems: 'center', padding: '2px 4px', borderRadius: '4px', cursor: steamSyncingCollection === collection.name || collection.is_syncing_steam ? 'default' : 'pointer' }}
                           >
-                            <FaSteam size={16} color={collection.steam_sync ? '#66c0f4' : '#6b7280'} />
+                            {steamSyncingCollection === collection.name || collection.is_syncing_steam
+                              ? <FaSync size={14} color="#66c0f4" style={{ animation: 'spin 1s linear infinite' }} />
+                              : <FaSteam size={16} color={collection.steam_sync ? '#66c0f4' : '#6b7280'} />
+                            }
                           </div>
                         )}
                       </div>
