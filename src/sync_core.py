@@ -4548,8 +4548,9 @@ class RetroArchInterface:
         original_ext = Path(original_filename).suffix.lower()
 
         if save_type == 'saves':
-            # For save files, keep the extension (.srm, .sav, etc.)
-            if original_ext in ['.srm', '.sav']:
+            # For save files, preserve the original extension for all known save formats
+            known_save_exts = {'.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra'}
+            if original_ext in known_save_exts:
                 target_filename = f"{base_name}{original_ext}"
             else:
                 # Default to .srm if unknown save extension
@@ -4672,7 +4673,7 @@ class RetroArchInterface:
         save_files = {}
         
         # Define common save and state extensions
-        save_extensions = {'.srm', '.sav'}
+        save_extensions = {'.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra'}
         state_extensions = {'.state', '.state1', '.state2', '.state3', '.state4', '.state5', '.state6', '.state7', '.state8', '.state9'}
         
         for save_type, directory in self.save_dirs.items():
@@ -6092,6 +6093,30 @@ class AutoSyncManager:
         except Exception as e:
             self.log(f"❌ Pre-launch sync failed for {game.get('name', 'Unknown')}: {e}")
 
+    def _resolve_core_dir(self, base_dir, game, romm_emulator):
+        """For core mode: when the emulator field doesn't map to an existing directory
+        (e.g. it came from a content-mode upload on another device), find the correct
+        core directory by checking which known cores for this platform exist on disk.
+        Falls back to the first mapped core dir even if it doesn't exist yet (mkdir will create it)."""
+        platform_slug = game.get('platform_slug', '')
+        platform_name = game.get('platform', '')
+        candidates = (self.retroarch.platform_core_map.get(platform_slug) or
+                      self.retroarch.platform_core_map.get(platform_name) or [])
+        first_mapped = None
+        for core in candidates:
+            mapped = self.retroarch.emulator_directory_map.get(core.lower())
+            if mapped:
+                candidate_dir = base_dir / mapped
+                if first_mapped is None:
+                    first_mapped = candidate_dir  # Remember as fallback if none exist on disk
+                if candidate_dir.exists():
+                    self.log(f"  [DEBUG] core fallback: {romm_emulator!r} → using existing dir {mapped!r}")
+                    return candidate_dir
+        if first_mapped is not None:
+            self.log(f"  [DEBUG] core fallback: {romm_emulator!r} → using first mapped dir {first_mapped.name!r} (will be created)")
+            return first_mapped
+        return None
+
     def download_saves_for_specific_game(self, game):
         """Download only the LATEST saves/states for a specific game from RomM with smart overwrite protection"""
         try:
@@ -6347,6 +6372,45 @@ class AutoSyncManager:
                     
                 return latest_file
 
+            # Derive the ROM's content directory (parent folder name) for content-mode path resolution.
+            # In RetroArch content mode, saves/states go into a subdir named after the ROM's
+            # immediate parent folder — e.g. roms/nds/Pokémon HeartGold Version/game.nds → subdir
+            # "Pokémon HeartGold Version".  This is more reliable than mapping the stored emulator
+            # name, which reflects the uploading device's mode and may differ across devices.
+            #
+            # Note: local_path in available_games is always set as download_dir/platform/file,
+            # so it won't reflect a subfolder path for variant ROMs.  We scan the platform dir
+            # on disk to find the actual parent folder name.
+            _content_dir = None
+            _rom_file_name = game.get('file_name', '')
+            _platform_slug = game.get('platform_slug', '')
+            if _rom_file_name and _platform_slug:
+                try:
+                    _rom_dir = Path(self.settings.get('Download', 'rom_directory',
+                                                       '~/RomMSync/roms')).expanduser()
+                    _platform_dir = _rom_dir / _platform_slug
+                    if _platform_dir.exists():
+                        # Case 1: file_name is itself a folder (container ROM like "Pokémon HeartGold Version")
+                        # → content dir IS that folder name
+                        if (_platform_dir / _rom_file_name).is_dir():
+                            _content_dir = _rom_file_name
+                        else:
+                            # Case 2: variant file inside a subfolder — scan to find which one
+                            for _subdir in _platform_dir.iterdir():
+                                if _subdir.is_dir() and (_subdir / _rom_file_name).exists():
+                                    _content_dir = _subdir.name
+                                    break
+                except Exception:
+                    pass
+            # If still not found (flat ROM), fall back to local_path parent
+            if not _content_dir:
+                _local_path = game.get('local_path')
+                if _local_path:
+                    _candidate = Path(_local_path).parent.name
+                    if _candidate and _candidate != _platform_slug:
+                        _content_dir = _candidate
+            self.log(f"  [DEBUG] content_dir resolved: {_content_dir!r} for {_rom_file_name!r}")
+
             # Process saves
             if 'saves' in self.retroarch.save_dirs:
                 save_base_dir = self.retroarch.save_dirs['saves']
@@ -6365,8 +6429,17 @@ class AutoSyncManager:
                         subdir_mode = self.retroarch.get_save_subdir_mode('saves')
                         if subdir_mode == 'core':
                             emulator_save_dir = save_base_dir / self.retroarch.get_retroarch_directory_name(romm_emulator)
+                            # If romm_emulator has no direct core mapping it's likely a content-dir
+                            # name from a content-mode upload on another device. Fall back to known
+                            # cores for this platform regardless of whether the directory exists.
+                            if not self.retroarch.emulator_directory_map.get(romm_emulator.lower() if romm_emulator else ''):
+                                emulator_save_dir = self._resolve_core_dir(
+                                    save_base_dir, game, romm_emulator) or emulator_save_dir
                         elif subdir_mode == 'content':
-                            emulator_save_dir = save_base_dir / self.get_platform_slug_from_emulator(romm_emulator)
+                            # Use the ROM's actual parent folder name (what RetroArch uses as content dir)
+                            # rather than the stored emulator field, which may be from a different device/mode.
+                            subdir_name = _content_dir or self.get_platform_slug_from_emulator(romm_emulator)
+                            emulator_save_dir = save_base_dir / subdir_name
                         else:
                             emulator_save_dir = save_base_dir
                         if emulator_save_dir:
@@ -6427,12 +6500,15 @@ class AutoSyncManager:
                                         temp_path.rename(final_path)
                                     downloads_successful += 1
                                     self.log(f"  ✅ Save ready: {retroarch_filename}")
-                                    # Skip auto-upload for recently downloaded files
-                                    if hasattr(self, 'upload_debounce'):
-                                        self.upload_debounce[str(final_path)] = time.time() + 30
-                                    elif hasattr(self, 'parent_window') and hasattr(self.parent_window, 'auto_sync') and self.parent_window.auto_sync:
-                                        self.parent_window.auto_sync.upload_debounce[str(final_path)] = time.time() + 30
-                                    self.retroarch.send_notification(f"Save downloaded: {game_name}")
+                                    # Record fingerprint so upload worker treats this as already-uploaded,
+                                    # preventing the download→re-upload loop until emulator modifies it.
+                                    _auto_sync = self if hasattr(self, 'upload_debounce') else (
+                                        getattr(getattr(self, 'parent_window', None), 'auto_sync', None))
+                                    if _auto_sync and final_path.exists():
+                                        _fp = final_path.stat()
+                                        _auto_sync.last_uploaded[str(final_path)] = (_fp.st_size, _fp.st_mtime)
+                                        _auto_sync.upload_debounce[str(final_path)] = time.time() + 30
+                                    # Notification sent once at end of sync (see summary block below)
                                 except Exception as e:
                                     self.log(f"  ❌ Failed to rename save: {e}")
 
@@ -6477,12 +6553,19 @@ class AutoSyncManager:
                     emulator_state_dir = None
                     if original_filename:
                         subdir_mode = self.retroarch.get_save_subdir_mode('states')
-                        config_dir_used = self.retroarch.find_retroarch_config_dir()
-                        self.log(f"  [DEBUG] states subdir_mode={subdir_mode!r}, config_dir={config_dir_used}, romm_emulator={romm_emulator!r}")
+                        self.log(f"  [DEBUG] states subdir_mode={subdir_mode!r}, romm_emulator={romm_emulator!r}, content_dir={_content_dir!r}")
                         if subdir_mode == 'core':
                             emulator_state_dir = state_base_dir / self.retroarch.get_retroarch_directory_name(romm_emulator)
+                            # If romm_emulator has no direct core mapping it's likely a content-dir
+                            # name from a content-mode upload on another device. Fall back to known
+                            # cores for this platform regardless of whether the directory exists.
+                            if not self.retroarch.emulator_directory_map.get(romm_emulator.lower() if romm_emulator else ''):
+                                emulator_state_dir = self._resolve_core_dir(
+                                    state_base_dir, game, romm_emulator) or emulator_state_dir
                         elif subdir_mode == 'content':
-                            emulator_state_dir = state_base_dir / self.get_platform_slug_from_emulator(romm_emulator)
+                            # Use the ROM's actual parent folder name (what RetroArch uses as content dir)
+                            subdir_name = _content_dir or self.get_platform_slug_from_emulator(romm_emulator)
+                            emulator_state_dir = state_base_dir / subdir_name
                         else:
                             emulator_state_dir = state_base_dir
                         if emulator_state_dir:
@@ -6543,12 +6626,15 @@ class AutoSyncManager:
                                         temp_path.rename(final_path)
                                     downloads_successful += 1
                                     self.log(f"  ✅ State ready: {retroarch_filename}")
-                                    # Skip auto-upload for recently downloaded files
-                                    if hasattr(self, 'upload_debounce'):
-                                        self.upload_debounce[str(final_path)] = time.time() + 30
-                                    elif hasattr(self, 'parent_window') and hasattr(self.parent_window, 'auto_sync') and self.parent_window.auto_sync:
-                                        self.parent_window.auto_sync.upload_debounce[str(final_path)] = time.time() + 30
-                                    self.retroarch.send_notification(f"Save state downloaded: {game_name}")
+                                    # Record fingerprint so upload worker treats this as already-uploaded,
+                                    # preventing the download→re-upload loop until emulator modifies it.
+                                    _auto_sync = self if hasattr(self, 'upload_debounce') else (
+                                        getattr(getattr(self, 'parent_window', None), 'auto_sync', None))
+                                    if _auto_sync and final_path.exists():
+                                        _fp = final_path.stat()
+                                        _auto_sync.last_uploaded[str(final_path)] = (_fp.st_size, _fp.st_mtime)
+                                        _auto_sync.upload_debounce[str(final_path)] = time.time() + 30
+                                    # Notification sent once at end of sync (see summary block below)
 
                                     # Download screenshot if available
                                     screenshot_filename = f"{final_path.name}.png"
@@ -6609,6 +6695,7 @@ class AutoSyncManager:
                 
                 if downloads_successful > 0:
                     self.log(f"🎮 {game_name} updated with latest server saves/states")
+                    self.retroarch.send_notification(f"Synced: {game_name} ({downloads_successful} file{'s' if downloads_successful != 1 else ''})")
                 elif conflicts_detected > 0:
                     self.log(f"🛡️ {game_name} local saves/states protected from overwrite")
                 else:
@@ -7116,6 +7203,20 @@ class CollectionSyncManager:
                 progress_callback=_chunk_progress
             )
 
+            # Child-file variants (regional ROMs inside a parent folder) cannot be
+            # downloaded via their own ROM ID — the API returns 404.
+            # Fall back to downloading via the parent folder ROM + file_id,
+            # using the siblings list from the collection API response.
+            if not success and 'HTTP 404' in (message or '') and rom.get('fs_extension'):
+                self.log(f"  ↩ Direct 404; trying via parent folder ROM...")
+                parent_success, parent_path = self._download_via_siblings(
+                    rom, file_name, platform_dir, _chunk_progress
+                )
+                if parent_success:
+                    success = True
+                    if parent_path:
+                        local_path = parent_path
+
             if success:
                 self.log(f"  ✅ Downloaded {rom.get('name')}")
                 downloaded_count += 1
@@ -7131,7 +7232,7 @@ class CollectionSyncManager:
                         game['collection'] = collection_name
                         game['is_downloaded'] = True
                         game['local_path'] = str(local_path)
-                        game['local_size'] = local_path.stat().st_size
+                        game['local_size'] = local_path.stat().st_size if local_path.exists() else 0
                         break
             else:
                 self.log(f"  ❌ Failed to download {rom.get('name')}: {message}")
@@ -7146,6 +7247,76 @@ class CollectionSyncManager:
 
         # Sync Steam shortcuts if enabled for this collection
         self._sync_steam_if_enabled(collection_name, collection_roms, download_dir)
+
+    def _download_via_siblings(self, rom, file_name, platform_dir, progress_callback=None):
+        """Download a child-file variant via its parent folder ROM's endpoint + file_id.
+
+        Called when a direct download returns HTTP 404 (variant ROM IDs are not
+        individually downloadable — they live inside a parent folder ROM).
+
+        Returns (success, actual_path) where actual_path is the Path the file
+        was saved to, or (False, None) if no suitable parent could be found.
+        """
+        from urllib.parse import urljoin
+
+        siblings = rom.get('siblings', [])
+        if not siblings:
+            # No sibling data — try fetching ROM details to find the parent
+            try:
+                resp = self.romm_client.session.get(
+                    urljoin(self.romm_client.base_url, f"/api/roms/{rom.get('id')}"),
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    siblings = resp.json().get('siblings', [])
+            except Exception:
+                pass
+
+        for sib in siblings:
+            sib_id = sib.get('id') if isinstance(sib, dict) else sib
+            if not sib_id:
+                continue
+            try:
+                resp = self.romm_client.session.get(
+                    urljoin(self.romm_client.base_url, f"/api/roms/{sib_id}"),
+                    timeout=10
+                )
+                if resp.status_code != 200:
+                    continue
+                sib_details = resp.json()
+            except Exception:
+                continue
+
+            # Only interested in folder ROMs (no extension, has files)
+            if sib_details.get('fs_extension', ''):
+                continue
+            parent_files = sib_details.get('files', [])
+            if not parent_files:
+                continue
+
+            # Find this file in the parent's file list
+            matching = next(
+                (f for f in parent_files
+                 if (f.get('filename') or f.get('file_name', '')) == file_name),
+                None
+            )
+            if not matching or not matching.get('id'):
+                continue
+
+            file_id = matching['id']
+            parent_folder_name = sib_details.get('fs_name') or sib_details.get('name', str(sib_id))
+            actual_path = platform_dir / parent_folder_name / file_name
+
+            self.log(f"  ↩ Downloading via parent ROM {sib_id} (file_id={file_id})")
+            success, message = self.romm_client.download_rom(
+                sib_id, file_name, platform_dir / file_name,
+                progress_callback=progress_callback,
+                file_ids=str(file_id)
+            )
+            if success:
+                return True, actual_path
+
+        return False, None
 
     def handle_removed_games(self, removed_rom_ids, collection_name):
         """Handle removed games - simplified for daemon"""
@@ -8246,11 +8417,47 @@ class SteamShortcutManager:
         added = 0
         download_dir = Path(download_dir)
 
+        self.log(f"[Steam] add_collection_shortcuts: {len(roms)} ROMs, download_dir={download_dir}")
+
         for rom in roms:
-            # Skip folder-container ROMs (no extension, has child files).
-            # Their individual variant files are handled as separate ROM entries.
+            # Folder-container ROM (no extension, has child files): the individual
+            # variant files live in a subdirectory named after the container's fs_name.
+            # Expand them here so both the GTK app (which pre-expands) and the Decky
+            # plugin (which passes raw API data) get shortcuts for downloaded variants.
             if not rom.get('fs_extension', '') and rom.get('files', []):
+                parent_folder = rom.get('fs_name', '')
+                self.log(f"[Steam] container ROM: fs_name={rom.get('fs_name')!r} ext={rom.get('fs_extension')!r} files={len(rom.get('files', []))}")
+                if not parent_folder:
+                    continue
+                _platform_slug = rom.get('platform_slug', 'Unknown')
+                _platform_name = rom.get('platform_name', rom.get('platform_slug', 'Unknown'))
+                _cover_url = rom.get('path_cover_large') or rom.get('path_cover_small')
+                _rom_id = rom.get('id')
+                for file_obj in rom.get('files', []):
+                    if isinstance(file_obj, str):
+                        file_name = file_obj
+                    elif isinstance(file_obj, dict):
+                        file_name = file_obj.get('filename') or file_obj.get('file_name', '')
+                    else:
+                        continue
+                    if not file_name:
+                        self.log(f"[Steam] container file_obj has no filename: {file_obj}")
+                        continue
+                    local_path = download_dir / _platform_slug / parent_folder / file_name
+                    self.log(f"[Steam] variant path check: {local_path} exists={local_path.exists()}")
+                    if not is_path_validly_downloaded(local_path):
+                        continue
+                    variant_name = Path(file_name).stem
+                    entry = self.build_shortcut_entry(
+                        variant_name, str(local_path), _platform_name, collection_name,
+                        rom_id=_rom_id, platform_slug=_platform_slug, cover_url=_cover_url
+                    )
+                    if entry:
+                        shortcuts.append(entry)
+                        added += 1
                 continue
+
+            self.log(f"[Steam] regular ROM: fs_name={rom.get('fs_name')!r} ext={rom.get('fs_extension')!r} platform_slug={rom.get('platform_slug')!r}")
 
             rom_id = rom.get('id')
             fs_name = rom.get('fs_name', '')
@@ -8293,6 +8500,7 @@ class SteamShortcutManager:
                 file_name = fs_name or f"{rom_name}.rom"
                 platform_dir = download_dir / platform_slug
                 local_path = platform_dir / file_name
+                self.log(f"[Steam] single ROM flat check: {local_path} exists={local_path.exists()}")
                 if not is_path_validly_downloaded(local_path):
                     # Regional variant files land inside a parent-named subdirectory.
                     # Scan one level of subdirectories before giving up.
@@ -8305,10 +8513,12 @@ class SteamShortcutManager:
                                     if is_path_validly_downloaded(candidate):
                                         local_path = candidate
                                         found_in_sub = True
+                                        self.log(f"[Steam] found variant in subdir: {local_path}")
                                         break
                         except (OSError, PermissionError):
                             pass
                     if not found_in_sub:
+                        self.log(f"[Steam] not found anywhere, skipping: {file_name}")
                         continue
                 entry = self.build_shortcut_entry(
                     rom_name, str(local_path), platform_name, collection_name,
@@ -8447,9 +8657,35 @@ class SteamShortcutManager:
         desired_names = set()
 
         for rom in current_roms:
-            # Skip folder-container ROMs (no extension, has child files).
-            # Their individual variant files are handled as separate ROM entries.
+            # Folder-container ROM (no extension, has child files): expand variants.
             if not rom.get('fs_extension', '') and rom.get('files', []):
+                parent_folder = rom.get('fs_name', '')
+                if not parent_folder:
+                    continue
+                _platform_slug = rom.get('platform_slug', 'Unknown')
+                _platform_name = rom.get('platform_name', rom.get('platform_slug', 'Unknown'))
+                _cover_url = rom.get('path_cover_large') or rom.get('path_cover_small')
+                _rom_id = rom.get('id')
+                for file_obj in rom.get('files', []):
+                    if isinstance(file_obj, str):
+                        file_name = file_obj
+                    elif isinstance(file_obj, dict):
+                        file_name = file_obj.get('filename') or file_obj.get('file_name', '')
+                    else:
+                        continue
+                    if not file_name:
+                        continue
+                    local_path = download_dir / _platform_slug / parent_folder / file_name
+                    if not is_path_validly_downloaded(local_path):
+                        continue
+                    variant_name = Path(file_name).stem
+                    entry = self.build_shortcut_entry(
+                        variant_name, str(local_path), _platform_name, collection_name,
+                        rom_id=_rom_id, platform_slug=_platform_slug, cover_url=_cover_url
+                    )
+                    if entry:
+                        desired.append(entry)
+                        desired_names.add(entry['AppName'])
                 continue
 
             rom_id = rom.get('id')

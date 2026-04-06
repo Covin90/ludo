@@ -297,14 +297,15 @@ class Plugin:
                         else:
                             local_size = local_path.stat().st_size
                     self._available_games.append({
-                        'name':          Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
-                        'rom_id':        rom.get('id'),
-                        'platform':      rom.get('platform_name', 'Unknown'),
-                        'platform_slug': platform_slug,
-                        'file_name':     file_name,
-                        'is_downloaded': is_downloaded,
-                        'local_path':    str(local_path) if is_downloaded else None,
-                        'local_size':    local_size,
+                        'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
+                        'rom_id':          rom.get('id'),
+                        'platform':        rom.get('platform_name', 'Unknown'),
+                        'platform_slug':   platform_slug,
+                        'file_name':       file_name,
+                        'is_downloaded':   is_downloaded,
+                        'local_path':      str(local_path) if is_downloaded else None,
+                        'local_size':      local_size,
+                        '_sibling_files':  rom.get('_sibling_files', []),
                         'romm_data': {
                             'fs_name':         rom.get('fs_name'),
                             'fs_name_no_ext':  rom.get('fs_name_no_ext'),
@@ -717,14 +718,15 @@ class Plugin:
                                 local_size = local_path.stat().st_size
 
                         self._available_games.append({
-                            'name': Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
-                            'rom_id': rom.get('id'),
-                            'platform': rom.get('platform_name', 'Unknown'),
-                            'platform_slug': platform_slug,
-                            'file_name': file_name,
-                            'is_downloaded': is_downloaded,
-                            'local_path': str(local_path) if is_downloaded else None,
-                            'local_size': local_size,
+                            'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
+                            'rom_id':          rom.get('id'),
+                            'platform':        rom.get('platform_name', 'Unknown'),
+                            'platform_slug':   platform_slug,
+                            'file_name':       file_name,
+                            'is_downloaded':   is_downloaded,
+                            'local_path':      str(local_path) if is_downloaded else None,
+                            'local_size':      local_size,
+                            '_sibling_files':  rom.get('_sibling_files', []),
                             'romm_data': {
                                 'fs_name': rom.get('fs_name'),
                                 'fs_name_no_ext': rom.get('fs_name_no_ext'),
