@@ -1125,8 +1125,16 @@ class SteamGridImageGenerator:
         """
         from PIL import Image
 
-        # Calculate aspect-ratio-preserving size
-        image.thumbnail(target_size, Image.Resampling.LANCZOS)
+        # Calculate aspect-ratio-preserving size (scale to fit, up or down)
+        img_ratio = image.width / image.height
+        target_ratio = target_size[0] / target_size[1]
+        if img_ratio > target_ratio:
+            new_width = target_size[0]
+            new_height = int(new_width / img_ratio)
+        else:
+            new_height = target_size[1]
+            new_width = int(new_height * img_ratio)
+        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
         # Create new image with black background
         result = Image.new('RGB', target_size, (0, 0, 0))
@@ -6848,7 +6856,9 @@ def build_sync_status(romm_client, collection_sync, auto_sync, available_games,
                     if collection_sync and hasattr(collection_sync, 'collection_caches'):
                         cached_rom_ids = collection_sync.collection_caches.get(collection_name)
                         if cached_rom_ids:
-                            total_roms      = len(cached_rom_ids)
+                            # Use file-based count (expands multi-disc ROMs to individual files)
+                            file_counts = getattr(collection_sync, 'collection_file_counts', {})
+                            total_roms      = file_counts.get(collection_name, len(cached_rom_ids))
                             downloaded_roms = total_roms
                             sync_state      = 'synced'
 
@@ -6967,6 +6977,8 @@ class CollectionSyncManager:
         self.thread = None
         self._stop_event = threading.Event()
         self.collection_caches = {}
+        # File-based count per collection — counts individual disc files for multi-disc ROMs
+        self.collection_file_counts = {}  # {collection_name: int}
         # Per-collection download progress — read directly by get_service_status()
         self.download_progress = {}  # {collection_name: {'downloaded': int, 'downloaded_pct': float, 'total': int, 'speed': float}}
         # Last removal event per collection — for frontend notification
@@ -7021,6 +7033,7 @@ class CollectionSyncManager:
         for removed in (old_set - new_set):
             if removed in self.collection_caches:
                 del self.collection_caches[removed]
+                self.collection_file_counts.pop(removed, None)
                 self.log(f"Removed collection from sync: {removed}")
 
         # Update selected_collections immediately so build_sync_status reflects the
@@ -7038,6 +7051,18 @@ class CollectionSyncManager:
                 name=f"romm-add-{added}",
             ).start()
     
+    @staticmethod
+    def _count_rom_files(roms):
+        """Count total files, expanding multi-file ROMs (e.g. multi-disc) by their file count."""
+        total = 0
+        for rom in roms:
+            files = rom.get('files', [])
+            if len(files) > 1:
+                total += len(files)
+            else:
+                total += 1
+        return total
+
     def _init_added_collection(self, collection_name):
         """Fetch ROM list, populate cache, and download missing ROMs for a newly
         added collection.  Runs in a background thread so update_collections()
@@ -7050,7 +7075,8 @@ class CollectionSyncManager:
                     collection_roms = self.romm_client.get_collection_roms(collection_id)
                     rom_ids = {rom.get('id') for rom in collection_roms if rom.get('id')}
                     self.collection_caches[collection_name] = rom_ids
-                    self.log(f"Added collection to sync: {collection_name} ({len(rom_ids)} games)")
+                    self.collection_file_counts[collection_name] = self._count_rom_files(collection_roms)
+                    self.log(f"Added collection to sync: {collection_name} ({self.collection_file_counts[collection_name]} files)")
                     self.handle_added_games(collection_roms, rom_ids, collection_name)
                     break
         except Exception as e:
@@ -7067,7 +7093,8 @@ class CollectionSyncManager:
                     collection_roms = self.romm_client.get_collection_roms(collection_id)
                     rom_ids = {rom.get('id') for rom in collection_roms if rom.get('id')}
                     self.collection_caches[collection_name] = rom_ids
-                    self.log(f"Initialized cache for '{collection_name}': {len(rom_ids)} games")
+                    self.collection_file_counts[collection_name] = self._count_rom_files(collection_roms)
+                    self.log(f"Initialized cache for '{collection_name}': {self.collection_file_counts[collection_name]} files")
 
                     # Download all existing ROMs in the collection
                     all_rom_ids = {rom.get('id') for rom in collection_roms if rom.get('id')}
@@ -7124,17 +7151,18 @@ class CollectionSyncManager:
         # First pass: count ROMs that actually need downloading AND count existing ROMs
         roms_to_download = []
         existing_roms_count = 0
-        # Total collection size is ALL ROMs in the collection, not just newly added ones
-        total_collection_size = len(collection_roms)
+        # Total collection size is ALL files in the collection (multi-disc ROMs expand to their disc count)
+        total_collection_size = self._count_rom_files(collection_roms)
 
         for rom in collection_roms:
+            rom_file_count = len(rom.get('files', [])) if len(rom.get('files', [])) > 1 else 1
             if rom.get('id') not in added_rom_ids:
                 # This ROM is not newly added, but check if it exists locally to count it
                 platform_slug = rom.get('platform_slug', 'Unknown')
                 file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
                 local_path = download_dir / platform_slug / file_name
                 if is_path_validly_downloaded(local_path):
-                    existing_roms_count += 1
+                    existing_roms_count += rom_file_count
                 continue
 
             # This ROM is newly added - check if we need to download it
@@ -7142,7 +7170,7 @@ class CollectionSyncManager:
             file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
             local_path = download_dir / platform_slug / file_name
             if is_path_validly_downloaded(local_path):
-                existing_roms_count += 1
+                existing_roms_count += rom_file_count
             else:
                 roms_to_download.append(rom)
 
@@ -7165,21 +7193,20 @@ class CollectionSyncManager:
             file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
             platform_dir = download_dir / platform_slug
             local_path = platform_dir / file_name
+            rom_file_count = len(rom.get('files', [])) if len(rom.get('files', [])) > 1 else 1
 
             # Create directories
             platform_dir.mkdir(parents=True, exist_ok=True)
 
-            # Progress callback: update download_progress on every chunk so
-            # get_service_status() always reads fresh data (no throttle needed
-            # since the frontend only polls every 2 s anyway).
-            # _base + 1 shows "currently on ROM N" rather than freezing at N-1.
+            # Progress callback: frac (0–1) is scaled across this ROM's file count
+            # so multi-disc games advance the bar proportionally through their disc slots.
             _completed_before_this = existing_roms_count + downloaded_count
 
             def _chunk_progress(info, _coll=collection_name, _base=_completed_before_this,
-                                 _total=total_collection_size):
+                                 _total=total_collection_size, _fcount=rom_file_count):
                 frac  = info.get('progress', 0.0)   # 0.0–1.0 within this ROM
                 speed = info.get('speed',    0.0)   # bytes/sec
-                overall_pct = round((_base + frac) / _total * 100.0, 1) if _total > 0 else 0.0
+                overall_pct = round((_base + frac * _fcount) / _total * 100.0, 1) if _total > 0 else 0.0
                 if _coll in self.download_progress:
                     self.download_progress[_coll]['downloaded']     = _base + 1
                     self.download_progress[_coll]['downloaded_pct'] = overall_pct
@@ -7189,8 +7216,6 @@ class CollectionSyncManager:
             self.log(f"  ⬇️ Downloading {rom.get('name')}...")
 
             # Update progress immediately to show we're starting this ROM
-            # (don't wait for first chunk callback)
-            # Use a tiny fraction (0.01) to show we've started without jumping to the next whole number
             if collection_name in self.download_progress:
                 self.download_progress[collection_name]['downloaded'] = _completed_before_this + 1
                 self.download_progress[collection_name]['downloaded_pct'] = round((_completed_before_this + 0.01) / total_collection_size * 100.0, 1) if total_collection_size > 0 else 0.0
@@ -7219,9 +7244,9 @@ class CollectionSyncManager:
 
             if success:
                 self.log(f"  ✅ Downloaded {rom.get('name')}")
-                downloaded_count += 1
+                downloaded_count += rom_file_count
 
-                # Update progress - add to existing_roms_count to show total local count
+                # Update progress to exact file count after completed download
                 current_local_count = existing_roms_count + downloaded_count
                 self.download_progress[collection_name]['downloaded'] = current_local_count
                 logging.info(f"[PROGRESS] Updated download_progress for {collection_name}: {current_local_count}/{total_collection_size}")

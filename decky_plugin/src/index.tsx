@@ -10,7 +10,7 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, toaster, routerHook, openFilePicker, FileSelectionType } from "@decky/api";
 import { useState, useEffect, useRef, ChangeEvent } from "react";
-import { FaSync, FaTrash, FaCog, FaSteam } from "react-icons/fa";
+import { FaSync, FaTrash, FaCog, FaSteam, FaGithub, FaBug } from "react-icons/fa";
 import { BsGearFill } from "react-icons/bs";
 
 // Call backend methods
@@ -443,6 +443,32 @@ function SettingsPage() {
             onChange={handleLoggingToggle}
             disabled={loading}
           />
+        </PanelSectionRow>
+      </PanelSection>
+      <PanelSection title="About">
+        <PanelSectionRow>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', padding: '4px 0 8px' }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
+              <span style={{ fontWeight: 'bold', fontSize: '15px' }}>RomM RetroArch Sync</span>
+              <span style={{ color: '#9ca3af', fontSize: '11px' }}>v1.5.0</span>
+            </div>
+            <div style={{ color: '#9ca3af', fontSize: '11px' }}>by Covin</div>
+            <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+              {[
+                { icon: <FaGithub size={12} />, label: 'GitHub', url: 'https://github.com/Covin90/romm-retroarch-sync' },
+                { icon: <FaBug size={12} />, label: 'Report Issue', url: 'https://github.com/Covin90/romm-retroarch-sync/issues' },
+              ].map(({ icon, label, url }) => (
+                <div
+                  key={label}
+                  onClick={() => Navigation.NavigateToExternalWeb(url)}
+                  style={{ display: 'flex', alignItems: 'center', gap: '5px', padding: '4px 10px', borderRadius: '4px', background: 'rgba(255,255,255,0.08)', cursor: 'pointer', fontSize: '12px' }}
+                >
+                  {icon}
+                  <span>{label}</span>
+                </div>
+              ))}
+            </div>
+          </div>
         </PanelSectionRow>
       </PanelSection>
       <PanelSection title="Danger Zone">
@@ -920,7 +946,7 @@ function Content() {
                           }} />
                           <span>{collection.name}</span>
                         </div>
-                        {status.steam_available && hasCount && (
+                        {status.steam_available && collection.auto_sync && hasCount && (
                           <div
                             onClick={(e: React.MouseEvent<HTMLDivElement>) => { e.stopPropagation(); if (steamSyncingCollection !== collection.name && !collection.is_syncing_steam) handleToggleSteamSync(collection.name, !collection.steam_sync); }}
                             title={steamSyncingCollection === collection.name || collection.is_syncing_steam
@@ -939,46 +965,30 @@ function Content() {
                       </div>
                     }
                     description={(() => {
-                      if (collection.auto_sync) {
-                        return hasCount ? `${Math.floor(collection.downloaded)} / ${collection.total} ROMs` : "Fetching...";
+                      const countText = collection.auto_sync
+                        ? (hasCount ? `${Math.floor(collection.downloaded)} / ${collection.total} ROMs` : "Fetching...")
+                        : (hasCount ? `${Math.floor(collection.downloaded)} / ${collection.total} ROMs locally` : "Fetching...");
+                      if (isSyncing && hasCount) {
+                        return (
+                          <div>
+                            <div>{countText}</div>
+                            <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.12)', borderRadius: '2px', overflow: 'hidden', margin: '5px 0' }}>
+                              <div style={{ width: `${pct}%`, height: '100%', background: '#fb923c', borderRadius: '2px', transition: 'width 0.4s ease' }} />
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#9ca3af' }}>
+                              <span>{pct}%</span>
+                              {collection.speed > 0 && <span>{formatSpeed(collection.speed)}</span>}
+                            </div>
+                          </div>
+                        );
                       }
-                      return hasCount ? `${Math.floor(collection.downloaded)} / ${collection.total} ROMs locally` : "Fetching...";
+                      return countText;
                     })()}
                     checked={collection.auto_sync}
                     onChange={(value: boolean) => handleToggleCollection(collection.name, value)}
                     disabled={togglingCollection === collection.name}
                   />
                 </PanelSectionRow>
-                {isSyncing && hasCount && (
-                  <PanelSectionRow>
-                    <div style={{ width: '100%', padding: '0 2px 6px' }}>
-                      {/* Progress bar */}
-                      <div style={{
-                        width: '100%',
-                        height: '4px',
-                        background: 'rgba(255,255,255,0.12)',
-                        borderRadius: '2px',
-                        overflow: 'hidden',
-                        marginBottom: '5px',
-                      }}>
-                        <div style={{
-                          width: `${pct}%`,
-                          height: '100%',
-                          background: '#fb923c',
-                          borderRadius: '2px',
-                          transition: 'width 0.4s ease',
-                        }} />
-                      </div>
-                      {/* Percentage + speed row */}
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#9ca3af' }}>
-                        <span>{pct}%</span>
-                        {collection.speed > 0 && (
-                          <span>{formatSpeed(collection.speed)}</span>
-                        )}
-                      </div>
-                    </div>
-                  </PanelSectionRow>
-                )}
               </div>
             );
           })}

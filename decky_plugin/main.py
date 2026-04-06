@@ -437,8 +437,10 @@ class Plugin:
                     continue  # already populated (e.g. from a live toggle this session)
                 roms = self._romm_client.get_collection_roms(col_id)
                 rom_ids = {r.get('id') for r in roms if r.get('id')}
-                self._disabled_collection_counts[name] = {'rom_ids': rom_ids, 'total': len(roms)}
-                logging.debug(f"Fetched disabled count for '{name}': {len(roms)} total")
+                from sync_core import CollectionSyncManager
+                file_count = CollectionSyncManager._count_rom_files(roms)
+                self._disabled_collection_counts[name] = {'rom_ids': rom_ids, 'total': file_count}
+                logging.debug(f"Fetched disabled count for '{name}': {file_count} files ({len(roms)} ROMs)")
         except Exception as e:
             logging.error(f"_fetch_disabled_counts error: {e}", exc_info=True)
 
@@ -801,9 +803,10 @@ class Plugin:
                 # downloaded dynamically (stays accurate as _available_games updates)
                 if self._collection_sync:
                     rom_ids = self._collection_sync.collection_caches.get(collection_name, set())
+                    file_counts = getattr(self._collection_sync, 'collection_file_counts', {})
                     self._disabled_collection_counts[collection_name] = {
                         'rom_ids': set(rom_ids),
-                        'total':   len(rom_ids),
+                        'total':   file_counts.get(collection_name, len(rom_ids)),
                     }
 
             config.set('Collections', 'actively_syncing',  '|'.join(sorted(sync_set)))
@@ -817,22 +820,18 @@ class Plugin:
             if self._settings:
                 self._settings.load_settings()
 
-            # Enable/disable Steam sync integration if available
-            if self._steam_manager and self._steam_manager.is_available():
-                steam_enabled = self._settings.get('Steam', 'enabled', 'false') == 'true'
-                if steam_enabled:
-                    # Call the steam toggle method but don't await it (run in background)
-                    # The method is async but we're in a sync context, so we'll call it
-                    # using asyncio to avoid blocking
+            # When disabling collection sync, also disable Steam sync if it was active
+            if not enabled and self._steam_manager and self._steam_manager.is_available():
+                steam_collections = self._steam_manager.get_steam_sync_collections()
+                if collection_name in steam_collections:
                     import asyncio
                     try:
-                        # Run the steam sync toggle in the background
                         asyncio.create_task(
-                            self.toggle_collection_steam_sync(collection_name, enabled)
+                            self.toggle_collection_steam_sync(collection_name, False)
                         )
-                        logging.info(f"Steam sync {'enabled' if enabled else 'disabled'} for: {collection_name}")
+                        logging.info(f"Steam sync disabled for: {collection_name} (collection sync turned off)")
                     except Exception as e:
-                        logging.warning(f"Could not toggle Steam sync: {e}")
+                        logging.warning(f"Could not disable Steam sync: {e}")
 
             # Update collection sync directly — no trigger file needed
             if self._collection_sync:
