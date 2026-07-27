@@ -59,6 +59,19 @@ if not os.environ.get("DECKY_PLUGIN_VERSION"):
 
 import main as plugin_module  # noqa: E402  (path setup must precede this)
 
+# Both frontends share one GitHub release and differ only in which asset they
+# want: Decky Loader unpacks a zip, the desktop swaps a single AppImage file.
+plugin_module.set_asset_suffix("-x86_64.AppImage")
+
+# Version comes from desktop/package.json, not the plugin's, so update
+# comparisons use the number this build actually ships as.
+try:
+    _dpkg = json.loads((Path(__file__).resolve().parents[1] / "package.json").read_text())
+    if _dpkg.get("version"):
+        plugin_module.PLUGIN_VERSION = _dpkg["version"]
+except Exception:
+    pass
+
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "dist"
 
 

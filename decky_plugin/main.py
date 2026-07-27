@@ -229,7 +229,24 @@ GITHUB_REPO = "ludo"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
 
 # The release asset the updater downloads (see DEPLOYMENT.md naming convention).
+# Both frontends share one release; they differ only in which asset they want.
+# The desktop shell overrides this at startup via set_asset_suffix().
 UPDATE_ASSET_SUFFIX = "-decky.zip"
+
+
+def set_asset_suffix(suffix: str) -> None:
+    """Choose which release asset this frontend updates from.
+
+    Decky keeps the default zip; the desktop shell sets the AppImage suffix.
+    Callers must not rely on the module constant after this — read
+    asset_suffix() instead, since the default is resolved per call.
+    """
+    global UPDATE_ASSET_SUFFIX
+    UPDATE_ASSET_SUFFIX = suffix
+
+
+def asset_suffix() -> str:
+    return UPDATE_ASSET_SUFFIX
 
 # Update channels exposed in the UI.
 VALID_CHANNELS = ("stable", "beta")
@@ -2164,17 +2181,17 @@ class Plugin:
         logging.info(f"[UPDATE] check_on_startup set to {bool(enabled)}")
         return bool(enabled)
 
-    def _select_release(self, channel: str, asset_suffix: str = UPDATE_ASSET_SUFFIX):
+    def _select_release(self, channel: str, asset_suffix: str = None):
         """Return the GitHub release dict for the given channel, or None.
 
         stable → newest non-prerelease carrying the asset. beta → newest release
         overall carrying it (prerelease or stable, whichever is more recent), so
         beta testers always track the leading edge.
         """
-        return select_release(channel, asset_suffix)
+        return select_release(channel, asset_suffix or globals()['UPDATE_ASSET_SUFFIX'])
 
     async def check_for_update(self, channel: str = None,
-                               asset_suffix: str = UPDATE_ASSET_SUFFIX):
+                               asset_suffix: str = None):
         """Query GitHub for a newer release on the selected channel.
 
         Returns dict: {success, available, current, latest, channel, prerelease,
@@ -2182,6 +2199,7 @@ class Plugin:
         AND a downloadable asset both exist.
         """
         try:
+            asset_suffix = asset_suffix or globals()['UPDATE_ASSET_SUFFIX']
             channel = channel if channel in VALID_CHANNELS else \
                 load_decky_settings().get('update_channel', 'stable')
             rel = self._select_release(channel, asset_suffix)
@@ -2239,6 +2257,59 @@ class Plugin:
             return {'success': True, 'path': str(dest), 'name': name}
         except Exception as e:
             logging.error(f"[UPDATE] download_update error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def apply_appimage_update(self, path: str):
+        """Replace the running AppImage with a freshly downloaded one.
+
+        Desktop-only. The Decky plugin updates through Decky Loader's
+        install_plugin instead, which unpacks a zip; an AppImage is a single
+        executable file, so updating it means swapping that file.
+
+        Returns {'success', 'restart_required'}. The caller is responsible for
+        relaunching: the swap only takes effect on the next start.
+        """
+        try:
+            target = os.environ.get('APPIMAGE')
+            if not target:
+                # Running from source (npm run electron) or as an unpacked
+                # build — there is no single file to replace.
+                return {'success': False,
+                        'message': 'Not running as an AppImage; update manually'}
+
+            target = Path(target)
+            src = Path(path)
+            if not src.is_file():
+                return {'success': False, 'message': f'Downloaded file missing: {src}'}
+
+            # Writing into a running executable fails with ETXTBSY, but renaming
+            # over it is fine: this process keeps the old inode until it exits.
+            # The temp file must share a filesystem with the target for
+            # os.replace to be atomic.
+            if not os.access(target.parent, os.W_OK):
+                return {'success': False,
+                        'message': f'No write permission for {target.parent}; '
+                                   'move the AppImage somewhere writable '
+                                   '(e.g. ~/Applications) and retry'}
+
+            staged = target.with_suffix(target.suffix + '.new')
+            shutil.copy2(src, staged)
+            os.chmod(staged, 0o755)
+
+            # Sanity-check before clobbering a working install: an AppImage is
+            # an ELF binary, and a truncated download would brick the app.
+            with open(staged, 'rb') as f:
+                if f.read(4) != b'\x7fELF':
+                    staged.unlink(missing_ok=True)
+                    return {'success': False,
+                            'message': 'Downloaded file is not a valid AppImage'}
+
+            os.replace(staged, target)
+            logging.info(f"[UPDATE] replaced {target} ({target.stat().st_size} bytes)")
+            _record_activity('update', 'Update installed', 'Restart to apply')
+            return {'success': True, 'restart_required': True, 'path': str(target)}
+        except Exception as e:
+            logging.error(f"[UPDATE] apply_appimage_update error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def reset_all_settings(self):
