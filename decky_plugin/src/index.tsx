@@ -8122,6 +8122,11 @@ function SettingsPage() {
       // takes effect on restart, which Decky never needs since it reloads the
       // plugin in place.
       if ((window as any).__rommDesktop) {
+        // No progress events on this path — the download is one long request,
+        // so a percentage would sit at 0 for the whole ~170MB and read as
+        // stalled. Use the busy state and say what is happening instead.
+        setInstallPct(null);
+        setStatusMsg({ kind: 'ok', text: `Downloading v${updateInfo.latest}…` });
         const dl = await downloadUpdate(updateInfo.url);
         if (!dl?.success) {
           setStatusMsg({ kind: 'err', text: `Download failed — ${dl?.message ?? 'unknown error'}` });
@@ -8138,8 +8143,10 @@ function SettingsPage() {
         }
         setInstallPct(null);
         setUpdating(false);
-        setUpdateInfo({ ...updateInfo, restartRequired: true });
-        setStatusMsg({ kind: 'ok', text: `v${updateInfo.latest} installed — restart to apply.` });
+        // Clear `available`: the update is on disk, so offering "Install"
+        // again is wrong. The action button becomes Restart instead.
+        setUpdateInfo({ ...updateInfo, available: false, restartRequired: true });
+        setStatusMsg({ kind: 'ok', text: `v${updateInfo.latest} installed — restart to finish.` });
         return;
       }
 
@@ -8399,32 +8406,30 @@ function SettingsPage() {
               value={channel} onChange={handleChannelChange} disabled={updating} />
           </div>
           {/* Action: full width, fixed height; fills with brand color while installing */}
+          {/* One action, whose meaning follows the state: check -> install ->
+              restart. A separate restart button alongside a re-enabled
+              "Install" reads as if the install failed. */}
           <UpdateActionBtn
-            label={updating ? `Installing… ${installPct != null ? `${installPct}%` : ''}`
+            label={updating ? `Installing…${installPct != null ? ` ${installPct}%` : ''}`
               : checking ? 'Checking…'
-                : updateInfo?.available ? `Install v${updateInfo.latest}`
-                  : 'Check for Updates'}
-            icon={updateInfo?.available && !updating ? <FaDownload size={13} /> : <FaSync size={13} />}
-            onClick={updateInfo?.available ? handleInstallUpdate : handleCheckUpdate}
+                : updateInfo?.restartRequired ? 'Restart to finish updating'
+                  : updateInfo?.available ? `Install v${updateInfo.latest}`
+                    : 'Check for Updates'}
+            icon={updateInfo?.restartRequired ? <FaSync size={13} />
+              : updateInfo?.available && !updating ? <FaDownload size={13} />
+                : <FaSync size={13} />}
+            onClick={updateInfo?.restartRequired
+              ? () => (window as any).__rommDesktop?.restart?.()
+              : updateInfo?.available ? handleInstallUpdate : handleCheckUpdate}
             disabled={checking || updating}
-            primary={!!updateInfo?.available && !updating}
-            progress={updating ? (installPct ?? 0) : null}
+            primary={(!!updateInfo?.available || !!updateInfo?.restartRequired) && !updating}
+            progress={updating ? installPct : null}
             busy={checking || updating}
           />
           {updateInfo?.downloadedPath && (
             <div style={{ fontSize: '11px', color: V2.fgMuted, wordBreak: 'break-all' }}>
               Downloaded to: {updateInfo.downloadedPath}
             </div>
-          )}
-          {/* Desktop only: the new AppImage is in place but the old one is
-              still running, so the update is not live until we re-exec. */}
-          {updateInfo?.restartRequired && (
-            <V2Button
-              variant="tonal"
-              onClick={() => (window as any).__rommDesktop?.restart?.()}
-            >
-              <FaSync size={13} /><span>Restart to finish updating</span>
-            </V2Button>
           )}
           {updateInfo?.available && !!updateInfo.notes && !updating && (
             <>

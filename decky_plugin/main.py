@@ -2292,19 +2292,33 @@ class Plugin:
                                    'move the AppImage somewhere writable '
                                    '(e.g. ~/Applications) and retry'}
 
-            staged = target.with_suffix(target.suffix + '.new')
-            shutil.copy2(src, staged)
-            os.chmod(staged, 0o755)
-
             # Sanity-check before clobbering a working install: an AppImage is
-            # an ELF binary, and a truncated download would brick the app.
-            with open(staged, 'rb') as f:
+            # an ELF binary, and a truncated download or an HTML error page
+            # would leave the app unlaunchable.
+            with open(src, 'rb') as f:
                 if f.read(4) != b'\x7fELF':
-                    staged.unlink(missing_ok=True)
                     return {'success': False,
                             'message': 'Downloaded file is not a valid AppImage'}
+            os.chmod(src, 0o755)
 
-            os.replace(staged, target)
+            # Move the download onto the target rather than copying it: the
+            # image is ~170MB, so a copy would briefly need three times the
+            # size on disk and leave the download behind afterwards.
+            try:
+                os.replace(src, target)
+            except OSError:
+                # Different filesystems — fall back to staging a copy beside
+                # the target (os.replace is only atomic within one fs), then
+                # drop the download so it does not accumulate in the config
+                # directory on every update.
+                staged = target.with_suffix(target.suffix + '.new')
+                shutil.copy2(src, staged)
+                os.chmod(staged, 0o755)
+                os.replace(staged, target)
+                try:
+                    src.unlink()
+                except OSError:
+                    logging.warning(f"[UPDATE] could not remove {src}")
             logging.info(f"[UPDATE] replaced {target} ({target.stat().st_size} bytes)")
             _record_activity('update', 'Update installed', 'Restart to apply')
             return {'success': True, 'restart_required': True, 'path': str(target)}
