@@ -298,6 +298,14 @@ def _iter_releases(max_pages=5, per_page=100):
     for page in range(1, max_pages + 1):
         resp = requests.get(f"{GITHUB_API}/releases", headers=headers,
                             params={'per_page': per_page, 'page': page}, timeout=15)
+        if resp.status_code == 404:
+            # No releases published yet, or the repo is private (GitHub answers
+            # 404 rather than 403 to unauthenticated reads). Neither is an
+            # error worth a traceback on every startup — there is simply
+            # nothing to update to.
+            logging.info("[UPDATE] no releases available (repo private or "
+                         "nothing published yet)")
+            return
         resp.raise_for_status()
         batch = resp.json()
         if not batch:
@@ -334,7 +342,10 @@ def select_release(channel: str, asset_suffix: str):
             logging.info("[UPDATE] /releases/latest lacks "
                          f"{asset_suffix}; enumerating releases")
         except Exception as e:
-            logging.warning(f"[UPDATE] /releases/latest failed ({e}); enumerating")
+            if getattr(getattr(e, 'response', None), 'status_code', None) == 404:
+                logging.info("[UPDATE] no published 'latest' release; enumerating")
+            else:
+                logging.warning(f"[UPDATE] /releases/latest failed ({e}); enumerating")
 
     candidates = [r for r in _iter_releases()
                   if (channel == 'beta' or not r.get('prerelease'))
