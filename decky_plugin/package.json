@@ -1,6 +1,6 @@
 {
   "name": "ludo",
-  "version": "1.0.0-beta.3",
+  "version": "1.0.0-beta.4",
   "description": "Sync ROMs, saves and states between RomM and RetroArch",
   "type": "module",
   "scripts": {
