@@ -256,8 +256,33 @@ if (!app.requestSingleInstanceLock()) {
   // moment we exit.
   ipcMain.on("romm:restart", () => {
     const appImage = process.env.APPIMAGE;
-    if (appImage) app.relaunch({ execPath: appImage });
-    else app.relaunch();
+    console.log(`[restart] APPIMAGE=${appImage || "(unset)"}`);
+
+    if (appImage) {
+      // app.relaunch() is unreliable here: it re-execs as this process exits,
+      // which is exactly when the AppImage's FUSE mount is being torn down —
+      // the new process can end up pointing at a mountpoint that is going
+      // away. Spawning a fully detached child first, and only then exiting,
+      // keeps the two lifetimes independent. The child mounts its own copy.
+      try {
+        stopBackend();
+        const child = spawn(appImage, [], {
+          detached: true,
+          stdio: "ignore",
+          env: { ...process.env },
+        });
+        child.unref();
+        console.log(`[restart] spawned replacement pid=${child.pid}`);
+        // Give the child a moment to exec before this process (and its mount)
+        // goes away.
+        setTimeout(() => app.exit(0), 500);
+        return;
+      } catch (err) {
+        console.error("[restart] detached spawn failed, falling back:", err);
+      }
+    }
+
+    app.relaunch();
     app.quit();
   });
 

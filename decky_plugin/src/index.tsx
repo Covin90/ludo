@@ -7992,6 +7992,10 @@ function SettingsPage() {
   const [checking, setChecking] = useState<boolean>(false);
   const [updating, setUpdating] = useState<boolean>(false);
   const [updateInfo, setUpdateInfo] = useState<any>(null);
+  // What the update is doing right now. Decky reports real percentages
+  // via loader events; the desktop path is a single long download with
+  // none, so it names the phase instead of showing a frozen number.
+  const [updatePhase, setUpdatePhase] = useState<string | null>(null);
   const [checkOnStartup, setCheckOnStartupState] = useState<boolean>(true);
   // Install progress % (from loader/plugin_download_info events) and the
   // inline status line under the action button ('ok' green / 'err' red).
@@ -8126,22 +8130,27 @@ function SettingsPage() {
         // so a percentage would sit at 0 for the whole ~170MB and read as
         // stalled. Use the busy state and say what is happening instead.
         setInstallPct(null);
-        setStatusMsg({ kind: 'ok', text: `Downloading v${updateInfo.latest}…` });
+        setUpdatePhase(`Downloading v${updateInfo.latest}…`);
+        setStatusMsg({ kind: 'ok', text: `Downloading v${updateInfo.latest} — this may take a minute.` });
         const dl = await downloadUpdate(updateInfo.url);
         if (!dl?.success) {
           setStatusMsg({ kind: 'err', text: `Download failed — ${dl?.message ?? 'unknown error'}` });
+          setUpdatePhase(null);
           setUpdating(false);
           setInstallPct(null);
           return;
         }
+        setUpdatePhase('Installing…');
         const applied = await applyAppImageUpdate(dl.path);
         if (!applied?.success) {
           setStatusMsg({ kind: 'err', text: `Install failed — ${applied?.message ?? 'unknown error'}` });
+          setUpdatePhase(null);
           setUpdating(false);
           setInstallPct(null);
           return;
         }
         setInstallPct(null);
+        setUpdatePhase(null);
         setUpdating(false);
         // Clear `available`: the update is on disk, so offering "Install"
         // again is wrong. The action button becomes Restart instead.
@@ -8260,6 +8269,7 @@ function SettingsPage() {
       setStatusMsg({ kind: 'err', text: `Update failed — ${String(error)}` });
       setUpdating(false);
       setInstallPct(null);
+      setUpdatePhase(null);
     }
   };
 
@@ -8410,7 +8420,7 @@ function SettingsPage() {
               restart. A separate restart button alongside a re-enabled
               "Install" reads as if the install failed. */}
           <UpdateActionBtn
-            label={updating ? `Installing…${installPct != null ? ` ${installPct}%` : ''}`
+            label={updating ? (updatePhase ?? `Installing…${installPct != null ? ` ${installPct}%` : ''}`)
               : checking ? 'Checking…'
                 : updateInfo?.restartRequired ? 'Restart to finish updating'
                   : updateInfo?.available ? `Install v${updateInfo.latest}`
