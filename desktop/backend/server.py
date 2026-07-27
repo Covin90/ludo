@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desktop HTTP backend for the RomM RetroArch Sync UI.
+"""Desktop HTTP backend for the Ludo UI.
 
 The desktop app has no Decky, so the React bundle (served here as static files)
 can't reach the Python engine through Decky's `callable` IPC. This server is the
@@ -32,8 +32,8 @@ from urllib.parse import unquote, urlparse
 # compiled for cpython-311). main.py prepends py_modules to sys.path at import
 # time, so those would shadow our environment's working builds. Pre-importing
 # the good copies caches them in sys.modules, and the late path insertion then
-# resolves them from cache. sync_core/activity_log are pure Python and load
-# fine from py_modules.
+# resolves them from cache. The engine itself is pure Python and
+# imports from the installed romm_sync_engine package.
 for _dep in ("PIL.Image", "requests", "watchdog", "psutil"):
     try:
         __import__(_dep)
@@ -43,13 +43,13 @@ for _dep in ("PIL.Image", "requests", "watchdog", "psutil"):
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_DIR = REPO_ROOT / "decky_plugin"
 
-sys.path.insert(0, str(REPO_ROOT / "src"))
+# The engine is a real package now (pip install -e engine/); only the plugin
+# itself still needs a path entry so `import main` resolves.
 sys.path.insert(0, str(PLUGIN_DIR))
-sys.path.append(str(PLUGIN_DIR / "py_modules"))  # activity_log lives here only
 
 # Decky injected these; supply equivalents so main.py's module-level reads work.
 os.environ.setdefault("DECKY_PLUGIN_RUNTIME_DIR",
-                      str(Path.home() / ".config" / "romm-retroarch-sync"))
+                      str(Path.home() / ".config" / "ludo"))
 if not os.environ.get("DECKY_PLUGIN_VERSION"):
     try:
         pkg = json.loads((PLUGIN_DIR / "package.json").read_text())

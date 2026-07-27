@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BIOS Manager for RomM-RetroArch Sync
+BIOS Manager for the RomM sync engine
 Handles BIOS detection, verification, and synchronization
 """
 

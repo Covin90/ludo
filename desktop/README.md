@@ -1,4 +1,4 @@
-# RomM RetroArch Sync — desktop client
+# Ludo — desktop client
 
 A generic build of the sync app (Linux + Windows), for people running RetroArch
 **without** a Steam Deck / Decky. It reuses the Decky plugin's engine and UI
@@ -8,7 +8,7 @@ unchanged:
   points `@decky/ui` and `@decky/api` at `src/shim/*` (web implementations of
   the Decky primitives) instead of forking the 9k-line file.
 - **Engine** — the plugin's `Plugin` class (`decky_plugin/main.py`) and
-  `sync_core.py`, imported as-is by `backend/server.py`. Decky's `callable` IPC
+  the shared `romm_sync_engine` package, imported by `backend/server.py`. Decky's `callable` IPC
   is replaced by HTTP: the shim's `callable` POSTs to `/api/<method>`, the
   server dispatches to `plugin.<method>(*args)`.
 

@@ -1,5 +1,5 @@
 {
-  "name": "romm-retroarch-sync",
+  "name": "ludo",
   "version": "1.7.0-beta.143",
   "description": "Sync ROMs, saves and states between RomM and RetroArch on Steam Deck",
   "type": "module",
@@ -13,7 +13,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Covin90/romm-retroarch-sync.git"
+    "url": "git+https://github.com/Covin90/ludo.git"
   },
   "keywords": [
     "decky",
@@ -25,9 +25,9 @@
   "author": "Hector Eduardo \"Covin\" Silveri",
   "license": "GPL-3.0-or-later",
   "bugs": {
-    "url": "https://github.com/Covin90/romm-retroarch-sync/issues"
+    "url": "https://github.com/Covin90/ludo/issues"
   },
-  "homepage": "https://github.com/Covin90/romm-retroarch-sync#readme",
+  "homepage": "https://github.com/Covin90/ludo#readme",
   "devDependencies": {
     "@decky/rollup": "^1.0.1",
     "@decky/ui": "^4.7.2",

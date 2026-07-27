@@ -1,7 +1,7 @@
 # Decky Plugin Deployment Guide
 
 > **For AI agents and developers:** This file documents the complete build and packaging process
-> for the RomM Sync Monitor Decky plugin. Read this before making any changes to the build process.
+> for the Ludo Decky plugin. Read this before making any changes to the build process.
 
 ---
 
@@ -25,15 +25,15 @@ installed plugin's files in place — no zip, no reinstall, no `sudo` (the insta
 user-writable). The plugin lives at:
 
 ```
-~/homebrew/plugins/romm-sync-monitor/
+~/homebrew/plugins/ludo/
 ```
 
 After editing source, copy only what changed, then reload the plugin from the Decky QAM
 (or toggle it off/on):
 
 ```bash
-cd /home/covin/romm-retroarch-sync
-DEST=~/homebrew/plugins/romm-sync-monitor
+cd /home/covin/ludo
+DEST=~/homebrew/plugins/ludo
 
 # Frontend change (src/index.tsx):
 (cd decky_plugin && pnpm run build) && cp decky_plugin/dist/index.js decky_plugin/dist/index.js.map "$DEST/dist/"
@@ -48,7 +48,7 @@ cp src/sync_core.py "$DEST/py_modules/sync_core.py"
 Notes:
 - A **full plugin reload** is required for `main.py` / `sync_core.py` changes (Python is only
   imported at load). Frontend (`dist/index.js`) also needs a reload to re-evaluate.
-- Backend Python logs land in `~/homebrew/logs/romm-sync-monitor/<timestamp>.log`. Frontend
+- Backend Python logs land in `~/homebrew/logs/ludo/<timestamp>.log`. Frontend
   `console.*`/toasts do **not**; bridge them to the backend with a temporary `debug_log`
   callable when diagnosing frontend issues.
 - Loose deploy is for iteration only — always cut a real zip (below) for releases/handoff.
@@ -78,9 +78,9 @@ cd "$ROOT"
 # VERSION is derived from decky_plugin/package.json (the single source of truth),
 # not hardcoded — bump it there and the zip name follows automatically.
 VERSION="$(node -p "require('./decky_plugin/package.json').version")"
-PLUGIN_NAME="romm-sync-monitor"
+PLUGIN_NAME="ludo"
 PLUGIN_DIR="decky_plugin"
-OUT_ZIP="RomM-RetroArch-Sync-v${VERSION}-decky.zip"
+OUT_ZIP="Ludo-v${VERSION}-decky.zip"
 TMP_DIR=$(mktemp -d)
 mkdir -p "${TMP_DIR}/${PLUGIN_NAME}/dist" "${TMP_DIR}/${PLUGIN_NAME}/assets" "${TMP_DIR}/${PLUGIN_NAME}/bin"
 cp "${PLUGIN_DIR}/plugin.json" "${PLUGIN_DIR}/package.json" "${PLUGIN_DIR}/LICENSE" "${PLUGIN_DIR}/main.py" "${TMP_DIR}/${PLUGIN_NAME}/"
@@ -97,10 +97,10 @@ rm -rf "$TMP_DIR"
 unzip -p "$OUT_ZIP" "${PLUGIN_NAME}/py_modules/sync_core.py" | grep -c "_host_subprocess_env"
 ```
 
-The output zip is at the **repo root**: `RomM-RetroArch-Sync-v<VERSION>-decky.zip` (~11 MB with
+The output zip is at the **repo root**: `Ludo-v<VERSION>-decky.zip` (~11 MB with
 bundled libs), where `<VERSION>` comes from `decky_plugin/package.json`. To release a new
-version, bump `"version"` in that file — the zip name (and this whole flow) follows. The name
-matches the AppImage pattern `RomM-RetroArch-Sync-v<VERSION>.AppImage`.
+version, bump `"version"` in that file — the zip name (and this whole flow) follows. (The GTK app lives in the separate romm-retroarch-sync repo and
+versions independently.)
 
 ## Publish a release
 
@@ -112,7 +112,7 @@ git tag "v${VERSION}" && git push origin "v${VERSION}"
 gh release create "v${VERSION}" \
   --prerelease \
   --notes-file notes.md \
-  "RomM-RetroArch-Sync-v${VERSION}-decky.zip"
+  "Ludo-v${VERSION}-decky.zip"
 ```
 
 **Push the tag before creating the release.** `gh` creates the release against `tag_name`;
@@ -164,10 +164,10 @@ Decky Loader's installer validates all of these. **Any missing file causes silen
 
 ### ZIP structure
 
-The zip must have a **single top-level directory** named `romm-sync-monitor/`:
+The zip must have a **single top-level directory** named `ludo/`:
 
 ```
-romm-sync-monitor/
+ludo/
   plugin.json
   package.json
   LICENSE
@@ -197,13 +197,13 @@ romm-sync-monitor/
 
 - `"flags"` **must be `[]`** — setting `["_root"]` silently blocks ZIP installation in Decky Loader
 - `"api_version"` must be `2`
-- `"name"` is the display name shown in Decky ("RomM Sync Monitor")
+- `"name"` is the display name shown in Decky ("Ludo")
 
 ---
 
 ## Installation on SteamOS
 
-1. Transfer the ZIP file (e.g., `RomM-RetroArch-Sync-v1.6-decky.zip`) to the SteamOS device
+1. Transfer the ZIP file (e.g., `Ludo-v1.6-decky.zip`) to the SteamOS device
 2. In Decky Loader: **gear icon → "Install plugin from ZIP"**
 3. Select the zip file
 
@@ -214,10 +214,10 @@ Do **not** restart Decky Loader after installation — use the Decky QAM reload 
 If `sshpass` is installed and the Deck is reachable, you can send the zip directly:
 
 ```bash
-sshpass -p "<password>" scp RomM-RetroArch-Sync-v1.6-decky.zip deck@<deck-ip>:~/
+sshpass -p "<password>" scp Ludo-v1.6-decky.zip deck@<deck-ip>:~/
 ```
 
-Then install from `~/RomM-RetroArch-Sync-v1.6-decky.zip` on the Deck via Decky Loader.
+Then install from `~/Ludo-v1.6-decky.zip` on the Deck via Decky Loader.
 
 ---
 

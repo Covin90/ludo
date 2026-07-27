@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RomM RetroArch Sync — desktop window shell.
+"""Ludo — desktop window shell.
 
 Launches the HTTP backend (backend/server.py) in-process on a free localhost
 port, then opens a native WebKitGTK window pointing at it. The engine lives only
@@ -76,7 +76,7 @@ MIN_ZOOM = 0.5
 
 class AppWindow:
     def __init__(self, url, fullscreen=True):
-        self.window = Gtk.Window(title="RomM RetroArch Sync")
+        self.window = Gtk.Window(title="Ludo")
         self.window.set_default_size(1280, 800)
         self.window.maximize()  # sensible non-fullscreen state
         self._fullscreen = fullscreen

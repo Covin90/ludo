@@ -3346,10 +3346,10 @@ function ConfigPage() {
         setPairCode('');
         Navigation.NavigateBack();
       } else {
-        toaster.toast({ title: 'RomM Sync Error', body: result.message || 'Pairing failed.', duration: 5000 });
+        toaster.toast({ title: 'Ludo Error', body: result.message || 'Pairing failed.', duration: 5000 });
       }
     } catch (e) {
-      toaster.toast({ title: 'RomM Sync Error', body: 'Pairing failed unexpectedly.', duration: 5000 });
+      toaster.toast({ title: 'Ludo Error', body: 'Pairing failed unexpectedly.', duration: 5000 });
     } finally {
       setPairing(false);
     }
@@ -3364,10 +3364,10 @@ function ConfigPage() {
         // No in-progress toast — NavigateBack to the reconnecting UI is the feedback.
         Navigation.NavigateBack();
       } else {
-        toaster.toast({ title: 'RomM Sync Error', body: result.error || 'Failed to save configuration.', duration: 5000 });
+        toaster.toast({ title: 'Ludo Error', body: result.error || 'Failed to save configuration.', duration: 5000 });
       }
     } catch (e) {
-      toaster.toast({ title: 'RomM Sync Error', body: 'Failed to save configuration.', duration: 5000 });
+      toaster.toast({ title: 'Ludo Error', body: 'Failed to save configuration.', duration: 5000 });
     } finally {
       setSaving(false);
     }
@@ -3385,7 +3385,7 @@ function ConfigPage() {
       {/* Header */}
       {isFirstTime ? (
         <div style={{ padding: '16px 16px 4px' }}>
-          <div className={staticClasses.Title} style={{ marginBottom: '8px' }}>Welcome to RomM Sync</div>
+          <div className={staticClasses.Title} style={{ marginBottom: '8px' }}>Welcome to Ludo</div>
           <div style={{ fontSize: '13px', color: '#d1d5db', lineHeight: '1.6' }}>
             Connect your SteamOS device to your RomM server to automatically sync ROMs and save files across devices.
           </div>
@@ -8065,7 +8065,7 @@ function SettingsPage() {
         };
 
         const onPrompt = (name: string, _version: string, request_id: string) => {
-          if (name !== 'RomM RetroArch Sync') return;
+          if (name !== 'Ludo') return;
           // Put Decky's listeners back immediately — store installs must keep
           // prompting normally; only OUR request skips the modal.
           try {
@@ -8083,7 +8083,7 @@ function SettingsPage() {
           if (typeof percent === 'number') setInstallPct(Math.max(0, Math.min(100, Math.round(percent))));
         };
         const onFinish = (name: string) => {
-          if (name !== 'RomM RetroArch Sync') return;
+          if (name !== 'Ludo') return;
           restore();
           setInstallPct(100);
           toaster.toast({ title: `Updated to v${updateInfo.latest}`, body: '', duration: 5000 });
@@ -8118,7 +8118,7 @@ function SettingsPage() {
         await backend.call(
           'utilities/install_plugin',
           updateInfo.url,
-          'RomM RetroArch Sync',
+          'Ludo',
           updateInfo.latest,
           '',
         );
@@ -8355,7 +8355,7 @@ function SettingsPage() {
         <V2SettingsRow
           icon={<FaBug size={16} />}
           title="Enable debug logging"
-          subtitle="Write logs to ~/.config/romm-retroarch-sync/decky_debug.log"
+          subtitle="Write logs to ~/.config/ludo/decky_debug.log"
           onClick={loading ? undefined : () => handleLoggingToggle(!loggingEnabled)}
           right={<V2Switch checked={loggingEnabled} />}
           disabled={loading}
@@ -8369,14 +8369,14 @@ function SettingsPage() {
           border: `1px solid ${V2.border}`,
         }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
-            <span style={{ fontWeight: 800, fontSize: '16px' }}>RomM RetroArch Sync</span>
+            <span style={{ fontWeight: 800, fontSize: '16px' }}>Ludo</span>
             <span style={{ color: V2.fgMuted, fontSize: '12px' }}>v{version || '1.6.0'}</span>
           </div>
           <div style={{ color: V2.fgMuted, fontSize: '12px' }}>by Covin</div>
           <div style={{ display: 'flex', gap: '10px', marginTop: '6px' }}>
             {[
-              { icon: <FaGithub size={13} />, label: 'GitHub', url: 'https://github.com/Covin90/romm-retroarch-sync' },
-              { icon: <FaBug size={13} />, label: 'Report Issue', url: 'https://github.com/Covin90/romm-retroarch-sync/issues' },
+              { icon: <FaGithub size={13} />, label: 'GitHub', url: 'https://github.com/Covin90/ludo' },
+              { icon: <FaBug size={13} />, label: 'Report Issue', url: 'https://github.com/Covin90/ludo/issues' },
             ].map(({ icon, label, url }) => (
               <V2Button key={label} variant="tonal" onClick={() => Navigation.NavigateToExternalWeb(url)}>
                 {icon}<span>{label}</span>
@@ -8460,7 +8460,7 @@ function Content() {
 
   if (configured === false) {
     return (
-      <PanelSection title="RomM Sync">
+      <PanelSection title="Ludo">
         <PanelSectionRow>
           <div style={{ fontSize: '0.85em', color: '#d1d5db', lineHeight: '1.5' }}>
             Connect your SteamOS device to your RomM server to sync ROMs and saves.
@@ -8547,7 +8547,7 @@ function TitleView() {
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
-      <div style={{ marginRight: 'auto', flex: 0.9 }}>RomM Sync</div>
+      <div style={{ marginRight: 'auto', flex: 0.9 }}>Ludo</div>
       <DialogButton
         style={{ height: '28px', width: '28px', minWidth: 0, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', marginRight: '4px' }}
         onClick={handleRefresh}
@@ -8783,15 +8783,15 @@ function SetupWizard() {
 
       if (mode === 'pair') {
         const r = await pairDevice(url.trim(), pairCode.trim());
-        if (r?.success) { toaster.toast({ title: 'RomM Sync', body: 'Paired — connecting…' }); finish(); }
-        else toaster.toast({ title: 'RomM Sync', body: r?.message || 'Pairing failed.' });
+        if (r?.success) { toaster.toast({ title: 'Ludo', body: 'Paired — connecting…' }); finish(); }
+        else toaster.toast({ title: 'Ludo', body: r?.message || 'Pairing failed.' });
       } else {
         const dev = deviceName.trim() || deviceNameDefault;
         const r = await saveConfig(url.trim(), username.trim(), password, romDir.trim(), saveDir.trim(), dev, biosDir.trim());
-        if (r?.success) { toaster.toast({ title: 'RomM Sync', body: 'Connected!' }); finish(); }
-        else toaster.toast({ title: 'RomM Sync', body: r?.error || 'Failed to save configuration.' });
+        if (r?.success) { toaster.toast({ title: 'Ludo', body: 'Connected!' }); finish(); }
+        else toaster.toast({ title: 'Ludo', body: r?.error || 'Failed to save configuration.' });
       }
-    } catch { toaster.toast({ title: 'RomM Sync', body: 'Something went wrong.' }); }
+    } catch { toaster.toast({ title: 'Ludo', body: 'Something went wrong.' }); }
     finally { setBusy(false); }
   };
 
@@ -8911,7 +8911,7 @@ function SetupWizard() {
           {step === 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', textAlign: 'center' }}>
               {logo && <img className="wiz-logo" src={logo} style={{ width: '96px', height: '96px', objectFit: 'contain' }} />}
-              <div style={{ fontSize: '28px', fontWeight: 800, letterSpacing: '-0.01em' }}>Welcome to RomM Sync</div>
+              <div style={{ fontSize: '28px', fontWeight: 800, letterSpacing: '-0.01em' }}>Welcome to Ludo</div>
               <div style={{ fontSize: '14px', color: V2.fg2, lineHeight: 1.6, maxWidth: '420px' }}>
                 Connect this device to your RomM server to browse your library, download games, and sync saves across devices.
               </div>
@@ -9045,7 +9045,7 @@ async function rommShortcutExe(): Promise<string> {
 // Stamped into the shortcut's launch options so we can re-identify our tile
 // even when Steam hasn't persisted its name (the root cause of duplicates and
 // the toggle flipping off after an update).
-const ROMM_TILE_SENTINEL = "romm-sync-monitor-tile";
+const ROMM_TILE_SENTINEL = "ludo-tile";
 let _rommAppId: number | null = null;
 let _rommNavTimer: any = null;
 let _rommActionReg: { unregister: () => void } | null = null;
@@ -9549,7 +9549,7 @@ export default definePlugin(() => {
   })();
 
   return {
-    name: "RomM Sync Monitor",
+    name: "Ludo",
     titleView: <TitleView />,
     content: <Content />,
     icon: <FaSync />,

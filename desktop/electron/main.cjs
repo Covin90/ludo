@@ -1,4 +1,4 @@
-// RomM RetroArch Sync — Electron desktop shell (Linux + Windows).
+// Ludo — Electron desktop shell (Linux + Windows).
 //
 // Replaces the GTK3/WebKit2GTK shell (desktop/app.py). Same lifecycle: spawn the
 // existing Python backend (backend/server.py) on a free localhost port at launch,
@@ -143,7 +143,7 @@ function createWindow(url, fullscreen) {
   win = new BrowserWindow({
     width: 1280,
     height: 800,
-    title: "RomM RetroArch Sync",
+    title: "Ludo",
     backgroundColor: "#0b0e14",
     fullscreen,
     autoHideMenuBar: true,

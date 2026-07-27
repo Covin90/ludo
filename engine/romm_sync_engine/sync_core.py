@@ -11,6 +11,8 @@ import pickle
 import time
 import logging
 from pathlib import Path
+
+from .paths import cache_dir, client_name, config_dir
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -30,7 +32,7 @@ from collections import defaultdict, deque
 # Recent-activity feed (Decky Settings UI). Optional so the desktop app —
 # which shares this module without py_modules/activity_log — degrades to no-op.
 try:
-    import activity_log
+    from . import activity_log
 except Exception:
     activity_log = None
 
@@ -99,7 +101,7 @@ class GameDataCache:
     
     def __init__(self, settings_manager):
         self.settings = settings_manager
-        self.cache_dir = Path.home() / '.config' / 'romm-retroarch-sync' / 'cache'
+        self.cache_dir = cache_dir()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Cache files
@@ -720,7 +722,7 @@ class SettingsManager:
     """Handle saving and loading application settings"""
     
     def __init__(self):
-        self.config_dir = Path.home() / '.config' / 'romm-retroarch-sync'
+        self.config_dir = config_dir()
         self.config_file = self.config_dir / 'settings.ini'
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -842,7 +844,7 @@ class SettingsManager:
                 'device_id': '',
                 'device_name': socket.gethostname(),
                 'device_platform': 'Linux',
-                'client': 'RomM-RetroArch-Sync',
+                'client': client_name(),
                 'client_version': '1.6',
                 'sync_enabled': 'true'
             }
@@ -869,7 +871,7 @@ class SettingsManager:
             'device_id': '',
             'device_name': socket.gethostname(),
             'device_platform': 'Linux',
-            'client': 'RomM-RetroArch-Sync',
+            'client': client_name(),
             'client_version': '1.6',
             'sync_enabled': 'true'
         }
@@ -1515,7 +1517,7 @@ class RomMClient:
         self.session.headers.update({
             'Accept-Encoding': 'gzip, deflate',
             'Accept': 'application/json',
-            'User-Agent': 'RomM-RetroArch-Sync/1.3.2',
+            'User-Agent': f'{client_name()}/1.3.2',
             'Connection': 'keep-alive',
             'Keep-Alive': 'timeout=30, max=100'
         })
@@ -1780,7 +1782,7 @@ class RomMClient:
             payload = {
                 'name': device_name or socket.gethostname(),
                 'platform': platform or sys_platform.system(),
-                'client': client or 'RomM-RetroArch-Sync',
+                'client': client or client_name(),
                 'client_version': client_version or '1.6',
                 'hostname': socket.gethostname(),
                 'allow_existing': True,
@@ -4367,7 +4369,7 @@ class RetroArchInterface:
     def _init_bios_manager(self):
         """Initialize BIOS manager"""
         try:
-            from bios_manager import BiosManager
+            from .bios_manager import BiosManager
             self.bios_manager = BiosManager(
                 retroarch_interface=self,
                 romm_client=None,  # Will be set when connected
@@ -6606,7 +6608,7 @@ class AutoSyncManager:
         self.startup_sync_thread = None
 
         # Upload fingerprints persistence
-        self.upload_fingerprints_file = Path.home() / '.config' / 'romm-retroarch-sync' / 'cache' / 'upload_fingerprints.json'
+        self.upload_fingerprints_file = cache_dir() / 'upload_fingerprints.json'
         self.upload_fingerprints_file.parent.mkdir(parents=True, exist_ok=True)
         self._load_upload_fingerprints()
 
@@ -9086,7 +9088,7 @@ class AutoSyncLock:
     """Linux-only file locking to prevent multiple auto-sync instances"""
     
     def __init__(self):
-        self.lock_file = Path.home() / '.config' / 'romm-retroarch-sync' / 'autosync.lock'
+        self.lock_file = config_dir() / 'autosync.lock'
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
         self.lock_fd = None
     

@@ -15,8 +15,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
-# Add py_modules to path so sync_core is importable
+# Add py_modules to path so the vendored engine is importable
 sys.path.insert(0, str(Path(__file__).parent / "py_modules"))
+
+# Claim our app identity before anything reads or writes engine state. Ludo
+# keeps ~/.config/ludo; it shares nothing with the GTK app.
+from romm_sync_engine import paths as _paths  # noqa: E402
+_paths.set_app_id("ludo")
+_paths.set_client_name("Ludo")
+CONFIG_DIR = _paths.config_dir()
 
 # Preload Pillow shared libraries for bundled wheel
 # This is needed because the .so files in the wheel need to find their dependencies
@@ -44,7 +51,7 @@ except ImportError as e:
     logging.error(f"[PIL] PIL import failed: {e}")
 
 try:
-    from sync_core import (
+    from romm_sync_engine.sync_core import (
         SettingsManager, RomMClient, RetroArchInterface,
         AutoSyncManager, CollectionSyncManager,
         BiosTrackingManager,
@@ -58,7 +65,7 @@ except ImportError as e:
     SYNC_CORE_AVAILABLE = False
 
 try:
-    import activity_log
+    from romm_sync_engine import activity_log
 except Exception:
     activity_log = None
 
@@ -74,16 +81,16 @@ def _record_activity(kind, title, detail=''):
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
-log_file = Path.home() / '.config' / 'romm-retroarch-sync' / 'decky_debug.log'
+log_file = CONFIG_DIR / 'decky_debug.log'
 log_file.parent.mkdir(parents=True, exist_ok=True)
-settings_file = Path.home() / '.config' / 'romm-retroarch-sync' / 'decky_settings.json'
+settings_file = CONFIG_DIR / 'decky_settings.json'
 
 # Persisted library snapshot — the last successful fetch of games + collections +
 # platform mappings. Hydrated on cold start so the Game Browser populates offline,
 # overwritten (write-through) after every successful fetch. schema-versioned and
 # tagged with the server_url so a server switch invalidates it. See _persist_snapshot /
 # _load_snapshot. SCHEMA bumps when the persisted game/collection shape changes.
-snapshot_file = Path.home() / '.config' / 'romm-retroarch-sync' / 'library_snapshot.json'
+snapshot_file = CONFIG_DIR / 'library_snapshot.json'
 SNAPSHOT_SCHEMA = 1
 
 
@@ -216,7 +223,7 @@ def _detect_multi_disc(local_path, is_downloaded):
 # Version + auto-update
 # ---------------------------------------------------------------------------
 GITHUB_OWNER = "Covin90"
-GITHUB_REPO = "romm-retroarch-sync"
+GITHUB_REPO = "ludo"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
 
 # The release asset the updater downloads (see DEPLOYMENT.md naming convention).
@@ -424,12 +431,12 @@ class Plugin:
         self._connection_attempted = False
         self._platform_slug_to_name = {}
         self._syncing_steam_collections = set()
-        logging.info("RomM Sync Monitor starting...")
+        logging.info("Ludo starting...")
         self._start_sync()
         return await self.get_service_status()
 
     async def _unload(self):
-        logging.info("RomM Sync Monitor unloading...")
+        logging.info("Ludo unloading...")
         self._stop_sync()
 
     # -----------------------------------------------------------------------
@@ -973,7 +980,7 @@ class Plugin:
                     continue  # already populated (e.g. from a live toggle this session)
                 roms = self._romm_client.get_collection_roms(col_id)
                 rom_ids = {r.get('id') for r in roms if r.get('id')}
-                from sync_core import CollectionSyncManager
+                from romm_sync_engine.sync_core import CollectionSyncManager
                 file_count = CollectionSyncManager._count_rom_files(roms)
                 self._disabled_collection_counts[name] = {'rom_ids': rom_ids, 'total': file_count}
                 logging.debug(f"Fetched disabled count for '{name}': {file_count} files ({len(roms)} ROMs)")
@@ -1452,7 +1459,7 @@ class Plugin:
         """Enable or disable auto-sync for a specific collection."""
         try:
             import configparser
-            ini_path = Path.home() / '.config' / 'romm-retroarch-sync' / 'settings.ini'
+            ini_path = CONFIG_DIR / 'settings.ini'
             if not ini_path.exists():
                 logging.error("Settings file not found")
                 return False
@@ -2225,7 +2232,7 @@ class Plugin:
         """Delete all downloaded ROMs from ALL collections, delete downloaded
         BIOS files, and reset sync state.  Credentials are preserved."""
         import configparser, shutil
-        config_dir   = Path.home() / '.config' / 'romm-retroarch-sync'
+        config_dir   = CONFIG_DIR
         ini_path     = config_dir / 'settings.ini'
 
         try:
@@ -2284,7 +2291,7 @@ class Plugin:
             deleted_bios = 0
             if bios_system_dir and bios_system_dir.exists():
                 try:
-                    from bios_manager import BIOS_DATABASE
+                    from romm_sync_engine.bios_manager import BIOS_DATABASE
                     known_bios_files = set()
                     for platform_info in BIOS_DATABASE.values():
                         for bios_entry in platform_info.get('bios_files', []):
@@ -2396,7 +2403,7 @@ class Plugin:
             device_id = self._romm_client.register_device(
                 device_name=self._settings.get('Device', 'device_name', _socket.gethostname()),
                 platform=self._settings.get('Device', 'device_platform', 'SteamOS'),
-                client=self._settings.get('Device', 'client', 'RomM-RetroArch-Sync-Decky'),
+                client=self._settings.get('Device', 'client', 'Ludo-Decky'),
                 client_version=PLUGIN_VERSION,
             )
             if device_id:
@@ -3092,7 +3099,7 @@ class Plugin:
             return {'success': False, 'games': [], 'message': str(e)}
 
     # -----------------------------------------------------------------------
-    # Cover-art disk cache  (~/.config/romm-retroarch-sync/cover_cache/)
+    # Cover-art disk cache  (~/.config/ludo/cover_cache/)
     #
     # Persists decoded cover/screenshot bytes across plugin reloads so art is
     # never re-fetched from RomM after the first load — and is served even
@@ -3176,7 +3183,7 @@ class Plugin:
             return content, None
 
     def _cover_dir(self):
-        d = Path.home() / '.config' / 'romm-retroarch-sync' / 'cover_cache'
+        d = CONFIG_DIR / 'cover_cache'
         try:
             d.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -4049,7 +4056,7 @@ class Plugin:
             # pass NO env — overriding it would clobber Steam's overlay preload.
             spec = {'argv': [str(c) for c in cmd], 'rom_name': g.get('name', ''),
                     'ts': time.time()}
-            spec_path = (Path.home() / '.config' / 'romm-retroarch-sync'
+            spec_path = (CONFIG_DIR
                          / 'session' / 'launch-spec.json')
             spec_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = spec_path.with_suffix('.json.tmp')
@@ -4196,7 +4203,7 @@ class Plugin:
         """
         try:
             import configparser
-            ini_path = Path.home() / '.config' / 'romm-retroarch-sync' / 'settings.ini'
+            ini_path = CONFIG_DIR / 'settings.ini'
             if not ini_path.exists():
                 logging.error("Settings file not found")
                 return {'success': False, 'message': 'Settings file not found'}

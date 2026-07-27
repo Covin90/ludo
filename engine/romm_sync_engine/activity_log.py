@@ -14,11 +14,16 @@ import logging
 import threading
 import time
 from collections import deque
-from pathlib import Path
+from .paths import config_dir
 
 MAX_ENTRIES = 10
 
-_FILE = Path.home() / '.config' / 'romm-retroarch-sync' / 'activity.json'
+
+def _file():
+    # Resolved lazily: the frontend sets its app id after this module is
+    # imported, and a module-level constant would bake in the default.
+    return config_dir() / 'activity.json'
+
 _lock = threading.Lock()
 _entries = deque(maxlen=MAX_ENTRIES)
 _loaded = False
@@ -30,8 +35,9 @@ def _load_locked():
         return
     _loaded = True
     try:
-        if _FILE.exists():
-            data = json.loads(_FILE.read_text())
+        f = _file()
+        if f.exists():
+            data = json.loads(f.read_text())
             for e in data if isinstance(data, list) else []:
                 if isinstance(e, dict) and e.get('title'):
                     _entries.append(e)
@@ -41,10 +47,10 @@ def _load_locked():
 
 def _save_locked():
     try:
-        _FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _FILE.with_suffix('.json.tmp')
+        f = _file()
+        tmp = f.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(list(_entries)))
-        tmp.replace(_FILE)
+        tmp.replace(f)
     except Exception as e:
         logging.debug(f"activity_log save failed: {e}")
 
