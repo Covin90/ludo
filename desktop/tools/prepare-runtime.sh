@@ -57,6 +57,43 @@ echo "==> Installing backend dependencies"
 echo "==> Installing romm-sync-engine (non-editable: the AppImage must be self-contained)"
 "$PY" -m pip install --quiet --no-compile "$REPO_ROOT/engine"
 
+# ── 2b. Trim the interpreter ─────────────────────────────────────────────────
+# A standalone CPython ships a full development install. The app only ever
+# runs already-written code, so the build-time and interactive parts are dead
+# weight in a file every user has to download on every update.
+#
+# Deliberately kept: Cryptodome and backports (py7zr), cryptography (settings
+# encryption), PIL (cover art).
+echo "==> Trimming interpreter"
+PYLIB="$PY_DIR/lib/python3.11"
+SP="$PYLIB/site-packages"
+
+# Packaging tooling: only needed to build this runtime, never to run it.
+rm -rf "$SP/pip" "$SP/pip-"*.dist-info "$SP/setuptools" "$SP/setuptools-"*.dist-info \
+       "$SP/pkg_resources" "$SP/_distutils_hack" "$PYLIB/ensurepip"
+# setuptools leaves a .pth that imports _distutils_hack at every interpreter
+# start; without the module it prints a traceback on each launch.
+rm -f "$SP/distutils-precedence.pth"
+
+# Interactive / development stdlib the backend never imports.
+rm -rf "$PYLIB/idlelib" "$PYLIB/tkinter" "$PYLIB/turtledemo" "$PYLIB/pydoc_data" \
+       "$PYLIB/lib2to3" "$PYLIB/test" "$PYLIB/distutils" "$PY_DIR/include" \
+       "$PY_DIR/share/man" "$PY_DIR/share/terminfo"
+
+# Test suites vendored inside dependencies.
+find "$SP" -type d \( -name tests -o -name test -o -name testing \) -prune -exec rm -rf {} + 2>/dev/null || true
+
+# Bytecode caches: --no-compile covers what pip installs, but the interpreter
+# tarball ships its own, and the AppImage is read-only so they never get reused
+# from a writable location anyway.
+find "$PY_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+find "$PY_DIR" -name '*.pyc' -delete 2>/dev/null || true
+
+# Static library, only useful for compiling C extensions against this build.
+find "$PY_DIR" -name 'libpython*.a' -delete 2>/dev/null || true
+
+echo "    trimmed to $(du -sh "$PY_DIR" | cut -f1)"
+
 # ── 3. Source mirror ─────────────────────────────────────────────────────────
 echo "==> Staging application sources"
 rm -rf "$SRC_DIR"
@@ -86,7 +123,7 @@ cp -r "$REPO_ROOT/decky_plugin/assets"    "$SRC_DIR/decky_plugin/"
 # Import the backend exactly as the packaged app will, so a missing dependency
 # fails here rather than in a shipped AppImage.
 echo "==> Verifying bundled runtime"
-( cd "$SRC_DIR/desktop/backend" && "$PY" -c "
+( cd "$SRC_DIR/desktop/backend" && PYTHONDONTWRITEBYTECODE=1 "$PY" -c "
 import sys
 sys.path.insert(0, '.')
 import server
@@ -95,6 +132,11 @@ assert server.plugin_module.asset_suffix() == '-x86_64.AppImage', 'wrong update 
 print('    backend imports OK, suffix =', server.plugin_module.asset_suffix())
 print('    engine  =', paths.__file__)
 " )
+
+# Importing during verification recreates caches the trim removed, so sweep
+# once more now that nothing else will run the interpreter.
+find "$PY_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+find "$PY_DIR" -name '*.pyc' -delete 2>/dev/null || true
 
 [ -f "$SRC_DIR/desktop/dist/index.html" ] || { echo "❌ staged UI missing"; exit 1; }
 echo "    UI      = $(du -sh "$SRC_DIR/desktop/dist" | cut -f1) staged"
