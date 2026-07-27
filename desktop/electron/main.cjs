@@ -232,6 +232,17 @@ if (!app.requestSingleInstanceLock()) {
   // Renderer's Exit row (desktop-only UserMenu item) asks the shell to quit.
   ipcMain.on("romm:quit", () => app.quit());
 
+  // Restart after a self-update. The AppImage on disk has already been
+  // swapped, so relaunching picks up the new build. app.relaunch() re-execs
+  // $APPIMAGE rather than the mounted binary, whose mountpoint disappears the
+  // moment we exit.
+  ipcMain.on("romm:restart", () => {
+    const appImage = process.env.APPIMAGE;
+    if (appImage) app.relaunch({ execPath: appImage });
+    else app.relaunch();
+    app.quit();
+  });
+
   // Physically-attached gamepads, which the renderer can't discover itself
   // (Chromium hides pads until one is pressed). Synchronous: it's a handful of
   // small sysfs reads and the renderer needs it during startup. Returns null on

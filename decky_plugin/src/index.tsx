@@ -3201,6 +3201,9 @@ const getUpdateChannel = callable<[], string>("get_update_channel");
 const setUpdateChannel = callable<[string], string>("set_update_channel");
 const checkForUpdate = callable<[string], any>("check_for_update");
 const downloadUpdate = callable<[string], any>("download_update");
+// Desktop-only: swaps the running AppImage. No-ops on Decky, which
+// updates through the loader instead.
+const applyAppImageUpdate = callable<[string], any>("apply_appimage_update");
 const getCheckOnStartup = callable<[], boolean>("get_check_on_startup");
 const setCheckOnStartup = callable<[boolean], boolean>("set_check_on_startup");
 // Session cache for update checks: the section auto-checks on open, and this
@@ -8114,6 +8117,32 @@ function SettingsPage() {
     setStatusMsg(null);
     setInstallPct(0);
     try {
+      // Desktop: there is no plugin loader. The release asset is a single
+      // AppImage, so we download it and swap the running file. The swap only
+      // takes effect on restart, which Decky never needs since it reloads the
+      // plugin in place.
+      if ((window as any).__rommDesktop) {
+        const dl = await downloadUpdate(updateInfo.url);
+        if (!dl?.success) {
+          setStatusMsg({ kind: 'err', text: `Download failed — ${dl?.message ?? 'unknown error'}` });
+          setUpdating(false);
+          setInstallPct(null);
+          return;
+        }
+        const applied = await applyAppImageUpdate(dl.path);
+        if (!applied?.success) {
+          setStatusMsg({ kind: 'err', text: `Install failed — ${applied?.message ?? 'unknown error'}` });
+          setUpdating(false);
+          setInstallPct(null);
+          return;
+        }
+        setInstallPct(null);
+        setUpdating(false);
+        setUpdateInfo({ ...updateInfo, restartRequired: true });
+        setStatusMsg({ kind: 'ok', text: `v${updateInfo.latest} installed — restart to apply.` });
+        return;
+      }
+
       // One-click install through the loader's WSRouter (window.DeckyBackend) —
       // @decky/api's `call` namespaces routes to our own plugin, so it can't
       // reach loader utilities/*. utilities/install_plugin only REGISTERS an
@@ -8386,6 +8415,16 @@ function SettingsPage() {
             <div style={{ fontSize: '11px', color: V2.fgMuted, wordBreak: 'break-all' }}>
               Downloaded to: {updateInfo.downloadedPath}
             </div>
+          )}
+          {/* Desktop only: the new AppImage is in place but the old one is
+              still running, so the update is not live until we re-exec. */}
+          {updateInfo?.restartRequired && (
+            <V2Button
+              variant="tonal"
+              onClick={() => (window as any).__rommDesktop?.restart?.()}
+            >
+              <FaSync size={13} /><span>Restart to finish updating</span>
+            </V2Button>
           )}
           {updateInfo?.available && !!updateInfo.notes && !updating && (
             <>
