@@ -94,3 +94,6 @@ releases/
 .romm-ref/
 
 node_modules/
+
+# local dev
+.venv/

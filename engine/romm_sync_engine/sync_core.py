@@ -12,7 +12,7 @@ import time
 import logging
 from pathlib import Path
 
-from .paths import cache_dir, client_name, config_dir
+from .paths import app_id, cache_dir, client_name, config_dir
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -4956,8 +4956,10 @@ class RetroArchInterface:
             if location.exists():
                 for appimage in location.glob('*RetroArch*.AppImage'):
                     if appimage.is_file() and os.access(appimage, os.X_OK):
-                        # Skip our own app
-                        if 'RomM-RetroArch-Sync' in appimage.name:
+                        # Skip our own app: the GTK build ships as
+                        # RomM-RetroArch-Sync-v*.AppImage, which matches the
+                        # *RetroArch* glob above.
+                        if client_name() in appimage.name:
                             continue
                         retroarch_candidates.append({
                             'type': 'appimage', 
@@ -7062,7 +7064,7 @@ class AutoSyncManager:
                         cmd_str = ' '.join(cmdline).lower()
                         # Exclude our own app but include real RetroArch
                         if ('retroarch' in cmd_str and 
-                            'romm-retroarch-sync' not in cmd_str and  # Exclude our app
+                            app_id() not in cmd_str and  # Exclude our own process
                             ('--menu' in cmd_str or '--verbose' in cmd_str or 
                             '.so' in cmd_str or 'content' in cmd_str or 
                             'bwrap' in cmd_str)):  # Include Bazzite's bwrap
