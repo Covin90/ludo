@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import subprocess
+import shutil
 import os
 import ctypes
 from datetime import datetime, timezone
@@ -58,6 +59,7 @@ try:
         SteamShortcutManager, CoverArtManager,
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
         _extract_archive, _archive_member_names,
+        get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
     )
     SYNC_CORE_AVAILABLE = True
 except ImportError as e:
@@ -3450,6 +3452,73 @@ class Plugin:
         except Exception as e:
             logging.error(f"get_retrodeck_logo error: {e}", exc_info=True)
             return {'success': False, 'data_uri': None}
+
+    async def get_steam_tile_status(self):
+        """Whether the desktop shell's Steam library tile exists.
+
+        Desktop-only: on the Deck the plugin owns its tile through SteamClient's
+        live shortcut API, and never touches shortcuts.vdf. Returns
+        {'available', 'installed', 'appid', 'steam_running', 'reason'}."""
+        try:
+            return get_desktop_tile_status()
+        except Exception as e:
+            logging.error(f"get_steam_tile_status error: {e}", exc_info=True)
+            return {'available': False, 'installed': False, 'appid': None,
+                    'steam_running': False, 'reason': str(e)}
+
+    async def set_steam_tile(self, enabled: bool, exe: str = '', start_dir: str = '',
+                             launch_options: str = ''):
+        """Add or remove the RomM tile in Steam's shortcuts.vdf.
+
+        `exe`/`start_dir`/`launch_options` describe how to relaunch THIS shell and
+        come from the Electron main process (window.__rommDesktop.launchSpec) —
+        the backend can't know whether it was started from an AppImage, a dev
+        checkout or a packaged binary."""
+        try:
+            if not enabled:
+                return remove_desktop_tile()
+            if not exe:
+                return {'success': False, 'message': 'No launch command supplied'}
+            icon = Path(__file__).parent / "assets" / "romm-icon.png"
+            return add_desktop_tile(
+                exe, start_dir=start_dir, launch_options=launch_options,
+                icon=str(icon) if icon.exists() else '',
+                assets_dir=Path(__file__).parent / "assets",
+            )
+        except Exception as e:
+            logging.error(f"set_steam_tile error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def launch_retrodeck(self):
+        """Launch RetroDECK directly, without Steam.
+
+        The Deck's Gaming Mode path goes through SteamClient.Apps.RunGame so the
+        session is Steam-tracked, but there is no SteamClient in the Electron
+        desktop shell — this is the fallback it calls instead. Tries the flatpak
+        (how RetroDECK ships) and then a plain `retrodeck` on PATH.
+        Returns {'ok': bool, 'reason': str|None}."""
+        candidates = [
+            ['flatpak', 'run', 'net.retrodeck.retrodeck'],
+            ['retrodeck'],
+        ]
+        flatpak_installed = (Path.home() / '.var' / 'app' / 'net.retrodeck.retrodeck').exists()
+        for argv in candidates:
+            if not shutil.which(argv[0]):
+                continue
+            # `flatpak run` on a missing app exits non-zero after we've already
+            # returned ok — only offer it when the app really is installed.
+            if argv[0] == 'flatpak' and not flatpak_installed:
+                continue
+            try:
+                subprocess.Popen(
+                    argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                logging.info(f"Launched RetroDECK via {' '.join(argv)}")
+                return {'ok': True, 'reason': None}
+            except Exception as e:
+                logging.error(f"launch_retrodeck {argv[0]} error: {e}")
+        return {'ok': False, 'reason': 'RetroDECK not found on this system'}
 
     async def get_ra_earned(self, ra_id: int):
         """Earned achievement badge ids for a game's ra_id, fetched on its own so

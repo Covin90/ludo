@@ -32,10 +32,35 @@
 
 const { ipcRenderer } = require("electron");
 
+// Which pads are PHYSICALLY attached, which navigator.getGamepads() refuses to
+// say until one is pressed. The footer legend needs the answer on frame one, so
+// src/shim/gamepad.ts calls this at startup. Returns null on platforms that
+// can't answer — "unknown", never "no pad".
+//
+// The scan itself lives in the MAIN process (electron/native-pads.cjs) and is
+// reached over IPC, because this preload is sandboxed: Electron has sandboxed
+// renderers by default since v20, and a sandboxed preload's require() resolves
+// only a few builtins like "electron". Requiring the scanner directly here threw
+// and took the whole preload down with it — which silently killed the gamepad
+// bridge below too, so the controller stopped working entirely. Keep every
+// require in this file to "electron".
+//
+// sendSync (not invoke) because refreshFamily() in the renderer is synchronous
+// and needs the answer during startup, not a frame or two later.
+window.__rommNativePads = () => {
+  try { return ipcRenderer.sendSync("romm:list-pads"); } catch { return null; }
+};
+
 // Desktop-only bridge the shared plugin UI feature-detects (window.__rommDesktop)
 // to show an Exit row in the account menu — the Deck build has no such object.
 window.__rommDesktop = {
   quit() { ipcRenderer.send("romm:quit"); },
+  // {exe, startDir, args} describing how to relaunch this shell — handed to the
+  // backend so it can write a Steam shortcut pointing back at us. null when the
+  // main process can't work it out.
+  launchSpec() {
+    try { return ipcRenderer.sendSync("romm:launch-spec"); } catch { return null; }
+  },
 };
 
 const OK = 1, CANCEL = 2, SECONDARY = 3, OPTIONS = 4;

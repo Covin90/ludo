@@ -33,6 +33,9 @@ const updateLoggingEnabled = callable<[boolean], boolean>("set_logging_enabled")
 const getRetrodeckButtonEnabled = callable<[], boolean>("get_retrodeck_button_enabled");
 const setRetrodeckButtonEnabled = callable<[boolean], boolean>("set_retrodeck_button_enabled");
 const getRetrodeckLogo = callable<[], any>("get_retrodeck_logo");
+const launchRetrodeckNative = callable<[], { ok: boolean; reason?: string }>("launch_retrodeck");
+const getSteamTileStatus = callable<[], any>("get_steam_tile_status");
+const setSteamTile = callable<[boolean, string, string, string], any>("set_steam_tile");
 const getCoreMappings = callable<[], any>("get_core_mappings");
 const setCoreOverride = callable<[string, string], any>("set_core_override");
 const getConfig = callable<[], any>("get_config");
@@ -3204,6 +3207,9 @@ const setCheckOnStartup = callable<[boolean], boolean>("set_check_on_startup");
 // keeps reopening Settings from burning GitHub's anonymous rate limit (60/hr).
 let _updCheckCache: { t: number; channel: string; info: any } | null = null;
 const _UPD_CACHE_MS = 5 * 60 * 1000;
+// Floor on how long a MANUAL update check shows its busy state, so the press
+// reads as an action that ran rather than a flicker (see runUpdateCheck).
+const MIN_CHECK_MS = 900;
 
 const formatSpeed = (bytesPerSec: number): string => {
   if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
@@ -7792,7 +7798,13 @@ function V2Segment({ options, value, onChange, disabled }:
             onClick={() => !disabled && onChange(id)}
             onFocus={() => setFocusedIdx(i)} onBlur={() => setFocusedIdx(null)}
             onMouseEnter={() => setFocusedIdx(i)} onMouseLeave={() => setFocusedIdx(null)}>
+            {/* Marks this option — and which one is CURRENT — for the desktop
+                shim's spatial nav, so entering the control from above/below
+                lands on the selected value instead of whichever pill happens to
+                be nearest. Inert on the Deck (Steam uses its own preferred-child
+                tracking), and purely advisory: styling never keys off these. */}
             <div ref={(el) => { btnRefs.current[i] = el; }}
+              data-seg-opt="1" data-seg-on={on ? '1' : undefined}
               style={{
                 position: 'relative', zIndex: 1, padding: '5px 16px', borderRadius: V2.radiusPill,
                 fontSize: '12.5px', textAlign: 'center', cursor: disabled ? 'default' : 'pointer',
@@ -7832,7 +7844,12 @@ function UpdateActionBtn({ label, icon, onClick, disabled, primary, progress, bu
         boxSizing: 'border-box',
         borderRadius: V2.radiusMd, border: `1px solid ${filling ? V2.brand : V2.border}`,
         background: primary && !filling ? V2.brand : V2.surface,
-        opacity: disabled && !filling ? 0.55 : 1, cursor: disabled ? 'default' : 'pointer',
+        // Dim only when the button is inert — NOT while it's working. The busy
+        // shimmer and the "Checking…" label already say that, and on the desktop
+        // shim a dimmed control drops its tabindex (opacity < 1 is that shim's
+        // disabled convention), which blurred the button mid-check and threw
+        // controller focus up to the page's Back button.
+        opacity: disabled && !filling && !busy ? 0.55 : 1, cursor: disabled ? 'default' : 'pointer',
         transition: 'box-shadow 0.15s, background 0.2s, border-color 0.2s',
         ...V2Focus.flat(focused && !disabled, { glow: primary || filling }),
       }}>
@@ -7886,6 +7903,15 @@ function SettingsPage() {
   const [rdDetected, setRdDetected] = useState<boolean>(false);
   const [rdButton, setRdButton] = useState<boolean>(false);
 
+  // Desktop-only: the RomM tile in Steam's library. Unlike the Deck plugin —
+  // which owns its tile through SteamClient's live API — the desktop shell has
+  // no SteamClient and the backend edits shortcuts.vdf, so the tile only shows
+  // up after Steam restarts. `tileNote` carries that hint to the row subtitle.
+  const [tileState, setTileState] = useState<{ available: boolean; installed: boolean }>(
+    { available: false, installed: false });
+  const [tileBusy, setTileBusy] = useState<boolean>(false);
+  const [tileNote, setTileNote] = useState<string>('');
+
   // Desktop-only: which screen corner notification toasts appear in. Persisted
   // in localStorage and read by the shim's ToastHost; the Deck build has no
   // __rommDesktop object so this section never renders there.
@@ -7916,6 +7942,12 @@ function SettingsPage() {
         setRdDetected(!!cfg?.retrodeck_detected);
       } catch { /* ignore */ }
       try { setRdButton(await getRetrodeckButtonEnabled()); } catch { /* ignore */ }
+      if ((window as any).__rommDesktop) {
+        try {
+          const st = await getSteamTileStatus();
+          setTileState({ available: !!st?.available, installed: !!st?.installed });
+        } catch { /* ignore */ }
+      }
     })();
   }, []);
 
@@ -7923,6 +7955,32 @@ function SettingsPage() {
     setRdButton(enabled);
     try { await setRetrodeckButtonEnabled(enabled); }
     catch { setRdButton(!enabled); }
+  };
+
+  const handleSteamTileToggle = async (enabled: boolean) => {
+    if (tileBusy) return;
+    setTileBusy(true);
+    setTileNote('');
+    try {
+      // The launch command can only come from the Electron main process — it
+      // alone knows whether we're an AppImage, a packaged binary or a checkout.
+      const spec = enabled ? (window as any).__rommDesktop?.launchSpec?.() : null;
+      if (enabled && !spec?.exe) {
+        setTileNote('Could not determine how to relaunch this app.');
+        return;
+      }
+      const r = await setSteamTile(enabled, spec?.exe || '', spec?.startDir || '', spec?.args || '');
+      if (r?.success) {
+        setTileState((s) => ({ ...s, installed: enabled }));
+        setTileNote(r.message || '');
+      } else {
+        setTileNote(r?.message || 'Could not update the Steam library tile.');
+      }
+    } catch (e) {
+      setTileNote(String(e));
+    } finally {
+      setTileBusy(false);
+    }
   };
 
   // Auto-update state
@@ -8014,11 +8072,32 @@ function SettingsPage() {
     setChecking(true);
     setUpdateInfo(null);
     setStatusMsg(null);
+    const startedAt = Date.now();
     try {
       const info = await checkForUpdate(ch);
+      // A manual check that comes back in ~200ms (the usual case) produced no
+      // perceptible feedback at all: the subline it lands on is the SAME text
+      // the mount-time auto-check already left there, so the only signal was a
+      // "Checking…" flash the eye misses. Hold the busy state briefly so the
+      // press visibly does something...
+      if (force) {
+        const remaining = MIN_CHECK_MS - (Date.now() - startedAt);
+        if (remaining > 0) await new Promise((r) => setTimeout(r, remaining));
+      }
       const now = Date.now();
       if (info?.success) _updCheckCache = { t: now, channel: ch, info };
       applyCheckResult(info, ch, now);
+      // ...and answer the question the user actually asked. Only for manual
+      // checks — auto-checks (mount, channel switch) must stay silent.
+      if (force) {
+        if (!info?.success) {
+          toaster.toast({ title: 'Updates', body: `Couldn't check — ${info?.message ?? 'unknown error'}` });
+        } else if (!info.available) {
+          toaster.toast({ title: 'Updates', body: `Up to date — v${info.current} is the latest on ${ch}.` });
+        }
+        // An available update needs no toast: the card itself changes loudly
+        // (version line, "Install v…" button, release notes).
+      }
     } catch (error) {
       setLastChecked(Date.now());
       setStatusMsg({ kind: 'err', text: `Couldn't check for updates — ${String(error)}` });
@@ -8204,6 +8283,19 @@ function SettingsPage() {
             subtitle="Adds a button in the top bar to launch the RetroDECK frontend."
             onClick={() => handleRdButtonToggle(!rdButton)}
             right={<V2Switch checked={rdButton} />}
+          />
+        </V2SettingsSection>
+      )}
+
+      {isDesktop && tileState.available && (
+        <V2SettingsSection title="Steam">
+          <V2SettingsRow
+            icon={<FaExternalLinkAlt size={16} />}
+            title="Add to Steam library"
+            subtitle={tileNote
+              || 'Creates a "RomM" tile that opens this app. Steam must be restarted for it to appear.'}
+            onClick={() => handleSteamTileToggle(!tileState.installed)}
+            right={<V2Switch checked={tileState.installed} />}
           />
         </V2SettingsSection>
       )}
@@ -8663,6 +8755,14 @@ function SetupWizard() {
   const [hasPassword, setHasPassword] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  // Desktop-only opt-in on the final step: write a "RomM" tile into Steam's
+  // shortcuts.vdf. Offered here rather than as its own step because it's
+  // optional system integration, not something sync needs — and it mirrors what
+  // doFinish already does unconditionally on the Deck (addRommShortcut, where
+  // the tile is mandatory because Play routes through it). Only shown when Steam
+  // is actually installed; applied in doFinish so backing out changes nothing.
+  const [tileAvailable, setTileAvailable] = useState(false);
+  const [wantTile, setWantTile] = useState(true);
   const [busy, setBusy] = useState(false);
   // Extra bottom scroll room, added ONLY while a field is focused (keyboard up),
   // so the resting layout stays vertically centered with normal top spacing and
@@ -8753,6 +8853,15 @@ function SetupWizard() {
         setHasPassword(c.has_password || false);
       } catch { /* ignore */ }
       try { const l = await getRommLogo(); setLogo(l?.data_uri || null); } catch { /* ignore */ }
+      if ((window as any).__rommDesktop) {
+        try {
+          const st = await getSteamTileStatus();
+          setTileAvailable(!!st?.available);
+          // Already there (re-running the wizard) → leave it on; the write is
+          // idempotent and unticking would be read as "remove it".
+          if (st?.installed) setWantTile(true);
+        } catch { /* ignore */ }
+      }
     })();
   }, []);
 
@@ -8780,6 +8889,20 @@ function SetupWizard() {
         // and a fresh install can legitimately have an empty shortcut list.
         if ((await reconcileRommTile()) == null) await addRommShortcut(true);
       } catch (e) { console.error('[RomM] wizard steam tile', e); }
+
+      // Desktop: no SteamClient, so the tile is the opt-in shortcuts.vdf one
+      // from the final step. Never fatal — a failed write must not block setup.
+      if ((window as any).__rommDesktop && tileAvailable && wantTile) {
+        try {
+          const spec = (window as any).__rommDesktop?.launchSpec?.();
+          if (spec?.exe) {
+            const r = await setSteamTile(true, spec.exe, spec.startDir || '', spec.args || '');
+            if (r?.success && r?.steam_running) {
+              toaster.toast({ title: 'RomM', body: 'Restart Steam to see the RomM tile' });
+            }
+          }
+        } catch (e) { console.error('[RomM] wizard desktop tile', e); }
+      }
 
       if (mode === 'pair') {
         const r = await pairDevice(url.trim(), pairCode.trim());
@@ -9002,6 +9125,17 @@ function SetupWizard() {
                   ? 'We\'ll pair this device with your RomM server and open your library.'
                   : 'We\'ll save your connection and open your library.'}
               </div>
+              {(window as any).__rommDesktop && tileAvailable && (
+                <div style={{ width: '100%', textAlign: 'left' }}>
+                  <V2SettingsRow
+                    icon={<FaExternalLinkAlt size={16} />}
+                    title="Add to Steam library"
+                    subtitle='Creates a "RomM" tile that opens this app. Steam must be restarted for it to appear.'
+                    onClick={() => setWantTile((v) => !v)}
+                    right={<V2Switch checked={wantTile} />}
+                  />
+                </div>
+              )}
               {footer(
                 <GameActionButton variant="emphasized" disabled={busy} focusRef={finishFocusRef}
                   label={busy ? 'Connecting…' : 'Finish & open library'}
@@ -9144,7 +9278,12 @@ function _allAppOverviews(): any[] {
 // shortcut named "RetroDECK"; we also scan installed apps as a fallback.
 async function launchRetrodeckViaSteam(): Promise<{ ok: boolean; reason?: string }> {
   const apps = _sc()?.Apps;
-  if (!apps?.RunGame) return { ok: false, reason: 'Steam launch API unavailable on this build' };
+  // No SteamClient at all (Electron desktop shell) — spawn RetroDECK from the
+  // backend instead. Nothing here is Steam-tracked, but neither is the shell.
+  if (!apps?.RunGame) {
+    try { return await launchRetrodeckNative(); }
+    catch (e) { return { ok: false, reason: String(e) }; }
+  }
   const isRd = (nm: string) => /retrodeck/i.test(nm || '');
   const shortcutIds = _shortcutAppIds();
   let appId: number | null = null;
@@ -9154,7 +9293,14 @@ async function launchRetrodeckViaSteam(): Promise<{ ok: boolean; reason?: string
       if (isRd(ov?.display_name)) { appId = Number(ov.appid); break; }
     }
   }
-  if (appId == null) return { ok: false, reason: 'RetroDECK not found in your Steam library' };
+  if (appId == null) {
+    // Installed but never added to Steam: still launchable directly.
+    try {
+      const r = await launchRetrodeckNative();
+      if (r.ok) return r;
+    } catch { /* fall through to the library-side message */ }
+    return { ok: false, reason: 'RetroDECK not found in your Steam library' };
+  }
   // A non-Steam shortcut launches by its 64-bit gameID ((appid<<32)|0x02000000);
   // a real Steam app launches by its bare appid.
   const gid = shortcutIds.includes(appId)

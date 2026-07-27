@@ -17,6 +17,7 @@ const { spawn } = require("child_process");
 const net = require("net");
 const path = require("path");
 const fs = require("fs");
+const { listNativePads } = require("./native-pads.cjs");
 
 // ── GPU / compositing (Linux) ────────────────────────────────────────────────
 //
@@ -213,6 +214,39 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   // Renderer's Exit row (desktop-only UserMenu item) asks the shell to quit.
   ipcMain.on("romm:quit", () => app.quit());
+
+  // Physically-attached gamepads, which the renderer can't discover itself
+  // (Chromium hides pads until one is pressed). Synchronous: it's a handful of
+  // small sysfs reads and the renderer needs it during startup. Returns null on
+  // platforms that can't answer — "unknown", never "no pad".
+  ipcMain.on("romm:list-pads", (e) => {
+    try { e.returnValue = listNativePads(); }
+    catch { e.returnValue = null; }
+  });
+
+  // How to relaunch this shell, for the backend's Steam shortcut writer. Only
+  // the main process knows how it was started, and the three cases launch
+  // differently:
+  //   • AppImage      — $APPIMAGE is the single file to run.
+  //   • packaged app  — process.execPath IS the app binary, no args.
+  //   • dev checkout  — execPath is the electron binary and the app dir must be
+  //                     passed as an argument (same as electron/launch.cjs).
+  // Steam stores Exe quoted when it contains spaces, and derives the artwork
+  // appid from exe+name, so the quoting here has to match what Steam expects.
+  ipcMain.on("romm:launch-spec", (e) => {
+    try {
+      const quote = (p) => (/\s/.test(p) ? `"${p}"` : p);
+      const appImage = process.env.APPIMAGE;
+      if (appImage) {
+        e.returnValue = { exe: quote(appImage), startDir: path.dirname(appImage), args: "" };
+      } else if (app.isPackaged) {
+        e.returnValue = { exe: quote(process.execPath), startDir: path.dirname(process.execPath), args: "" };
+      } else {
+        const appDir = path.resolve(__dirname, "..");
+        e.returnValue = { exe: quote(process.execPath), startDir: appDir, args: quote(appDir) };
+      }
+    } catch { e.returnValue = null; }
+  });
 
   app.on("second-instance", () => {
     if (win) { if (win.isMinimized()) win.restore(); win.focus(); }

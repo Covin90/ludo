@@ -106,11 +106,20 @@ function notifyLegend() { legendSubs.forEach((f) => f()); }
 // The element the legend should describe: whatever the pointer is over in mouse
 // mode, else the gamepad-focused element.
 export function currentLegendTarget(): HTMLElement | null {
-  if (mouseMode) {
-    return hovered && document.contains(hovered) ? hovered : null;
-  }
+  if (mouseMode && hovered && document.contains(hovered)) return hovered;
+  // Fall back to the focused element even in mouse mode. This is what the app
+  // looks like at startup: mouseMode defaults to true because no input has
+  // happened yet, while the library grid has already auto-focused its first
+  // cover. Without the fallback that cover is visibly selected but the legend is
+  // blank until the first d-pad/arrow press flips mouseMode off — the bar looked
+  // broken for the whole first interaction.
+  //
+  // It doesn't leak a stale legend once the mouse really is driving: the
+  // transition into mouse mode blurs the active element (see enterMouseMode), so
+  // moving the pointer off every control leaves activeElement at <body> and the
+  // legend clears exactly as before.
   const a = document.activeElement as HTMLElement | null;
-  return a && a !== document.body ? a : null;
+  return a && a !== document.body && document.contains(a) ? a : null;
 }
 
 // ── Controller family (drives which glyph set the footer draws) ──────────────
@@ -123,24 +132,101 @@ export function onControllerFamilyChange(cb: () => void) {
 }
 export function controllerFamily(): ControllerFamily { return _family; }
 
+// Whether ANY pad is currently connected, tracked separately from the family
+// because an unrecognised pad is still a pad: it reports family "neutral", which
+// is indistinguishable from "no pad at all" if you only look at the family.
+let _padConnected = false;
+export function padConnected(): boolean { return _padConnected; }
+
+// ── Remembered pad (first-frame glyphs) ──────────────────────────────────────
+//
+// Chromium refuses to reveal a gamepad until the user presses something on it —
+// an anti-fingerprinting rule, so getGamepads() returns nothing at load even
+// with a pad plugged in and powered on. That means padConnected() is false for
+// the whole first interaction and the legend opens on keyboard glyphs, which is
+// wrong for anyone who plays on a pad.
+//
+// There is no way to ask the page "is a pad attached"; the only honest source is
+// last session. So we persist the family and use it as the OPENING GUESS, then
+// let reality overrule it the moment any real input arrives. A guess that's
+// occasionally stale for one keystroke beats being wrong every single launch.
+const PAD_MEMORY_KEY = "romm.lastPadFamily";
+
+function rememberPad(fam: ControllerFamily) {
+  try { localStorage.setItem(PAD_MEMORY_KEY, fam); } catch { /* private mode */ }
+}
+
+export function rememberedPadFamily(): ControllerFamily | null {
+  try {
+    const v = localStorage.getItem(PAD_MEMORY_KEY);
+    return v === "xbox" || v === "ps" || v === "switch" || v === "neutral"
+      ? v
+      : null;
+  } catch { return null; }
+}
+
+// Which kind of device the user last actually touched — the legend follows this,
+// so picking up the pad or reaching for the keyboard swaps the glyphs either way.
+//
+// null means "nothing touched yet", which is NOT the same as "keyboard": at
+// launch we want pad glyphs already showing if a pad is attached (that's the
+// whole point of the sysfs scan), so null is treated as pad-leaning by pickSet.
+export type InputKind = "kbm" | "gamepad";
+let _lastInput: InputKind | null = null;
+export function lastInputKind(): InputKind | null { return _lastInput; }
+function noteInput(kind: InputKind) {
+  if (_lastInput === kind) return;
+  _lastInput = kind;
+  familySubs.forEach((f) => f());
+}
+function noteKbmInput() { noteInput("kbm"); }
+
 function detectFamily(id: string): ControllerFamily {
   const s = id.toLowerCase();
   // Vendor IDs are the most reliable signal; fall back to product-name keywords.
   if (/vendor:\s*054c|sony|dualshock|dualsense|playstation|\bps[345]\b/.test(s)) return "ps";
-  if (/vendor:\s*045e|xbox|microsoft|xinput/.test(s)) return "xbox";
+  // 28de is Valve: a Steam Deck's built-in pad, or any pad remapped through Steam
+  // Input, which presents an Xbox-layout virtual controller. Either way ABXY sit
+  // where the Xbox glyphs say they do.
+  if (/vendor:\s*28de|valve|steam ?deck|steam controller/.test(s)) return "xbox";
+  // "X-Box" and "X Box" are how a lot of third-party pads name themselves on
+  // Linux (the ubiquitous 0079 "Generic X-Box pad", 360 clones), so match the
+  // hyphenated spellings too or they fall through to the neutral set.
+  if (/vendor:\s*045e|x[- ]?box|microsoft|xinput/.test(s)) return "xbox";
   if (/vendor:\s*057e|nintendo|switch|joy-con|joycon|pro controller/.test(s)) return "switch";
   return "neutral";
 }
 
 function refreshFamily() {
   let fam: ControllerFamily = "neutral";
+  let connected = false;
   try {
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     for (const p of pads) {
-      if (p && p.connected) { fam = detectFamily(p.id || ""); break; }
+      if (p && p.connected) { fam = detectFamily(p.id || ""); connected = true; break; }
     }
   } catch { /* no gamepad API */ }
-  if (fam !== _family) { _family = fam; familySubs.forEach((f) => f()); }
+  // Chromium reports nothing until a pad is pressed, so before that fall back to
+  // the shell's sysfs scan (preload.cjs → electron/native-pads.cjs), which sees
+  // pads that are merely plugged in. Only a fallback: once the Gamepad API does
+  // report, it wins, because it reflects the pad actually delivering input.
+  if (!connected) {
+    const native = (window as any).__rommNativePads?.();
+    // null means "this platform can't tell" — distinct from an empty list, which
+    // is a real "nothing attached". Only a non-empty list is evidence.
+    if (native && native.length) {
+      fam = detectFamily(native[0] || "");
+      connected = true;
+    }
+  }
+  if (fam !== _family || connected !== _padConnected) {
+    _family = fam;
+    _padConnected = connected;
+    // Only remember a pad we actually saw — a disconnect must not erase which
+    // pad this user plays with, or the next launch is back to keyboard glyphs.
+    if (connected) rememberPad(fam);
+    familySubs.forEach((f) => f());
+  }
 }
 
 function synthEvent(button: number, isRepeat: boolean) {
@@ -263,6 +349,40 @@ export function seedFocus(): void {
       ? a
       : focusRoot();
   focusFirstIn(root);
+}
+
+// ── Focus restore after a transient blur ────────────────────────────────────
+//
+// A control that dims while it's working (opacity < 1 is the shim's "disabled"
+// convention — see Focusable in ui.tsx) loses its tabindex for the duration, and
+// the browser blurs it to <body>. Without this, the reseed below treated that as
+// a page swap and seeded the page's FIRST target — so pressing "Check for
+// Updates" in Settings threw the highlight up to the Back button in the header,
+// and the same went for any button that goes busy (wizard Finish, Log out…).
+//
+// Instead: remember the element focus fell off, and for a short grace period
+// prefer restoring focus to it once it's tabbable again over seeding somewhere
+// new. If it never comes back (really removed, or still disabled when the grace
+// runs out), we fall through to the normal reseed.
+const STRAND_GRACE_MS = 5000;
+let strandedFrom: HTMLElement | null = null;
+let strandedUntil = 0;
+
+// True if focus was restored to the stranded element (or it's still worth
+// waiting for it, in which case focus is deliberately left alone for now).
+function restoreFocus(): "restored" | "waiting" | "gone" {
+  const el = strandedFrom;
+  if (!el || !document.contains(el) || Date.now() > strandedUntil) {
+    strandedFrom = null;
+    return "gone";
+  }
+  if (isVisible(el) && el.matches(FOCUS_SELECTOR)) {
+    strandedFrom = null;
+    focusAndReveal(el, false, false);
+    return "restored";
+  }
+  // Still mounted but not focusable yet — the busy control hasn't re-enabled.
+  return "waiting";
 }
 
 // Whether focus currently sits on a real, visible, tabbable control (as opposed
@@ -476,6 +596,54 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
     const score = Math.abs(along) * 3 + Math.abs(cross) + penalty + barPenalty;
     if (score < bestScore) { bestScore = score; best = t; }
   }
+  // Never LEAPFROG a row. The scoring above adds a flat 1e6 penalty to targets
+  // that don't overlap the origin on the cross axis, which is right for
+  // Left/Right but too blunt vertically: a narrow, differently-aligned control
+  // directly above (Settings ▸ Notifications' left-aligned "Overlay position"
+  // segment) loses to any full-width row further up (▸ Steam's "Add to Steam
+  // library"), because only the full-width row overlaps the origin's x. Moving
+  // Up off the right-aligned Stable/Beta pill therefore skipped a whole section.
+  //
+  // So: after scoring, if any eligible target lies entirely BETWEEN the origin
+  // and the winner, the move overshot — land on the nearest such row instead
+  // (closest column within it). Vertical only; horizontal moves already require
+  // cross-overlap and can't overshoot this way.
+  if (best && !horizontal) {
+    const br = best.getBoundingClientRect();
+    let bridge: HTMLElement | null = null;
+    let bridgeScore = Infinity;
+    for (const t of targets) {
+      if (t === best || t === active || t.contains(active) || active.contains(t)) continue;
+      const r = t.getBoundingClientRect();
+      // Strictly between the origin's leading edge and the winner's box.
+      const between = dir === "up"
+        ? r.bottom <= ar.top + 1 && r.top >= br.bottom - 1
+        : r.top >= ar.bottom - 1 && r.bottom <= br.top + 1;
+      if (!between) continue;
+      const c = center(t);
+      // Nearest row first, then nearest column within it — same shape as the
+      // main score, minus the alignment penalty that caused the overshoot.
+      const s = Math.abs(c.y - from.y) * 3 + Math.abs(c.x - from.x);
+      if (s < bridgeScore) { bridgeScore = s; bridge = t; }
+    }
+    if (bridge) best = bridge;
+  }
+
+  // Entering a segmented control (Stable/Beta, the notification-corner picker)
+  // from above or below lands on its CURRENT value, not on whichever pill is
+  // nearest in column — the control represents one setting, so Left/Right should
+  // adjust from where it actually sits. Vertical only, and skipped when the move
+  // starts inside the same control (walking along it is untouched).
+  if (best && !horizontal) {
+    const opt = best.querySelector("[data-seg-opt]");
+    const group = opt ? best.parentElement : null;
+    if (group && !group.contains(active)) {
+      const on = group.querySelector("[data-seg-on]");
+      const target = on?.closest<HTMLElement>(".shim-focusable");
+      if (target && targets.includes(target)) best = target;
+    }
+  }
+
   // Entering the wizard footer from above: land on the primary button directly
   // rather than on Back. index.tsx's footer auto-advances focus from Back to the
   // primary (a Deck focus-repair path), which on desktop shows as a Back→Next
@@ -638,6 +806,15 @@ declare global {
 // restore both the instant the real mouse moves.
 let mouseMode = true;
 
+// ── Input mode (drives WHICH glyph set the footer draws) ─────────────────────
+//
+// Separate from controllerFamily(): the family says which pad is plugged in, the
+// mode says who is actually driving right now. A user with a pad connected but a
+// hand on the mouse needs to be told "click"/"Esc", not "press A" — so the
+// footer picks the keyboard/mouse glyph set whenever we're in mouse mode, and
+// the pad's own set the instant the pad takes over.
+
+
 // Elements currently carrying Steam's gpfocus markers (see startGamepad). Kept as
 // a list so a focus change removes exactly what the previous one added.
 let _marked: HTMLElement[] = [];
@@ -668,7 +845,12 @@ function markGamepadFocus(leaf: HTMLElement | null) {
 // press continues from THAT cover (and A activates it) instead of resuming from
 // wherever focus happened to sit before.
 let hovered: HTMLElement | null = null;
-function enterGamepadMode() {
+// `src` says which device is driving. Focus handling and pointer suppression are
+// identical for both — a keyboard user needs the highlight and the hidden cursor
+// just as much as a pad user — but only a real pad press should flip the legend
+// to ABXY.
+function enterGamepadMode(src: "gamepad" | "keyboard" = "gamepad") {
+  noteInput(src === "gamepad" ? "gamepad" : "kbm");
   // Continue from the hovered element even if we're already in gamepad mode:
   // moving the mouse (enterMouseMode) then pressing the pad must always hand off
   // from the pointer, and mouseMode may already be false from an earlier press.
@@ -711,8 +893,16 @@ function enterMouseMode(e?: Event) {
   const me = e as MouseEvent | undefined;
   if (me && me.type === "mousemove") {
     if (me.clientX === lastPointerX && me.clientY === lastPointerY) return;
+    // Whether we've ever seen a pointer position before this event.
+    const hadPrevious = !Number.isNaN(lastPointerX);
     lastPointerX = me.clientX;
     lastPointerY = me.clientY;
+    // Only a move from a KNOWN previous position proves the user is on the
+    // mouse. The very first mousemove proves nothing: opening the window under a
+    // stationary cursor makes Chromium synthesise one, and counting it handed
+    // the legend to the keyboard/mouse set at launch even with a pad attached.
+    // Real mouse use always produces a second, differing position.
+    if (hadPrevious) noteKbmInput();
   }
   // Record what the pointer is over so a later gamepad press can resume from it.
   const t = e && (e.target as HTMLElement | null);
@@ -754,13 +944,28 @@ export function startGamepad() {
   // Focus leaving to nowhere (blur → body, no new target) clears the markers; a
   // real move fires a fresh focusin that re-marks.
   window.addEventListener("focusout", (e) => {
-    if ((e as FocusEvent).relatedTarget == null) { clearFocusMarkers(); notifyLegend(); }
+    if ((e as FocusEvent).relatedTarget == null) {
+      // Remember what we fell off, and for how long we're willing to wait for it
+      // to come back (see restoreFocus below).
+      const from = e.target as HTMLElement | null;
+      if (from && from !== document.body) {
+        strandedFrom = from;
+        strandedUntil = Date.now() + STRAND_GRACE_MS;
+      }
+      clearFocusMarkers(); notifyLegend();
+    }
   }, true);
 
   // Keep the footer's glyph set in sync with the connected controller.
   refreshFamily();
   window.addEventListener("gamepadconnected", refreshFamily);
   window.addEventListener("gamepaddisconnected", () => { refreshFamily(); notifyLegend(); });
+  // Neither event is trustworthy on its own: gamepadconnected doesn't fire until
+  // the pad is pressed, and gamepaddisconnected is unreliable on unplug. The
+  // sysfs scan behind refreshFamily sees both immediately, so poll it — a few
+  // small file reads every couple of seconds, and refreshFamily only notifies
+  // subscribers when something actually changed.
+  setInterval(refreshFamily, 2000);
 
   // Re-seed focus when a page/view swap strands the controller. index.tsx swaps
   // the in-library views (Settings/Stats/Cores/Downloads) by toggling `display`
@@ -770,13 +975,30 @@ export function startGamepad() {
   // seed the current page's first target — but ONLY when focus has actually
   // fallen to <body> in gamepad mode, so normal navigation (focus on a live
   // control) and mouse use are never disturbed.
+  // A control that merely went busy (dimmed → lost its tabindex) is NOT a page
+  // swap: restoreFocus puts the highlight back on it when it re-enables, and
+  // while we're still waiting for that we leave focus alone rather than seeding
+  // the page's first target. The re-enable itself mutates the tree, so it wakes
+  // this observer again — no polling needed; the grace period is only there to
+  // stop us waiting forever on a control that never comes back.
   let reseedTimer: any = null;
+  const reseedIfStranded = () => {
+    if (mouseMode || focusIsUseful()) return;
+    const state = restoreFocus();
+    if (state === "restored") return;
+    if (state === "waiting") {
+      // Re-check when the grace period lapses, so a control that never
+      // re-enables still ends with a normal reseed instead of no focus at all.
+      clearTimeout(reseedTimer);
+      reseedTimer = setTimeout(reseedIfStranded, Math.max(120, strandedUntil - Date.now()));
+      return;
+    }
+    seedFocus();
+  };
   const observer = new MutationObserver(() => {
     if (mouseMode || focusIsUseful()) return;
     clearTimeout(reseedTimer);
-    reseedTimer = setTimeout(() => {
-      if (!mouseMode && !focusIsUseful()) seedFocus();
-    }, 120);
+    reseedTimer = setTimeout(reseedIfStranded, 120);
   });
   if (document.body) observer.observe(document.body, { childList: true, subtree: true });
 
@@ -786,9 +1008,11 @@ export function startGamepad() {
   // Timestamp of the last horizontal press, to coalesce fast dpad mashing.
   let lastHMove = 0;
 
-  function direction(dir: DirName | null) {
+  // `src` defaults to "gamepad" because the pad drives this through the public
+  // window.__rommGamepad API; the keyboard path passes "keyboard".
+  function direction(dir: DirName | null, src: "gamepad" | "keyboard" = "gamepad") {
     if (dir === curDir) return;
-    if (dir) enterGamepadMode();
+    if (dir) enterGamepadMode(src);
     curDir = dir;
     clearTimeout(delayTimer);
     clearInterval(repeatTimer);
@@ -831,6 +1055,67 @@ export function startGamepad() {
       }
     }
   }
+
+  // ── Keyboard arrows → the same spatial nav the d-pad drives ────────────────
+  //
+  // Without this the arrow keys fall through to Chromium, which SCROLLS the page
+  // and leaves focus where it was: the view slides but nothing gets selected, and
+  // the focused control drifts off-screen. Routing them through direction() gives
+  // the keyboard the d-pad's exact behaviour — spatial move, hold-to-repeat,
+  // scroll-into-view, the horizontal coalescing — because it is literally the
+  // same code path, not a parallel implementation that can drift from it.
+  const ARROWS: Record<string, DirName> = {
+    ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
+  };
+  // Arrows currently held, newest last. A held set (rather than a single value)
+  // is what makes roll-over work: press Left, then Right without releasing Left,
+  // and releasing Left must leave Right still repeating instead of stopping dead.
+  const heldArrows: DirName[] = [];
+
+  function releaseArrow(dir: DirName | null) {
+    if (dir) {
+      const i = heldArrows.lastIndexOf(dir);
+      if (i >= 0) heldArrows.splice(i, 1);
+    } else {
+      heldArrows.length = 0;
+    }
+    direction(heldArrows.length ? heldArrows[heldArrows.length - 1] : null, "keyboard");
+  }
+
+  window.addEventListener("keydown", (e) => {
+    // Any keypress at all (not just the arrows) retires the remembered-pad
+    // guess — someone typing in a search box is on the keyboard.
+    noteKbmInput();
+    const dir = ARROWS[e.key];
+    if (!dir) return;
+    // Leave browser/OS shortcuts (and text selection) alone.
+    if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+    // Inside a text field the arrows belong to the caret, not to navigation.
+    const t = e.target as HTMLElement | null;
+    if (t && isEditable(t)) return;
+    // The whole point: stop Chromium scrolling the page out from under us.
+    e.preventDefault();
+    // Auto-repeat keydowns still need the preventDefault above, but direction()
+    // no-ops on an unchanged dir — the hold repeat is driven by its own timer at
+    // the pad's cadence, so held arrows feel identical to a held d-pad rather
+    // than following the OS key-repeat rate.
+    if (e.repeat) return;
+    if (!heldArrows.includes(dir)) heldArrows.push(dir);
+    // Take over from the mouse, but as the KEYBOARD: same focus handling and
+    // pointer suppression as a pad, while the footer keeps showing Enter/Esc.
+    enterGamepadMode("keyboard");
+    ensureFocusInOverlay();
+    direction(dir, "keyboard");
+  }, true);
+
+  window.addEventListener("keyup", (e) => {
+    const dir = ARROWS[e.key];
+    if (dir) releaseArrow(dir);
+  }, true);
+
+  // A key held while the window loses focus never delivers its keyup, which
+  // would leave the repeat timer running forever. Drop everything on blur.
+  window.addEventListener("blur", () => releaseArrow(null));
 
   window.__rommGamepad = { direction, button };
 }

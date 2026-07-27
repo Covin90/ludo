@@ -489,24 +489,26 @@ div[class*="v2pf-"] > div {
   white-space: nowrap;
 }
 
-.shim-legend-glyph {
+/* Kenney glyphs carry their own button shape and colour, so unlike the drawn
+   letters they replaced they get no border/background chrome of their own. */
+.shim-glyph {
   display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 19px;
-  height: 19px;
-  border-radius: 50%;
-  border: 1.5px solid rgba(255, 255, 255, 0.35);
-  background: rgba(255, 255, 255, 0.04);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
   flex-shrink: 0;
+  width: 20px;
+  height: 20px;
 }
 
-.shim-legend-glyph-sys {
-  color: #cfd2dc;
-  font-weight: 400;
+.shim-glyph svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Chords (Shift+Enter) overlap slightly so they read as one hint, not two. */
+.shim-legend-chord {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
 }
 
 .shim-legend-label {

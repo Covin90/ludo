@@ -160,7 +160,23 @@ export const Focusable = forwardRef(function Focusable(
       }
       tabIndex={tabIndex}
       autoFocus={autoFocus}
-      onClick={activate}
+      onClick={(e) => {
+        // Shift+click is the alternate action, mirroring Shift+Enter below.
+        if (e.shiftKey && onSecondaryButton) {
+          e.preventDefault();
+          onSecondaryButton(e);
+          return;
+        }
+        activate?.(e);
+      }}
+      onContextMenu={(e) => {
+        // Right-click is the desktop idiom for "more options" — the same slot
+        // the pad reaches with Y. Only swallow the native menu when this
+        // Focusable actually has an options handler.
+        if (!onOptionsButton) return;
+        e.preventDefault();
+        onOptionsButton(e);
+      }}
       onKeyDown={(e) => {
         // Don't hijack Enter/Space when the key was pressed inside an editable
         // control nested under this Focusable — the input needs the space to
@@ -171,7 +187,17 @@ export const Focusable = forwardRef(function Focusable(
           t.tagName === "INPUT" ||
           t.tagName === "TEXTAREA" ||
           t.isContentEditable;
-        if (!editable && activate && (e.key === "Enter" || e.key === " ")) {
+        // Keyboard equivalents for the pad's non-primary face buttons, so a
+        // keyboard-only user can reach the same actions the footer legend
+        // advertises. Checked before the plain-Enter case, which would otherwise
+        // swallow Shift+Enter.
+        if (!editable && e.shiftKey && e.key === "Enter" && onSecondaryButton) {
+          e.preventDefault();
+          onSecondaryButton(e);
+        } else if (!editable && e.key === "ContextMenu" && onOptionsButton) {
+          e.preventDefault();
+          onOptionsButton(e);
+        } else if (!editable && activate && (e.key === "Enter" || e.key === " ")) {
           e.preventDefault();
           activate(e);
         } else if ((onCancelButton ?? onCancel) && e.key === "Escape") {

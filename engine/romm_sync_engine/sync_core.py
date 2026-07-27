@@ -11324,3 +11324,247 @@ class SteamShortcutManager:
             self.log(f"Failed to remove Steam collection: {e}")
             logging.error(f"Steam collection removal error: {e}", exc_info=True)
             return False
+
+
+# ── Desktop "RomM" library tile ──────────────────────────────────────────────
+#
+# The Decky plugin creates its Big Picture tile through SteamClient.Apps.
+# AddShortcut, a live API that only exists inside Steam's own UI process. The
+# Electron desktop shell has no SteamClient, so it gets the same tile by editing
+# shortcuts.vdf on disk with SteamVDFHandler below. The one behavioural
+# difference the UI must surface: Steam keeps shortcuts in memory and rewrites
+# the file when it exits, so a tile written while Steam is running is lost —
+# hence is_steam_running() and the restart hint.
+
+DESKTOP_TILE_NAME = 'RomM'
+DESKTOP_TILE_TAG = 'romm-sync-desktop'  # identifies the tile across exe changes
+
+# Bundled artwork -> Steam's grid/ filename suffix for a non-Steam shortcut.
+# (These are the on-disk equivalents of the eAppArtworkAssetType values the
+# plugin feeds SetCustomArtworkForApp: portrait, landscape/header, hero, logo.)
+_DESKTOP_TILE_ART = {
+    'romm-grid.png': 'p.png',
+    'romm-header.png': '.png',
+    'romm-hero.png': '_hero.png',
+    'romm-logo.png': '_logo.png',
+}
+
+
+def find_steam_config_dir():
+    """Locate the active Steam user's config dir (the one holding shortcuts.vdf).
+
+    Scans the usual install roots and picks the user with the most recently
+    touched shortcuts.vdf, falling back to any user whose config dir exists but
+    who has no shortcuts yet. Returns a Path or None.
+    """
+    steam_roots = [
+        Path.home() / '.steam' / 'steam' / 'userdata',
+        Path.home() / '.local' / 'share' / 'Steam' / 'userdata',
+        Path.home() / '.var' / 'app' / 'com.valvesoftware.Steam' / 'data' / 'Steam' / 'userdata',
+    ]
+
+    for root in steam_roots:
+        if not root.exists():
+            continue
+        best, best_mtime = None, 0
+        for user_dir in (d for d in root.iterdir() if d.is_dir() and d.name.isdigit()):
+            config_dir = user_dir / 'config'
+            shortcuts_file = config_dir / 'shortcuts.vdf'
+            if shortcuts_file.exists():
+                mtime = shortcuts_file.stat().st_mtime
+                if mtime > best_mtime:
+                    best, best_mtime = config_dir, mtime
+            elif config_dir.exists() and best is None:
+                best = config_dir
+        if best:
+            return best
+    return None
+
+
+def is_steam_running():
+    """Whether a Steam client is up right now.
+
+    Matters because Steam rewrites shortcuts.vdf from its in-memory copy on
+    exit: a tile added underneath a running Steam survives only if Steam is
+    restarted, and would otherwise be silently discarded.
+    """
+    try:
+        for proc in psutil.process_iter(['name']):
+            name = (proc.info.get('name') or '').lower()
+            if name in ('steam', 'steamwebhelper', 'steam.exe'):
+                return True
+    except Exception as e:
+        logging.debug(f"is_steam_running check failed: {e}")
+    return False
+
+
+def _tile_tags(shortcut):
+    tags = shortcut.get('tags', {})
+    if isinstance(tags, dict):
+        return set(tags.values())
+    if isinstance(tags, list):
+        return set(tags)
+    return set()
+
+
+def _write_desktop_tile_artwork(config_dir, appid, assets_dir):
+    """Copy the bundled RomM artwork into Steam's grid/ dir for `appid`.
+
+    Steam names custom art by the shortcut's UNSIGNED appid. Non-fatal: a tile
+    with no art still works, it just shows a generic capsule.
+    """
+    assets_dir = Path(assets_dir)
+    grid_dir = Path(config_dir) / 'grid'
+    unsigned = appid if appid >= 0 else appid + 0x100000000
+    written = 0
+    try:
+        grid_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logging.warning(f"Could not create Steam grid dir: {e}")
+        return 0
+    for src_name, suffix in _DESKTOP_TILE_ART.items():
+        src = assets_dir / src_name
+        if not src.exists():
+            continue
+        try:
+            shutil.copy2(str(src), str(grid_dir / f"{unsigned}{suffix}"))
+            written += 1
+        except OSError as e:
+            logging.warning(f"Could not write tile artwork {src_name}: {e}")
+    return written
+
+
+def find_desktop_tile(shortcuts):
+    """Return (index, shortcut) for our tile in a parsed shortcuts list, or (None, None)."""
+    for i, sc in enumerate(shortcuts):
+        if DESKTOP_TILE_TAG in _tile_tags(sc):
+            return i, sc
+    return None, None
+
+
+def get_desktop_tile_status():
+    """Report whether the RomM tile exists, for the desktop Settings toggle.
+
+    Returns {'available', 'installed', 'appid', 'steam_running', 'reason'}.
+    """
+    config_dir = find_steam_config_dir()
+    if not config_dir:
+        return {'available': False, 'installed': False, 'appid': None,
+                'steam_running': False, 'reason': 'Steam not found on this system'}
+    _, existing = find_desktop_tile(SteamVDFHandler.read_shortcuts(config_dir / 'shortcuts.vdf'))
+    return {
+        'available': True,
+        'installed': existing is not None,
+        'appid': existing.get('appid') if existing else None,
+        'steam_running': is_steam_running(),
+        'reason': None,
+    }
+
+
+def add_desktop_tile(exe, start_dir='', launch_options='', icon='', assets_dir=None,
+                     name=DESKTOP_TILE_NAME):
+    """Create (or update) the RomM tile in shortcuts.vdf.
+
+    `exe` is the desktop shell's launch command as Steam stores it — quoted when
+    it contains spaces, exactly like the entries Steam writes itself, because the
+    artwork appid is a hash of exe+name and must match what Steam recomputes.
+
+    Returns {'success', 'appid', 'created', 'steam_running', 'message'}.
+    """
+    config_dir = find_steam_config_dir()
+    if not config_dir:
+        return {'success': False, 'appid': None, 'created': False,
+                'steam_running': False, 'message': 'Steam not found on this system'}
+
+    shortcuts_path = config_dir / 'shortcuts.vdf'
+    shortcuts = SteamVDFHandler.read_shortcuts(shortcuts_path)
+    idx, existing = find_desktop_tile(shortcuts)
+
+    appid = SteamVDFHandler.calculate_appid(exe, name)
+    entry = {
+        'appid': appid,
+        'AppName': name,
+        'Exe': exe,
+        'StartDir': start_dir or '',
+        'icon': icon or '',
+        'ShortcutPath': '',
+        'LaunchOptions': launch_options or '',
+        'IsHidden': 0,
+        'AllowDesktopConfig': 1,
+        'AllowOverlay': 1,
+        'OpenVR': 0,
+        'Devkit': 0,
+        'DevkitGameID': '',
+        'DevkitOverrideAppID': 0,
+        # Preserve play time across an exe change so the tile keeps its place in
+        # Steam's "recent" ordering instead of dropping to the bottom.
+        'LastPlayTime': (existing or {}).get('LastPlayTime', 0),
+        'FlatpakAppID': '',
+        'tags': [DESKTOP_TILE_TAG],
+    }
+
+    created = existing is None
+    if created:
+        shortcuts.append(entry)
+    else:
+        shortcuts[idx] = entry
+
+    try:
+        SteamVDFHandler.write_shortcuts(shortcuts_path, shortcuts)
+    except Exception as e:
+        logging.error(f"add_desktop_tile write failed: {e}", exc_info=True)
+        return {'success': False, 'appid': None, 'created': False,
+                'steam_running': is_steam_running(),
+                'message': f'Could not write shortcuts.vdf: {e}'}
+
+    if assets_dir:
+        _write_desktop_tile_artwork(config_dir, appid, assets_dir)
+
+    running = is_steam_running()
+    return {
+        'success': True,
+        'appid': appid,
+        'created': created,
+        'steam_running': running,
+        'message': ('Restart Steam to see the RomM tile' if running
+                    else 'RomM added to your Steam library'),
+    }
+
+
+def remove_desktop_tile():
+    """Remove the RomM tile and its artwork. Returns {'success', 'message'}."""
+    config_dir = find_steam_config_dir()
+    if not config_dir:
+        return {'success': False, 'steam_running': False,
+                'message': 'Steam not found on this system'}
+
+    shortcuts_path = config_dir / 'shortcuts.vdf'
+    shortcuts = SteamVDFHandler.read_shortcuts(shortcuts_path)
+    idx, existing = find_desktop_tile(shortcuts)
+    if existing is None:
+        return {'success': True, 'steam_running': is_steam_running(),
+                'message': 'No RomM tile to remove'}
+
+    appid = existing.get('appid')
+    shortcuts.pop(idx)
+    try:
+        SteamVDFHandler.write_shortcuts(shortcuts_path, shortcuts)
+    except Exception as e:
+        logging.error(f"remove_desktop_tile write failed: {e}", exc_info=True)
+        return {'success': False, 'steam_running': is_steam_running(),
+                'message': f'Could not write shortcuts.vdf: {e}'}
+
+    if appid is not None:
+        unsigned = appid if appid >= 0 else appid + 0x100000000
+        for suffix in _DESKTOP_TILE_ART.values():
+            arch = config_dir / 'grid' / f"{unsigned}{suffix}"
+            try:
+                if arch.exists():
+                    arch.unlink()
+            except OSError as e:
+                logging.debug(f"Could not delete tile artwork {arch.name}: {e}")
+
+    running = is_steam_running()
+    return {'success': True, 'steam_running': running,
+            'message': ('Restart Steam to drop the RomM tile' if running
+                        else 'RomM removed from your Steam library')}

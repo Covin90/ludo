@@ -69,10 +69,108 @@ What the shell reproduces from `app.py`:
   table in `preload.cjs`). If some pad ever misbehaves, `preload.cjs` is the one
   place to add a `node-hid`/XInput fallback.
 
+## Button-hint legend
+
+`src/shim/footer.tsx` rebuilds the Deck's bottom hint bar. Its glyph art comes
+from Kenney's [Input Prompts](https://kenney.nl/assets/input-prompts) pack
+(**CC0** — commercial use fine, attribution not required), inlined as SVG into
+`src/shim/glyphs.tsx`. That file is **generated and committed**; regenerate with:
+
+```bash
+node tools/gen-glyphs.mjs ~/Downloads/kenney_input-prompts_1.5
+```
+
+The set follows the device last touched (`lastInputKind()`): press the pad and it
+shows that pad's art — `controllerFamily()` picks Xbox / PlayStation / Switch /
+neutral by USB vendor ID — reach for the keyboard or mouse and it shows
+Enter/Esc. Before anything has been touched (`lastInputKind()` is null) it leans
+on the pad, so a launch with a controller attached already shows pad glyphs.
+
+One subtlety in that "last touched" signal: the FIRST mousemove is ignored.
+Opening the window under a stationary cursor makes Chromium synthesise one, and
+counting it handed the legend to the keyboard set at launch even with a pad
+plugged in. Real mouse use always produces a second, differing position. The neutral
+set uses the Steam Deck art, the only one in the pack with plain grey lettered
+ABXY. Note `padConnected()` is tracked separately from the family because an
+unrecognised pad reports family "neutral" — indistinguishable from no pad.
+
+**Getting the first frame right.** Chromium refuses to reveal a gamepad until the
+user presses something on it (anti-fingerprinting), so at launch `getGamepads()`
+is empty even with a pad plugged in — the legend would open on keyboard glyphs
+every time. The page can't ask "is a pad attached", so the shell asks the OS:
+`electron/native-pads.cjs` scans `/sys/class/input` for devices advertising
+`BTN_SOUTH` and hands the list to the renderer via `window.__rommNativePads()`
+(installed in `preload.cjs`). `refreshFamily()` falls back to it whenever the
+Gamepad API reports nothing, so the correct family is known on frame one.
+
+Two traps worth keeping in mind if you touch that file:
+
+- **Don't classify by "has a `jsN` node".** joydev creates one for anything with
+  axes and buttons, so virtual pointer devices qualify — a "Mouse passthrough
+  (absolute)" held `js0` on the dev machine and outranked the real pad on `js1`.
+  `BTN_SOUTH` is what udev and SDL use, and it excludes such devices cleanly.
+- **`null` means "can't tell", not "no pad".** Non-Linux platforms return null,
+  and it must never be read as a negative. Windows has no dependency-free
+  enumeration (it needs XInput/HID via a native addon), so there the legend falls
+  back to the remembered family in `localStorage` — persisted whenever a pad is
+  seen, retired by the first real keypress or pointer move (`sawKbmInput()`), and
+  deliberately *not* cleared on disconnect.
+
+Both `gamepadconnected` and `gamepaddisconnected` are unreliable (the former
+doesn't fire until a press, the latter often not at all on unplug), so
+`refreshFamily` is also polled every 2s; it only notifies subscribers on an
+actual change.
+
+The keyboard/mouse set advertises only bindings that exist, so `Focusable`
+(`src/shim/ui.tsx`) gained desktop equivalents for the pad's non-primary face
+buttons — without them the legend would name actions no keyboard could reach:
+
+| Action | Pad | Keyboard / mouse |
+| --- | --- | --- |
+| Navigate | D-pad / stick | arrow keys, pointer |
+| Confirm | A | Enter, Space, left click |
+| Alternate | X | Shift+Enter, Shift+click |
+| Options | Y | right click, Menu key |
+| Back | B | Escape |
+| Select / Start | View / Menu | *(no equivalent — hint hidden)* |
+
+Arrow keys route into `direction()` in `gamepad.ts` — the *same* function the pad
+drives, so keyboard nav inherits spatial movement, hold-to-repeat and
+scroll-into-view rather than reimplementing them. Left unhandled they'd fall
+through to Chromium, which scrolls the page without moving focus. They're ignored
+inside text fields (the caret needs them) and when a modifier is held.
+
 The NVIDIA/Wayland `__NV_DISABLE_EXPLICIT_SYNC` workaround from `app.py` is
 deliberately **not** ported — it's a WebKitGTK-specific bug.
 
 Installers/AppImage packaging are a separate follow-up.
+
+## Steam library tile
+
+The setup wizard's last step ("Ready to go") offers this as an opt-in toggle, on
+by default, and applies it in `doFinish` — the same place the Deck build creates
+its mandatory tile. Afterwards it lives in
+Settings → Steam → *Add to Steam library*, which creates a "RomM" non-Steam shortcut
+that launches this shell, mirroring the tile the Decky plugin puts in Big
+Picture. The mechanism differs by necessity: the plugin calls
+`SteamClient.Apps.AddShortcut`, a live API that exists only inside Steam's own
+UI process, while here the backend edits `shortcuts.vdf` directly
+(`add_desktop_tile` / `remove_desktop_tile` in `src/sync_core.py`) and drops the
+bundled RomM artwork into `userdata/<id>/config/grid/`.
+
+Two consequences worth knowing:
+
+* **Steam must be restarted.** It holds shortcuts in memory and rewrites the file
+  on exit, so a tile written underneath a running Steam is discarded. The
+  Settings row says so after you toggle it.
+* The tile is tagged `romm-sync-desktop`, so it's found and updated in place even
+  if the launch path changes — no duplicate tiles pile up, and the GTK app's own
+  `romm-sync` per-ROM shortcuts are left untouched.
+
+The launch command comes from the main process (`romm:launch-spec`), which is the
+only side that knows whether we're running as an AppImage (`$APPIMAGE`), a
+packaged binary (`process.execPath`) or a dev checkout (electron binary + app
+dir).
 
 ## Status
 

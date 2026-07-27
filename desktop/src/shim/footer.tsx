@@ -4,10 +4,12 @@
 // so we rebuild it here. The gamepad layer (gamepad.ts) aggregates the current
 // target's labels via computeLegend() and tells us when to refresh.
 //
-// Glyphs are drawn in-app (no external, trademarked console-button assets — and
-// nothing to fetch under the app's strict CSP). The set is chosen from the
-// connected controller's family: Xbox (colored ABXY), PlayStation (✕○□△),
-// Switch (Nintendo-layout letters), or a neutral monochrome set otherwise.
+// Glyph art is Kenney's CC0 "Input Prompts" pack, inlined as SVG by glyphs.tsx
+// (part of the bundle — nothing is fetched at runtime). Which set is drawn
+// follows whoever is actually driving: the keyboard/mouse set in mouse mode, and
+// the connected pad's own set (Xbox / PlayStation / Switch / neutral) once the
+// pad takes over. See inputMode() for why that is not the same as "a pad is
+// plugged in".
 import { useEffect, useState } from "react";
 import {
   computeLegend,
@@ -15,91 +17,102 @@ import {
   onLegendChange,
   onControllerFamilyChange,
   controllerFamily,
-  type ControllerFamily,
+  padConnected,
+  rememberedPadFamily,
+  lastInputKind,
   type Legend,
 } from "./gamepad";
+import { Glyph, type GlyphSet } from "./glyphs";
 
-// Per-family face-button appearance. Slots are the SEMANTIC actions (ok/cancel/
-// secondary/options); each family maps them to the glyph the user physically
-// sees. Switch swaps A/B and X/Y positions vs. the standard layout, so its
-// letters differ from the button index.
-type Face = { sym: string; color: string };
-const FACE: Record<ControllerFamily, Record<string, Face>> = {
+// Semantic slot -> the physical button that slot maps to, per glyph set. The
+// slots are the actions (ok/cancel/secondary/options); the values are what the
+// user is actually looking at. Switch swaps A/B and X/Y against the standard
+// layout, so its face buttons intentionally differ from the button index.
+type Binding = { name: string; title: string };
+const GAMEPAD_SLOTS: Record<Exclude<GlyphSet, "kbm">, Record<string, Binding>> = {
   neutral: {
-    ok: { sym: "A", color: "#cfd2dc" },
-    cancel: { sym: "B", color: "#cfd2dc" },
-    secondary: { sym: "X", color: "#cfd2dc" },
-    options: { sym: "Y", color: "#cfd2dc" },
+    ok: { name: "a", title: "A" }, cancel: { name: "b", title: "B" },
+    secondary: { name: "x", title: "X" }, options: { name: "y", title: "Y" },
+    select: { name: "view", title: "View" }, start: { name: "menu", title: "Menu" },
+    navigate: { name: "dpad", title: "D-pad" },
   },
   xbox: {
-    ok: { sym: "A", color: "#6cc04a" },
-    cancel: { sym: "B", color: "#e74c3c" },
-    secondary: { sym: "X", color: "#3b7ddd" },
-    options: { sym: "Y", color: "#edb92e" },
+    ok: { name: "a", title: "A" }, cancel: { name: "b", title: "B" },
+    secondary: { name: "x", title: "X" }, options: { name: "y", title: "Y" },
+    select: { name: "view", title: "View" }, start: { name: "menu", title: "Menu" },
+    navigate: { name: "dpad", title: "D-pad" },
   },
   ps: {
-    ok: { sym: "✕", color: "#8a9be8" },       // ✕ cross
-    cancel: { sym: "○", color: "#f0787f" },    // ○ circle
-    secondary: { sym: "□", color: "#e58fc4" }, // □ square
-    options: { sym: "△", color: "#67cbb0" },   // △ triangle
+    ok: { name: "a", title: "Cross" }, cancel: { name: "b", title: "Circle" },
+    secondary: { name: "x", title: "Square" }, options: { name: "y", title: "Triangle" },
+    select: { name: "view", title: "Create" }, start: { name: "menu", title: "Options" },
+    navigate: { name: "dpad", title: "D-pad" },
   },
   switch: {
-    ok: { sym: "B", color: "#dfe2ea" },
-    cancel: { sym: "A", color: "#dfe2ea" },
-    secondary: { sym: "Y", color: "#dfe2ea" },
-    options: { sym: "X", color: "#dfe2ea" },
+    // Nintendo's physical A/B and X/Y sit mirrored, so the standard "bottom face
+    // button = confirm" is the one printed B, and "right = cancel" is A.
+    ok: { name: "b", title: "B" }, cancel: { name: "a", title: "A" },
+    secondary: { name: "y", title: "Y" }, options: { name: "x", title: "X" },
+    select: { name: "view", title: "Minus" }, start: { name: "menu", title: "Plus" },
+    navigate: { name: "dpad", title: "D-pad" },
   },
 };
 
-function FaceGlyph({ slot, family }: { slot: string; family: ControllerFamily }) {
-  const f = FACE[family][slot];
-  const colored = family === "xbox" || family === "ps";
-  return (
-    <span
-      className="shim-legend-glyph"
-      style={{
-        borderColor: colored ? f.color : "rgba(255,255,255,0.35)",
-        color: colored ? f.color : "#e6e8ee",
-      }}
-    >
-      {f.sym}
-    </span>
-  );
-}
+// Keyboard/mouse bindings, matching what Focusable actually listens for in
+// ui.tsx. Slots with no desktop equivalent (select/start are pad-only system
+// buttons) are absent, and the legend simply omits them rather than showing a
+// hint nothing can trigger.
+const KBM_SLOTS: Record<string, Binding[]> = {
+  navigate: [{ name: "arrows", title: "Arrow keys" }],
+  ok: [{ name: "enter", title: "Enter" }],
+  cancel: [{ name: "escape", title: "Escape" }],
+  secondary: [{ name: "shift", title: "Shift" }, { name: "enter", title: "Enter" }],
+  options: [{ name: "mouseRight", title: "Right click" }],
+};
 
-// Select / Start are small pictographs (view = two overlapping panes, menu =
-// three lines), kept family-neutral — the semantics read the same everywhere.
-function SystemGlyph({ kind }: { kind: "select" | "start" }) {
-  return (
-    <span className="shim-legend-glyph shim-legend-glyph-sys" aria-hidden>
-      {kind === "select" ? (
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
-          <rect x="2.5" y="4.5" width="6.5" height="5" rx="1.2" stroke="currentColor" strokeWidth="1.3" />
-          <rect x="7" y="6.5" width="6.5" height="5" rx="1.2" stroke="currentColor" strokeWidth="1.3" fill="#12121e" />
-        </svg>
-      ) : (
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
-          <line x1="3.5" y1="5" x2="12.5" y2="5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-          <line x1="3.5" y1="8" x2="12.5" y2="8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-          <line x1="3.5" y1="11" x2="12.5" y2="11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-        </svg>
-      )}
-    </span>
-  );
-}
-
-function Hint({ children, label }: { children: any; label: string }) {
+// One hint: the glyph(s) for a slot plus what the action does. Renders nothing
+// when the active set has no binding for the slot (e.g. select/start on
+// keyboard+mouse) — a label with no button attached would be noise.
+function Hint({ set, slot, label }: { set: GlyphSet; slot: string; label?: string }) {
+  if (!label) return null;
+  const binds = set === "kbm" ? KBM_SLOTS[slot] : [GAMEPAD_SLOTS[set][slot]];
+  if (!binds || binds.some((b) => !b)) return null;
   return (
     <span className="shim-legend-hint">
-      {children}
+      {/* Multi-glyph slots are chords, e.g. Shift+Enter. */}
+      <span className="shim-legend-chord">
+        {binds.map((b, i) => (
+          <Glyph key={i} set={set} name={b.name} title={b.title} />
+        ))}
+      </span>
       <span className="shim-legend-label">{label}</span>
     </span>
   );
 }
 
+// The legend follows whichever device the user last touched, in both directions:
+// pick up the pad and it shows ABXY, reach for the keyboard and it shows
+// Enter/Esc. Before anything has been touched it leans on the pad, because a
+// launch with a controller attached should already be showing pad glyphs.
+function pickSet(): GlyphSet {
+  // Follow the device actually in use, so switching hands swaps the glyphs.
+  if (lastInputKind() === "kbm") return "kbm";
+  // Either the pad is driving, or nothing has been touched yet (null) — at
+  // launch, with a pad attached, we want its glyphs up before the first press.
+  if (padConnected()) return controllerFamily();
+  // No pad visible and nothing touched yet. On Linux the sysfs scan already
+  // settled this, so we only get here on platforms that can't enumerate: fall
+  // back to the pad this user played with last session.
+  if (lastInputKind() == null) {
+    const remembered = rememberedPadFamily();
+    if (remembered) return remembered;
+  }
+  return "kbm";
+}
+
 export function FooterLegend() {
   const [legend, setLegend] = useState<Legend>({});
-  const [family, setFamily] = useState<ControllerFamily>(controllerFamily());
+  const [set, setSet] = useState<GlyphSet>(() => pickSet());
 
   useEffect(() => {
     let last = "";
@@ -109,9 +122,11 @@ export function FooterLegend() {
       const key = JSON.stringify(l);
       if (key !== last) { last = key; setLegend(l); }
     };
+    const resync = () => setSet(pickSet());
     recompute();
+    resync();
     const offL = onLegendChange(recompute);
-    const offF = onControllerFamilyChange(() => setFamily(controllerFamily()));
+    const offF = onControllerFamilyChange(resync);
     // Safety net: labels can change on the SAME focused element (e.g. a two-step
     // delete confirm) without any focus/hover event to trigger recompute.
     const iv = window.setInterval(recompute, 500);
@@ -122,22 +137,15 @@ export function FooterLegend() {
   return (
     <div className="shim-legend">
       <div className="shim-legend-group">
-        <Hint label="Navigate">
-          <span className="shim-legend-glyph shim-legend-glyph-sys" aria-hidden>
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
-              <path d="M8 2.2 L9.6 4 H6.4 Z M8 13.8 L6.4 12 H9.6 Z M2.2 8 L4 6.4 V9.6 Z M13.8 8 L12 9.6 V6.4 Z"
-                fill="currentColor" />
-            </svg>
-          </span>
-        </Hint>
-        {legend.select && <Hint label={legend.select}><SystemGlyph kind="select" /></Hint>}
-        {legend.start && <Hint label={legend.start}><SystemGlyph kind="start" /></Hint>}
+        <Hint set={set} slot="navigate" label="Navigate" />
+        <Hint set={set} slot="select" label={legend.select} />
+        <Hint set={set} slot="start" label={legend.start} />
       </div>
       <div className="shim-legend-group">
-        {legend.ok && <Hint label={legend.ok}><FaceGlyph slot="ok" family={family} /></Hint>}
-        {legend.secondary && <Hint label={legend.secondary}><FaceGlyph slot="secondary" family={family} /></Hint>}
-        {legend.options && <Hint label={legend.options}><FaceGlyph slot="options" family={family} /></Hint>}
-        {legend.cancel && <Hint label={legend.cancel}><FaceGlyph slot="cancel" family={family} /></Hint>}
+        <Hint set={set} slot="ok" label={legend.ok} />
+        <Hint set={set} slot="secondary" label={legend.secondary} />
+        <Hint set={set} slot="options" label={legend.options} />
+        <Hint set={set} slot="cancel" label={legend.cancel} />
       </div>
     </div>
   );
