@@ -139,21 +139,30 @@ jobs:
           # Import the real module rather than a copy of its logic, so this
           # exercises the code the app actually ships.
           pip install --quiet ./engine
-          python - <<'PY'
-          import sys, logging
+          VERSION='${{ needs.version.outputs.version }}' python - <<'PY'
+          import os, sys, logging
           logging.basicConfig(level=logging.INFO)
           sys.path.insert(0, 'decky_plugin')
           import main
 
+          # A prerelease is only visible on the beta channel — the stable
+          # channel filters prereleases out, which is correct behaviour and
+          # not something to assert against.
+          version = os.environ['VERSION']
+          channel = 'beta' if '-' in version else 'stable'
+          print(f'verifying {version} on the {channel} channel')
+
           failures = []
           for suffix in ('-decky.zip', '-x86_64.AppImage'):
-              rel = main.select_release('stable', suffix)
+              rel = main.select_release(channel, suffix)
               if not rel:
                   failures.append(suffix)
                   print(f'FAIL {suffix}: updater cannot resolve a release')
                   continue
               asset = main._release_asset(rel, suffix)
               print(f'OK   {suffix} -> {rel["tag_name"]} / {asset["name"]}')
+              if rel['tag_name'].lstrip('v') != version:
+                  failures.append(f'{suffix} (resolved {rel["tag_name"]}, expected v{version})')
           if failures:
               raise SystemExit(f'updater cannot resolve: {", ".join(failures)}')
           PY
