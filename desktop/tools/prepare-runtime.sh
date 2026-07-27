@@ -65,6 +65,15 @@ mkdir -p "$SRC_DIR/desktop/backend" "$SRC_DIR/decky_plugin"
 cp "$DESKTOP_DIR/backend/server.py"   "$SRC_DIR/desktop/backend/"
 cp "$DESKTOP_DIR/package.json"        "$SRC_DIR/desktop/"
 
+# The window loads from the backend's HTTP server, not from a file:// URL, so
+# the built UI has to sit next to server.py where STATIC_ROOT points — not
+# inside the asar, which Python cannot read.
+if [ ! -f "$DESKTOP_DIR/dist/index.html" ]; then
+    echo "❌ desktop/dist/index.html missing — run 'npm run build' first"
+    exit 1
+fi
+cp -r "$DESKTOP_DIR/dist" "$SRC_DIR/desktop/dist"
+
 # The plugin supplies the Plugin class the backend drives. py_modules is
 # deliberately NOT copied: those are Deck-only cpython-311 binary builds that
 # would shadow the interpreter's own working copies.
@@ -86,6 +95,9 @@ assert server.plugin_module.asset_suffix() == '-x86_64.AppImage', 'wrong update 
 print('    backend imports OK, suffix =', server.plugin_module.asset_suffix())
 print('    engine  =', paths.__file__)
 " )
+
+[ -f "$SRC_DIR/desktop/dist/index.html" ] || { echo "❌ staged UI missing"; exit 1; }
+echo "    UI      = $(du -sh "$SRC_DIR/desktop/dist" | cut -f1) staged"
 
 du -sh "$PY_DIR" "$SRC_DIR" 2>/dev/null | sed 's/^/    /'
 echo "==> Runtime ready"
