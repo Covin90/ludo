@@ -1,0 +1,159 @@
+name: Release
+
+# One release carries both artifacts. They are named by the suffixes the
+# in-app updater selects on (UPDATE_ASSET_SUFFIX in decky_plugin/main.py,
+# artifactName in desktop/package.json), so the names are a contract, not
+# cosmetics — the verify job below enforces that.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (must already exist)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  DECKY_SUFFIX: '-decky.zip'
+  DESKTOP_SUFFIX: '-x86_64.AppImage'
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.tag || github.ref }}' }
+      - id: v
+        run: |
+          # The tag is the source of truth; package.json must agree, or the
+          # updater compares against a version the release does not carry.
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./decky_plugin/package.json').version")
+          DESK=$(node -p "require('./desktop/package.json').version")
+          echo "tag=$TAG plugin=$PKG desktop=$DESK"
+          [ "$TAG" = "$PKG" ]  || { echo "::error::tag v$TAG != decky_plugin/package.json $PKG"; exit 1; }
+          [ "$TAG" = "$DESK" ] || { echo "::error::tag v$TAG != desktop/package.json $DESK"; exit 1; }
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+  decky:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.tag || github.ref }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - name: Build plugin
+        working-directory: decky_plugin
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+          bash decky-build.sh
+      # decky-build.sh emits <repo>/ludo.zip; rename to the versioned asset the
+      # updater looks for.
+      - name: Name the asset
+        run: mv ludo.zip "Ludo-v${{ needs.version.outputs.version }}${{ env.DECKY_SUFFIX }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: decky
+          path: Ludo-v*${{ env.DECKY_SUFFIX }}
+          if-no-files-found: error
+
+  desktop:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.tag || github.ref }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Build AppImage
+        working-directory: desktop
+        # prepare-runtime.sh downloads a standalone CPython and installs the
+        # engine into it, then verifies the backend imports before packaging.
+        run: |
+          npm ci
+          npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop
+          path: desktop/release/Ludo-v*${{ env.DESKTOP_SUFFIX }}
+          if-no-files-found: error
+
+  release:
+    needs: [version, decky, desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+
+      # Both assets must be present and non-trivial before anything is
+      # published: a release missing one silently breaks that frontend's
+      # updater, and select_release skips releases lacking the asset, so the
+      # failure would look like "no update available" rather than an error.
+      - name: Verify assets
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          DECKY="dist/Ludo-v${V}${{ env.DECKY_SUFFIX }}"
+          DESK="dist/Ludo-v${V}${{ env.DESKTOP_SUFFIX }}"
+          ls -lh dist/
+          for f in "$DECKY" "$DESK"; do
+            [ -f "$f" ] || { echo "::error::missing asset $f"; exit 1; }
+            sz=$(stat -c%s "$f")
+            [ "$sz" -gt 1000000 ] || { echo "::error::$f is only $sz bytes"; exit 1; }
+          done
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          gh release create "v${V}" \
+            --repo "${{ github.repository }}" \
+            --title "Ludo v${V}" \
+            --generate-notes \
+            $([ "${V#*-}" != "$V" ] && echo --prerelease) \
+            dist/Ludo-v${V}*
+
+  # Proves the published release is actually consumable by the in-app updater,
+  # rather than assuming it because the files exist.
+  verify-updater:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ inputs.tag || github.ref }}' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Resolve both assets through select_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Import the real module rather than a copy of its logic, so this
+          # exercises the code the app actually ships.
+          pip install --quiet ./engine
+          python - <<'PY'
+          import sys, logging
+          logging.basicConfig(level=logging.INFO)
+          sys.path.insert(0, 'decky_plugin')
+          import main
+
+          failures = []
+          for suffix in ('-decky.zip', '-x86_64.AppImage'):
+              rel = main.select_release('stable', suffix)
+              if not rel:
+                  failures.append(suffix)
+                  print(f'FAIL {suffix}: updater cannot resolve a release')
+                  continue
+              asset = main._release_asset(rel, suffix)
+              print(f'OK   {suffix} -> {rel["tag_name"]} / {asset["name"]}')
+          if failures:
+              raise SystemExit(f'updater cannot resolve: {", ".join(failures)}')
+          PY
