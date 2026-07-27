@@ -38,7 +38,14 @@ if (process.platform === "linux") {
 }
 
 const DESKTOP_DIR = path.resolve(__dirname, "..");
-const SERVER_PY = path.join(DESKTOP_DIR, "backend", "server.py");
+
+// Packaged builds carry their own interpreter and a mirror of the repo layout
+// under resources/ (see tools/prepare-runtime.sh). From source we use the tree
+// we are sitting in. Everything below branches on this one flag.
+const PACKAGED = app.isPackaged;
+const RES = process.resourcesPath || "";
+const SRC_ROOT = PACKAGED ? path.join(RES, "app-src", "desktop") : DESKTOP_DIR;
+const SERVER_PY = path.join(SRC_ROOT, "backend", "server.py");
 
 // The plugin UI is authored against the Deck's fixed 1280x800 gamepad viewport,
 // where SteamOS scales the whole design to the screen. We reproduce that by
@@ -65,10 +72,20 @@ function freePort(host = "127.0.0.1") {
   });
 }
 
-// Locate the Python interpreter: prefer a project venv (created per README),
-// then an explicit override, then the platform default.
+// Locate the Python interpreter. A packaged build must never fall back to the
+// user's system Python: it would be missing the engine and the backend deps,
+// and would fail confusingly at import time rather than here.
 function pythonExe() {
   if (process.env.ROMM_PYTHON) return process.env.ROMM_PYTHON;
+
+  if (PACKAGED) {
+    const bundled = path.join(RES, "python", "bin", "python3");
+    if (fs.existsSync(bundled)) return bundled;
+    throw new Error(
+      `Bundled Python runtime missing at ${bundled}. The build is incomplete; ` +
+      `run desktop/tools/prepare-runtime.sh before packaging.`);
+  }
+
   const venv = process.platform === "win32"
     ? path.join(DESKTOP_DIR, ".venv", "Scripts", "python.exe")
     : path.join(DESKTOP_DIR, ".venv", "bin", "python");

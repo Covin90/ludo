@@ -97,3 +97,7 @@ node_modules/
 
 # local dev
 .venv/
+
+# desktop packaging outputs
+desktop/runtime/
+desktop/release/

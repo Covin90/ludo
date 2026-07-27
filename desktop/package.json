@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Desktop client (Linux + Windows) — reuses the Decky plugin's React UI via a @decky/* shim, shelled in Electron",
+  "description": "Desktop client (Linux + Windows) \u2014 reuses the Decky plugin's React UI via a @decky/* shim, shelled in Electron",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "electron": "npm run build && node electron/launch.cjs",
-    "electron:dev": "node electron/launch.cjs --dev"
+    "electron:dev": "node electron/launch.cjs --dev",
+    "prepare-runtime": "bash tools/prepare-runtime.sh",
+    "dist": "npm run build && npm run prepare-runtime && electron-builder --linux AppImage"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -24,10 +26,43 @@
     "@types/react-dom": "18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
     "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
     "typescript": "^5.6.2",
     "vite": "^5.4.0"
   },
   "allowScripts": {
     "electron@33.4.11": true
-  }
+  },
+  "build": {
+    "appId": "io.github.covin90.ludo",
+    "productName": "Ludo",
+    "artifactName": "Ludo-v${version}-x86_64.AppImage",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime/python",
+        "to": "python"
+      },
+      {
+        "from": "runtime/app-src",
+        "to": "app-src"
+      }
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Game",
+      "synopsis": "Sync ROMs, saves and states between RomM and RetroArch"
+    }
+  },
+  "author": "Hector Eduardo \"Covin\" Silveri",
+  "license": "GPL-3.0"
 }
