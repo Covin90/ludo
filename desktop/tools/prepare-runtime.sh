@@ -32,18 +32,27 @@ echo "==> Preparing runtime in $RUNTIME"
 mkdir -p "$RUNTIME"
 
 # ── 1. Standalone interpreter ────────────────────────────────────────────────
-if [ "${FORCE:-0}" = "1" ]; then rm -rf "$PY_DIR"; fi
-if [ ! -x "$PY_DIR/bin/python3" ]; then
+# The interpreter is always re-extracted rather than reused: step 2b strips
+# pip out of it, so a second run against a kept tree could not install
+# anything. The download is what is slow, so the tarball is cached instead
+# and re-extracting costs a few seconds.
+TARBALL="$RUNTIME/_cache/$PBS_FILE"
+if [ "${FORCE:-0}" = "1" ]; then rm -rf "$RUNTIME/_cache"; fi
+if [ ! -f "$TARBALL" ]; then
     echo "==> Fetching CPython ${PBS_VER}"
-    rm -rf "$PY_DIR" "$RUNTIME/_dl"
-    mkdir -p "$RUNTIME/_dl"
-    curl -fsSL "$PBS_URL" -o "$RUNTIME/_dl/python.tar.gz"
-    tar -xzf "$RUNTIME/_dl/python.tar.gz" -C "$RUNTIME/_dl"
-    mv "$RUNTIME/_dl/python" "$PY_DIR"
-    rm -rf "$RUNTIME/_dl"
+    mkdir -p "$RUNTIME/_cache"
+    curl -fsSL "$PBS_URL" -o "$TARBALL.part"
+    mv "$TARBALL.part" "$TARBALL"
 else
-    echo "==> Reusing existing interpreter ($("$PY_DIR/bin/python3" -V))"
+    echo "==> Using cached CPython ${PBS_VER} tarball"
 fi
+
+echo "==> Extracting a clean interpreter"
+rm -rf "$PY_DIR" "$RUNTIME/_x"
+mkdir -p "$RUNTIME/_x"
+tar -xzf "$TARBALL" -C "$RUNTIME/_x"
+mv "$RUNTIME/_x/python" "$PY_DIR"
+rm -rf "$RUNTIME/_x"
 
 PY="$PY_DIR/bin/python3"
 

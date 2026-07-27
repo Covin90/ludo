@@ -93,6 +93,24 @@ function pythonExe() {
   return process.platform === "win32" ? "python" : "python3";
 }
 
+// Mirroring the backend's output is a convenience for terminal launches. When
+// the app is started from a desktop entry or a file manager, stdout is a pipe
+// with no reader: it closes, the write throws EPIPE, and an uncaught exception
+// in the main process takes the whole app down. Logging is never worth
+// crashing over, so failures here are swallowed.
+function mirror(stream, text) {
+  try { stream.write(text); } catch { /* no reader; drop it */ }
+}
+
+// write() can also surface EPIPE asynchronously, which bypasses the try/catch
+// above and would reach the uncaught-exception handler.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on("error", (err) => {
+    if (err && (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED")) return;
+    console.error("stdio error:", err);
+  });
+}
+
 // Start backend/server.py on `host:port` and resolve once it announces it's
 // listening. server.serve() binds the socket only after the engine is ready, so
 // the "[server] listening" line means the URL is loadable.
@@ -109,14 +127,14 @@ function startBackend(host, port) {
     let ready = false;
     const onData = (buf) => {
       const text = buf.toString();
-      process.stdout.write(text); // mirror engine logs to the shell console
+      mirror(process.stdout, text); // engine logs, when anyone is listening
       if (!ready && text.includes("[server] listening")) {
         ready = true;
         resolve();
       }
     };
     child.stdout.on("data", onData);
-    child.stderr.on("data", (b) => process.stderr.write(b.toString()));
+    child.stderr.on("data", (b) => mirror(process.stderr, b.toString()));
 
     child.on("error", reject);
     child.on("exit", (code) => {
