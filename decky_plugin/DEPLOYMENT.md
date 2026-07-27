@@ -32,7 +32,7 @@ After editing source, copy only what changed, then reload the plugin from the De
 (or toggle it off/on):
 
 ```bash
-cd /home/covin/ludo
+cd /path/to/ludo
 DEST=~/homebrew/plugins/ludo
 
 # Frontend change (src/index.tsx):
