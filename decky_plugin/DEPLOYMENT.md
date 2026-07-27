@@ -203,7 +203,7 @@ ludo/
 
 ## Installation on SteamOS
 
-1. Transfer the ZIP file (e.g., `Ludo-v1.6-decky.zip`) to the SteamOS device
+1. Transfer the ZIP file (e.g., `Ludo-v1.0.0-decky.zip`) to the SteamOS device
 2. In Decky Loader: **gear icon → "Install plugin from ZIP"**
 3. Select the zip file
 
@@ -214,10 +214,10 @@ Do **not** restart Decky Loader after installation — use the Decky QAM reload 
 If `sshpass` is installed and the Deck is reachable, you can send the zip directly:
 
 ```bash
-sshpass -p "<password>" scp Ludo-v1.6-decky.zip deck@<deck-ip>:~/
+sshpass -p "<password>" scp Ludo-v1.0.0-decky.zip deck@<deck-ip>:~/
 ```
 
-Then install from `~/Ludo-v1.6-decky.zip` on the Deck via Decky Loader.
+Then install from `~/Ludo-v1.0.0-decky.zip` on the Deck via Decky Loader.
 
 ---
 

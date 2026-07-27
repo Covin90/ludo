@@ -8462,7 +8462,7 @@ function SettingsPage() {
         }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
             <span style={{ fontWeight: 800, fontSize: '16px' }}>Ludo</span>
-            <span style={{ color: V2.fgMuted, fontSize: '12px' }}>v{version || '1.6.0'}</span>
+            <span style={{ color: V2.fgMuted, fontSize: '12px' }}>v{version || '1.0.0'}</span>
           </div>
           <div style={{ color: V2.fgMuted, fontSize: '12px' }}>by Covin</div>
           <div style={{ display: 'flex', gap: '10px', marginTop: '6px' }}>
