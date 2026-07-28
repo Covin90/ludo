@@ -38,6 +38,8 @@ const getSteamTileStatus = callable<[], any>("get_steam_tile_status");
 const setSteamTile = callable<[boolean, string, string, string], any>("set_steam_tile");
 const getCoreMappings = callable<[], any>("get_core_mappings");
 const setCoreOverride = callable<[string, string], any>("set_core_override");
+const downloadCore = callable<[string], any>("download_core");
+const getDownloadableCores = callable<[boolean], any>("get_downloadable_cores");
 const getConfig = callable<[], any>("get_config");
 const logout = callable<[boolean], any>("logout");
 const getAccountUsername = callable<[], any>("get_account_username");
@@ -4201,7 +4203,8 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
 
   useEffect(() => {
     let alive = true;
-    const load = async () => {
+    let retry: any = null;
+    const load = async (attempt = 0) => {
       try {
         const [h, p, c] = await Promise.all([
           getHomeData(), getLibraryGroups('platform'), getLibraryGroups('collection'),
@@ -4219,8 +4222,20 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         };
         if (h?.success) {
           next.recent = upd(h.recent || [], prev?.recent, setRecent);
-          next.continuePlaying = upd(h.continue_playing || [], prev?.continuePlaying, setContinuePlaying);
           next.downloaded = upd(h.downloaded_games || [], prev?.downloaded, setDownloaded);
+        }
+        // Continue playing is the one row fetched live from RomM, so it alone
+        // can come back "unknown" (null) — not authenticated yet at boot,
+        // offline, a 5xx. Keep whatever we last knew instead of blanking the
+        // row; an empty ARRAY is a real answer and does clear it. Runs outside
+        // the h.success guard so a failed payload can't clear it either.
+        if (h?.continue_playing != null) {
+          next.continuePlaying = upd(h.continue_playing, prev?.continuePlaying, setContinuePlaying);
+        } else if (attempt < 3) {
+          // Losing the race with login is the common case on a cold start, and
+          // it resolves silently a second or two later — without this the row
+          // would stay missing until something else triggered a reload.
+          retry = setTimeout(() => { if (alive) load(attempt + 1); }, 2500);
         }
         if (p?.success) next.platforms = upd(p.groups || [], prev?.platforms, setPlatforms);
         if (c?.success) next.collections = upd(c.groups || [], prev?.collections, setCollections);
@@ -4233,7 +4248,7 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
     // Re-fetch on a manual "Refresh library" (account menu) so a same-tab
     // refresh shows up immediately instead of waiting for a tab switch.
     _libRefreshListeners.add(load);
-    return () => { alive = false; _libRefreshListeners.delete(load); };
+    return () => { alive = false; clearTimeout(retry); _libRefreshListeners.delete(load); };
     // Re-fetch when connectivity flips: offline filters the library to
     // downloaded-only, so the rows must rebuild without a tab switch.
   }, [offline]);
@@ -7071,17 +7086,70 @@ function V2SettingsSection({ title, children }: { title: string; children: any }
 
 // A focusable surface row: leading icon, title + optional subtitle, optional
 // trailing control. Acts as a button when onClick is given.
+// Row highlight — hover and focus tracked separately, because they are not the
+// same thing once a modal is involved. Closing a modal restores focus to the row
+// that opened it (right for the gamepad: that's where the cursor should resume),
+// but with a mouse the pointer has since moved on, leaving that row lit next to
+// whatever you're now hovering — two highlighted rows.
+//
+// So a row lights up for focus only when the pointer isn't the thing driving,
+// which takes two checks — the restore happens in a rAF after the modal closes,
+// so it can land either side of the pointer's own movement:
+//
+//   1. At focus time, look BACK: if the pointer was active in the last moment,
+//      this focus is the tail of a mouse interaction, not a gamepad landing on
+//      the row — don't light it. Needed when the pointer has already settled on
+//      its new row before the restore fires, leaving no later event to react to.
+//   2. While lit, look FORWARD: any pointer movement retires the highlight.
+//      Needed when the restore fires first and the pointer moves away after.
+//
+// A gamepad leaves the pointer untouched, so neither check ever trips and its
+// focus highlight behaves exactly as before.
+const POINTER_IDLE_MS = 500;
+let _lastPointerAt = 0;
+const _pointerSubs = new Set<() => void>();
+if (typeof window !== 'undefined') {
+  // Capture phase: still observed if something downstream stops propagation.
+  // mousedown counts too — dismissing a modal by clicking the backdrop can
+  // reach the row underneath without producing a single mousemove.
+  for (const evt of ['mousemove', 'mousedown']) {
+    window.addEventListener(evt, () => {
+      _lastPointerAt = Date.now();
+      if (_pointerSubs.size) [..._pointerSubs].forEach((f) => f());
+    }, true);
+  }
+}
+
+function useRowHighlight() {
+  const [hover, setHover] = useState(false);
+  const [focusLit, setFocusLit] = useState(false);
+  useEffect(() => {
+    if (!focusLit) return;
+    const drop = () => setFocusLit(false);
+    _pointerSubs.add(drop);
+    return () => { _pointerSubs.delete(drop); };
+  }, [focusLit]);
+  return {
+    active: hover || focusLit,
+    highlightHandlers: {
+      onFocus: () => setFocusLit(Date.now() - _lastPointerAt > POINTER_IDLE_MS),
+      onBlur: () => setFocusLit(false),
+      onMouseEnter: () => setHover(true),
+      onMouseLeave: () => setHover(false),
+    },
+  };
+}
+
 function V2SettingsRow({ icon, title, subtitle, onClick, right, danger, disabled, bareIcon }:
   { icon?: any; title: any; subtitle?: any; onClick?: () => void; right?: any; danger?: boolean; disabled?: boolean; bareIcon?: boolean }) {
-  const [active, setActive] = useState(false);
+  const { active, highlightHandlers } = useRowHighlight();
   const interactive = !!onClick && !disabled;
   const accent = danger ? V2.danger : V2.brand;
   return (
     <Focusable noFocusRing
       onActivate={interactive ? onClick : undefined}
       onClick={interactive ? onClick : undefined}
-      onFocus={() => setActive(true)} onBlur={() => setActive(false)}
-      onMouseEnter={() => setActive(true)} onMouseLeave={() => setActive(false)}
+      {...highlightHandlers}
       style={{
         display: 'flex', alignItems: 'center', gap: '14px', padding: '14px 16px',
         borderRadius: V2.radiusCard, background: active ? V2.surfaceHover : V2.surface,
@@ -7595,11 +7663,16 @@ function DownloadsPage() {
 // Glassy core picker (RomM v2 chrome, like the account/collection menus).
 // Lists "Auto" + every installed core, with RetroDECK's choices surfaced first
 // and the current selection check-marked. closeModal is injected by showModal.
-function CorePickerModal({ row, availableCores, onPick, closeModal }: {
-  row: any; availableCores: string[]; onPick: (core: string) => void; closeModal?: () => void;
+function CorePickerModal({ row, availableCores, canDownload, onPick, onDownload, closeModal }: {
+  row: any; availableCores: string[]; canDownload: boolean; onPick: (core: string) => void;
+  onDownload: (core: string) => void; closeModal?: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState('');
+  // Cores the buildbot can supply for this platform that aren't installed. The
+  // full buildbot catalogue (~200 cores) is only pulled in once you search, so
+  // opening the picker stays a local, offline-safe operation.
+  const [catalogue, setCatalogue] = useState<string[] | null>(null);
   const rdSet = new Set<string>(row?.retrodeck_choices || []);
   // RetroDECK's choices for this system are the cores actually meant for the
   // platform (mGBA/VBA-M for gba, Swanstation/Beetle for psx, …). Show only
@@ -7619,12 +7692,35 @@ function CorePickerModal({ row, availableCores, onPick, closeModal }: {
   const current = row?.override || '';
 
   const pick = (core: string) => { closeModal?.(); onPick(core); };
+  const grab = (core: string) => { closeModal?.(); onDownload(core); };
+
+  // Suggested downloads for this platform, plus — once you type — anything else
+  // in the catalogue. Both filtered against what's already installed.
+  // Nothing downloadable on a RetroDECK install (it bundles its own cores in a
+  // read-only tree) — the whole section, catalogue fetch included, stays off.
+  const suggested: string[] = canDownload ? (row?.download_candidates || []).filter(match) : [];
+  const catalogueHits = (canDownload && q && catalogue)
+    ? catalogue.filter((c) => !availableCores.includes(c) && !suggested.includes(c) && match(c)).slice(0, 40)
+    : [];
+  useEffect(() => {
+    if (!canDownload || !q || catalogue !== null) return;
+    getDownloadableCores(false)
+      .then((r: any) => setCatalogue(r?.success ? (r.cores || []).map((c: any) => c.name) : []))
+      .catch(() => setCatalogue([]));
+  }, [canDownload, q, catalogue]);
 
   const coreRow = (core: string) => (
     <UserMenuRow key={core}
       icon={current === core ? <FaCheck size={13} /> : <FaPuzzlePiece size={13} />}
       label={core + (row?.retrodeck_default === core ? '  · RetroDECK default' : (rdSet.has(core) ? '  · RetroDECK' : ''))}
       onSelect={() => pick(core)} />
+  );
+
+  const downloadRow = (core: string) => (
+    <UserMenuRow key={`dl-${core}`}
+      icon={<FaDownload size={13} />}
+      label={`${core}  ·  download`}
+      onSelect={() => grab(core)} />
   );
 
   return (
@@ -7677,6 +7773,19 @@ function CorePickerModal({ row, availableCores, onPick, closeModal }: {
           )}
           {others.length > 0 && <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />}
           {others.map(coreRow)}
+          {/* Not installed, but the libretro buildbot has it — same source
+              RetroArch's own Online Updater uses. */}
+          {(suggested.length > 0 || catalogueHits.length > 0) && (
+            <>
+              <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+              <div style={{
+                fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
+                color: V2.fgMuted, padding: '6px 8px 4px',
+              }}>Available to download</div>
+            </>
+          )}
+          {suggested.map(downloadRow)}
+          {catalogueHits.map(downloadRow)}
         </Focusable>
       </Focusable>
     </ModalRoot>
@@ -7690,11 +7799,20 @@ function CoresPage() {
   const [rows, setRows] = useState<any[]>([]);
   const [cores, setCores] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  // Whether this RetroArch can gain cores at all, and why not when it can't
+  // (RetroDECK bundles them read-only; unsupported CPU; no writable dir).
+  const [canDownload, setCanDownload] = useState(false);
+  const [noDownloadReason, setNoDownloadReason] = useState('');
 
   const load = async () => {
     try {
       const r = await getCoreMappings();
-      if (r?.success) { setRows(r.mappings || []); setCores(r.available_cores || []); }
+      if (r?.success) {
+        setRows(r.mappings || []);
+        setCores(r.available_cores || []);
+        setCanDownload(!!r.can_download_cores);
+        setNoDownloadReason(r.download_unavailable_reason || '');
+      }
     } catch { /* ignore */ }
     finally { setLoading(false); }
   };
@@ -7709,8 +7827,30 @@ function CoresPage() {
     } catch { toaster.toast({ title: 'Core override', body: 'Could not save change' }); }
   };
 
+  // Fetch a core, then pin it for this platform — picking a core you just
+  // downloaded and NOT using it is never what was meant.
+  const [busy, setBusy] = useState<string | null>(null);
+  const install = async (row: any, core: string) => {
+    setBusy(row.slug);
+    toaster.toast({ title: 'Emulator core', body: `Downloading ${core}…` });
+    try {
+      const r = await downloadCore(core);
+      if (r?.success) {
+        toaster.toast({ title: 'Emulator core', body: `${core} installed` });
+        await apply(row.slug, core);
+        await load();   // the installed-core list grew
+      } else {
+        toaster.toast({ title: 'Emulator core', body: r?.message || `Could not download ${core}` });
+      }
+    } catch {
+      toaster.toast({ title: 'Emulator core', body: `Could not download ${core}` });
+    } finally { setBusy(null); }
+  };
+
   const openPicker = (row: any) =>
-    showModal(<CorePickerModal row={row} availableCores={cores} onPick={(c) => apply(row.slug, c)} />);
+    showModal(<CorePickerModal row={row} availableCores={cores} canDownload={canDownload}
+      onPick={(c) => apply(row.slug, c)}
+      onDownload={(c) => install(row, c)} />);
 
   const badge = (row: any) => {
     const labelFor: Record<string, string> = { override: 'pinned', retrodeck: 'RetroDECK', guess: 'auto', none: '—' };
@@ -7751,9 +7891,17 @@ function CoresPage() {
             bareIcon
             icon={<PlatformIcon slug={row.slug} size={28} />}
             title={row.platform_name}
-            subtitle={row.source === 'override'
-              ? 'Pinned by you — A to change or reset to auto'
-              : 'Auto-resolved — A to pin a specific core'}
+            subtitle={busy === row.slug
+              ? 'Downloading core…'
+              : row.source === 'none'
+                ? ((row.download_candidates || []).length
+                  ? `No core installed — A to download ${row.download_candidates[0]}`
+                  : noDownloadReason
+                    ? `No core installed — ${noDownloadReason}`
+                    : 'No core installed — A to pick one')
+                : row.source === 'override'
+                  ? 'Pinned by you — A to change or reset to auto'
+                  : 'Auto-resolved — A to pin a specific core'}
             onClick={() => openPicker(row)}
             right={badge(row)} />
         ))}

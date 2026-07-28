@@ -2127,10 +2127,58 @@ class Plugin:
                 info.update({'slug': slug, 'platform_name': label})
                 rows.append(info)
             rows.sort(key=lambda r: (r['platform_name'] or '').lower())
-            return {'success': True, 'available_cores': available, 'mappings': rows}
+            support = ra.core_download_support()
+            return {'success': True, 'available_cores': available, 'mappings': rows,
+                    'can_download_cores': support['available'],
+                    'download_unavailable_reason': support['reason']}
         except Exception as e:
             logging.error(f"get_core_mappings error: {e}", exc_info=True)
             return {'success': False, 'mappings': [], 'available_cores': [], 'message': str(e)}
+
+    async def download_core(self, core: str):
+        """Install one core from the libretro buildbot (RetroArch's own core
+        source). Blocking network + unzip, so it runs off the event loop."""
+        try:
+            ra = self._retroarch
+            if not ra:
+                return {'success': False, 'message': 'RetroArch interface unavailable'}
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, ra.download_core, core)
+            if result.get('success'):
+                logging.info(f"Installed emulator core: {core}")
+            return result
+        except Exception as e:
+            logging.error(f"download_core error: {e}", exc_info=True)
+            return {'success': False, 'core': core, 'message': str(e)}
+
+    async def get_downloadable_cores(self, refresh: bool = False):
+        """Every core the buildbot ships for this OS/arch, with an installed
+        flag — backs the "add a core" section of the core picker."""
+        try:
+            ra = self._retroarch
+            if not ra:
+                return {'success': False, 'cores': [],
+                        'message': 'RetroArch interface unavailable'}
+            support = ra.core_download_support()
+            if not support['available']:
+                return {'success': True, 'cores': [], 'writable_dir': None,
+                        'can_download': False, 'message': support['reason']}
+            index = await asyncio.get_event_loop().run_in_executor(
+                None, ra.list_downloadable_cores, bool(refresh))
+            installed = ra.get_available_cores()
+            dest = ra.find_writable_cores_directory()
+            return {
+                'success': True,
+                'can_download': True,
+                'writable_dir': str(dest) if dest else None,
+                'cores': sorted(
+                    ({'name': name, 'installed': name in installed,
+                      'date': meta.get('date')} for name, meta in index.items()),
+                    key=lambda c: c['name']),
+            }
+        except Exception as e:
+            logging.error(f"get_downloadable_cores error: {e}", exc_info=True)
+            return {'success': False, 'cores': [], 'message': str(e)}
 
     async def set_core_override(self, slug: str, core: str = ''):
         """Pin (core non-empty) or clear (core empty) the launch core for a
@@ -3990,10 +4038,17 @@ class Plugin:
         /api/roms ordered by it rather than guessing from local save mtimes.
         Returns serialized LibGames, enriched with local download state when the
         rom is in our index.
+
+        Returns None — NOT [] — when the list couldn't be fetched (client not
+        authenticated yet at boot, offline, HTTP error). The two are completely
+        different to the caller: [] means "nothing played, hide the row", while
+        None means "don't know", and blanking a good row on a transient failure
+        is what made Continue playing vanish at random on launch.
         """
         client = self._romm_client
         if not client or not client.ensure_authenticated():
-            return []
+            logging.debug("continue-playing: client not ready yet")
+            return None
         try:
             resp = client.session.get(
                 urljoin(client.base_url, '/api/roms'),
@@ -4007,11 +4062,11 @@ class Plugin:
             )
             if resp.status_code != 200:
                 logging.warning(f"continue-playing fetch HTTP {resp.status_code}")
-                return []
+                return None
             items = resp.json().get('items', [])
         except Exception as e:
             logging.warning(f"continue-playing fetch failed: {e}")
-            return []
+            return None
 
         idx = self._games_index()
         out = []
@@ -4092,7 +4147,7 @@ class Plugin:
             }
         except Exception as e:
             logging.error(f"get_home_data error: {e}", exc_info=True)
-            return {'success': False, 'stats': {}, 'recent': [], 'downloaded_games': [], 'continue_playing': [], 'message': str(e)}
+            return {'success': False, 'stats': {}, 'recent': [], 'downloaded_games': [], 'continue_playing': None, 'message': str(e)}
 
     async def launch_game(self, rom_id: int, disc: str = None, sibling_rom_id: int = None):
         """Launch a downloaded game in RetroArch (A button on a downloaded card).

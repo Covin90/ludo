@@ -55,10 +55,20 @@ except ImportError as e:
     PIL_AVAILABLE = False
     Image = None
 
-# Fix SSL certificate path for AppImage environment
+IS_WINDOWS = os.name == 'nt'
+# Libretro cores are .so on Linux, .dll on Windows — every core glob and every
+# "is this a core file" test goes through these two.
+CORE_EXT = '.dll' if IS_WINDOWS else '.so'
+_CORE_GLOB = f'*{CORE_EXT}'
+
+# Fix SSL certificate path for AppImage environment. Guarded on existence: the
+# path is Linux-only, and pointing requests at a missing bundle on Windows makes
+# every HTTPS call fail to verify.
 import ssl
-os.environ['REQUESTS_CA_BUNDLE'] = '/etc/ssl/certs/ca-certificates.crt'
-os.environ['SSL_CERT_FILE'] = '/etc/ssl/certs/ca-certificates.crt'
+_CA_BUNDLE = '/etc/ssl/certs/ca-certificates.crt'
+if os.path.exists(_CA_BUNDLE):
+    os.environ['REQUESTS_CA_BUNDLE'] = _CA_BUNDLE
+    os.environ['SSL_CERT_FILE'] = _CA_BUNDLE
 
 # GLib is optional - used for GUI thread scheduling when GTK is available.
 # In headless/Decky mode, callbacks are called directly instead.
@@ -4210,6 +4220,8 @@ class RetroArchInterface:
         # Cache for the per-system core map parsed from RetroDECK/ES-DE's
         # es_systems.xml (lazy; built on first core lookup).
         self._retrodeck_core_map_cache = None
+        # Cache for the libretro buildbot's downloadable-core listing (lazy).
+        self._buildbot_index_cache = None
 
         # Check for custom path override first
         custom_path = self.settings.get('RetroArch', 'custom_path', '').strip()
@@ -4868,6 +4880,32 @@ class RetroArchInterface:
         
         retroarch_candidates = []
 
+        # Windows has none of the Linux packaging below (no flatpak/snap/
+        # AppImage), so it's its own short search: the standard installer
+        # locations, Steam, then PATH for portable/scoop setups.
+        if IS_WINDOWS:
+            win_paths = [
+                Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'RetroArch' / 'retroarch.exe',
+                Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'RetroArch' / 'retroarch.exe',
+                Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'RetroArch' / 'retroarch.exe',
+                Path(r'C:\RetroArch-Win64\retroarch.exe'),
+                Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'))
+                    / 'Steam' / 'steamapps' / 'common' / 'RetroArch' / 'retroarch.exe',
+            ]
+            for i, p in enumerate(win_paths):
+                if p.is_file():
+                    retroarch_candidates.append({'type': 'windows', 'command': str(p),
+                                                 'priority': 1 + i})
+            on_path = shutil.which('retroarch')
+            if on_path and not any(c['command'] == on_path for c in retroarch_candidates):
+                retroarch_candidates.append({'type': 'path', 'command': on_path,
+                                             'priority': 6})
+            if retroarch_candidates:
+                best = min(retroarch_candidates, key=lambda x: x['priority'])
+                print(f"🎮 Selected RetroArch: {best['type']} - {best['command']}")
+                return best['command']
+            return None
+
         # Method 1: Flatpak. Detect by filesystem presence (a per-app dir under
         # ~/.var/app or the system flatpak tree) rather than parsing
         # `flatpak list` — the latter's subprocess is unreliable in sandboxed /
@@ -4990,8 +5028,8 @@ class RetroArchInterface:
             return {}
         
         cores = {}
-        for core_file in self.cores_dir.glob('*.so'):
-            # Remove _libretro.so suffix to get core name
+        for core_file in self.cores_dir.glob(_CORE_GLOB):
+            # Remove the _libretro.so/.dll suffix to get core name
             core_name = core_file.stem.replace('_libretro', '')
             cores[core_name] = str(core_file)
         
@@ -5214,7 +5252,47 @@ class RetroArchInterface:
             'override': override,
             'retrodeck_default': rd_default,
             'retrodeck_choices': [c for _, c in rd_choices],
+            # Cores this platform wants that aren't installed but the buildbot
+            # can supply, best guess first — what the "Download" action offers
+            # when resolved_core is None.
+            'download_candidates': self.downloadable_cores_for_platform(
+                platform_name, system_slug),
         }
+
+    # platform_core_map names a few cores the way libretro's docs do, while the
+    # buildbot ships them under their upstream (Mednafen) filename. Map ours to
+    # its, so those platforms get a download offer instead of silently none.
+    _BUILDBOT_ALIASES = {
+        'beetle_psx': 'mednafen_psx',
+        'beetle_psx_hw': 'mednafen_psx_hw',
+        'beetle_saturn': 'mednafen_saturn',
+        'beetle_pce': 'mednafen_pce',
+        'beetle_pce_fast': 'mednafen_pce_fast',
+        'beetle_lynx': 'mednafen_lynx',
+    }
+
+    def downloadable_cores_for_platform(self, platform_name, system_slug=None):
+        """Core names this platform could use that aren't installed yet and the
+        buildbot ships for this OS/arch, in our preference order.
+
+        Names are the buildbot's (post-alias), so a returned name can be passed
+        straight to download_core() AND pinned as an override afterwards. Cores
+        the buildbot doesn't carry at all (redream isn't libretro; fs-uae has no
+        nightly) are filtered out rather than offered as a download that 404s.
+        """
+        if not self.core_download_support()['available']:
+            return []
+        installed = self.get_available_cores()
+        index = self.list_downloadable_cores()
+        if not index:
+            return []
+        wanted = []
+        for key in (system_slug, platform_name):
+            for c in (self.platform_core_map.get(key) or []):
+                c = self._BUILDBOT_ALIASES.get(c, c)
+                if c not in wanted:
+                    wanted.append(c)
+        return [c for c in wanted if c not in installed and c in index]
 
     def suggest_core_for_platform(self, platform_name, system_slug=None):
         """Suggest best core for a platform"""
@@ -5316,6 +5394,13 @@ class RetroArchInterface:
             core_name, _ = self.suggest_core_for_platform(
                 platform_name, system_slug=self._system_slug_from_path(rom_path))
             if not core_name:
+                # Name what's missing rather than just "none found": the caller
+                # surfaces this, and the core downloader can install it.
+                candidates = self.downloadable_cores_for_platform(
+                    platform_name, self._system_slug_from_path(rom_path))
+                if candidates:
+                    return None, (f"No core installed for {platform_name} — "
+                                  f"{candidates[0]} can be downloaded")
                 return None, f"No suitable core found for platform: {platform_name}"
 
         # Get core path
@@ -5621,6 +5706,19 @@ class RetroArchInterface:
                 print(f"🔧 Using custom config directory: {custom_config_dir}")
                 return custom_config_dir
 
+        # Windows keeps retroarch.cfg beside the exe (portable, the default for
+        # the .7z build) or under %APPDATA% (installer build).
+        if IS_WINDOWS:
+            win_dirs = []
+            exe = self.retroarch_executable
+            if exe and Path(exe).is_file():
+                win_dirs.append(Path(exe).parent)
+            win_dirs.append(Path(os.environ.get('APPDATA', Path.home())) / 'RetroArch')
+            for d in win_dirs:
+                if (d / 'retroarch.cfg').is_file():
+                    return d
+            return None
+
         # Standard detection logic
         possible_dirs = [
             # RetroDECK (correct path)
@@ -5790,6 +5888,20 @@ class RetroArchInterface:
         installed plain RetroArch flatpak (which may carry only a handful of
         cores) — otherwise we'd launch RetroDECK but read the wrong, smaller core
         set and report most cores "missing"."""
+        # Windows: cores live next to the exe in a portable install, or under
+        # %APPDATA% when RetroArch was installed per-user.
+        if IS_WINDOWS:
+            win_dirs = []
+            exe = self.retroarch_executable
+            if exe and Path(exe).is_file():
+                win_dirs.append(Path(exe).parent / 'cores')
+            win_dirs.append(Path(os.environ.get('APPDATA', Path.home())) / 'RetroArch' / 'cores')
+            for d in win_dirs:
+                if d.exists() and any(d.glob(_CORE_GLOB)):
+                    print(f"🔧 Using cores directory: {d}")
+                    return d
+            return None
+
         # RetroDECK: cores ship read-only inside the flatpak (rd_extras), not in
         # the user config dir. The in-sandbox libretro_directory is
         # /app/retrodeck/components/retroarch/rd_extras/cores; from the host that
@@ -5842,11 +5954,293 @@ class RetroArchInterface:
             possible_dirs = other_dirs + retrodeck_dirs
 
         for cores_dir in possible_dirs:
-            if cores_dir.exists() and any(cores_dir.glob('*.so')):
+            if cores_dir.exists() and any(cores_dir.glob(_CORE_GLOB)):
                 print(f"🔧 Using cores directory: {cores_dir}")
                 return cores_dir
 
         return None
+
+    # ─── libretro buildbot core downloader ───────────────────────────────────
+    # RetroArch's own "Online Updater → Core Downloader" pulls from the libretro
+    # buildbot; we do the same thing so a bare RetroArch install can gain the
+    # core a game needs without the user leaving Ludo. Deliberately NOT wired for
+    # RetroDECK: it bundles a full core set already, and its RetroArch is a
+    # specific build a nightly core can be ABI-mismatched against.
+
+    def _buildbot_base(self):
+        """(url, ext) for this OS/arch on the libretro buildbot, or (None, None)
+        if we don't know a matching build directory."""
+        import platform as _plat
+        machine = (_plat.machine() or '').lower()
+        if IS_WINDOWS:
+            arch = {'amd64': 'x86_64', 'x86_64': 'x86_64',
+                    'x86': 'x86', 'i386': 'x86', 'i686': 'x86'}.get(machine)
+            os_dir, ext = 'windows', '.dll'
+        else:
+            arch = {'x86_64': 'x86_64', 'amd64': 'x86_64',
+                    'aarch64': 'aarch64', 'arm64': 'aarch64',
+                    'i686': 'x86', 'i386': 'x86',
+                    'armv7l': 'armv7-neon-hf'}.get(machine)
+            os_dir, ext = 'linux', '.so'
+        if not arch:
+            return None, None
+        return f'https://buildbot.libretro.com/nightly/{os_dir}/{arch}/latest', ext
+
+    def list_downloadable_cores(self, force_refresh=False):
+        """{core_key: {'file', 'crc', 'date'}} of every core the buildbot ships
+        for this OS/arch. Parsed from the directory's `.index-extended` listing
+        ("<date> <crc32> <filename>"), cached on disk for a day — the nightly
+        only rebuilds once a day, and this must not become a fetch per UI paint.
+
+        The CRC is that of the EXTRACTED core, not of the zip, so it doubles as
+        the post-extract integrity check in download_core(). Empty dict when
+        offline or on an unsupported platform: callers treat "no downloadable
+        cores" as a normal state, never an error.
+        """
+        if self._buildbot_index_cache is not None and not force_refresh:
+            return self._buildbot_index_cache
+        base, ext = self._buildbot_base()
+        if not base:
+            self._buildbot_index_cache = {}
+            return {}
+
+        cache_file = cache_dir() / 'libretro_core_index.json'
+        if not force_refresh:
+            try:
+                blob = json.loads(cache_file.read_text(encoding='utf-8'))
+                if (blob.get('base') == base
+                        and time.time() - blob.get('fetched', 0) < 86400):
+                    self._buildbot_index_cache = blob['cores']
+                    return blob['cores']
+            except Exception:
+                pass
+
+        cores = {}
+        try:
+            resp = requests.get(f'{base}/.index-extended', timeout=20)
+            resp.raise_for_status()
+            suffix = f'_libretro{ext}.zip'
+            for line in resp.text.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) != 3 or not parts[2].endswith(suffix):
+                    continue
+                date, crc, fname = parts
+                # Key by the same name get_available_cores() uses, so "is this
+                # core installed?" is a plain dict lookup on both sides.
+                cores[fname[:-len(suffix)]] = {'file': fname, 'crc': crc.lower(),
+                                               'date': date}
+        except Exception as e:
+            print(f"⚠️ Could not fetch libretro core index: {e}")
+            return {}
+
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(
+                {'base': base, 'fetched': time.time(), 'cores': cores}),
+                encoding='utf-8')
+        except Exception:
+            pass
+        self._buildbot_index_cache = cores
+        return cores
+
+    def find_writable_cores_directory(self):
+        """Where a downloaded core should land — which is NOT always where
+        find_cores_directory() reads from, since that one happily returns
+        read-only system dirs (/usr/lib/libretro, a flatpak's /app tree).
+
+        Prefer RetroArch's own configured `libretro_directory` when it's
+        writable: writing anywhere else would give us a core we can launch
+        (we pass an absolute -L path) but that RetroArch's own menu can't see,
+        which reads as a bug. Otherwise fall back to the per-user config dir for
+        the detected install, creating it if needed.
+        """
+        def _usable(p):
+            if not p:
+                return None
+            p = Path(p)
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                return p if os.access(p, os.W_OK) else None
+            except Exception:
+                return None
+
+        configured = self.get_retroarch_config_setting('libretro_directory', '')
+        if configured and configured not in (':', 'default'):
+            # RetroArch writes ":\cores"-style paths relative to its own install.
+            configured = configured.replace(':\\', '').replace(':/', '')
+            if not Path(configured).is_absolute():
+                cfg_dir = self.find_retroarch_config_dir()
+                configured = str(cfg_dir / configured) if cfg_dir else ''
+            hit = _usable(configured)
+            if hit:
+                return hit
+
+        # Existing read location, if we may write to it (native Windows/Steam/
+        # AppImage installs usually qualify; /usr/lib/libretro won't).
+        if self.cores_dir and os.access(self.cores_dir, os.W_OK):
+            return Path(self.cores_dir)
+
+        exe = (self.retroarch_executable or '').lower()
+        if IS_WINDOWS:
+            fallback = Path(os.environ.get('APPDATA', Path.home())) / 'RetroArch' / 'cores'
+        elif 'retrodeck' in exe:
+            fallback = Path.home() / '.var/app/net.retrodeck.retrodeck/config/retroarch/cores'
+        elif 'org.libretro.retroarch' in exe or 'flatpak' in exe:
+            fallback = Path.home() / '.var/app/org.libretro.RetroArch/config/retroarch/cores'
+        elif 'snap' in exe:
+            fallback = Path.home() / 'snap/retroarch/current/.config/retroarch/cores'
+        else:
+            fallback = Path.home() / '.config/retroarch/cores'
+        return _usable(fallback)
+
+    def core_download_support(self):
+        """{'available': bool, 'reason': str} — whether downloading cores makes
+        sense for the CURRENTLY SELECTED RetroArch, and a user-facing reason
+        when it doesn't.
+
+        RetroDECK is the deliberate no-op: its cores dir (and the
+        config/retroarch/cores "override", which is really a symlink into the
+        same place) lives read-only inside the flatpak, and it bundles a full
+        core set anyway. Keyed on the selected executable rather than
+        is_retrodeck_installation(), which is true whenever RetroDECK is merely
+        present — someone with both installed but launching bare RetroArch
+        should still get downloads.
+        """
+        if 'retrodeck' in (self.retroarch_executable or '').lower():
+            n = len(self.get_available_cores())
+            return {'available': False,
+                    'reason': f'RetroDECK manages its own cores'
+                              + (f' — {n} already installed' if n else '')}
+        if not self._buildbot_base()[0]:
+            import platform as _plat
+            return {'available': False,
+                    'reason': f'No libretro builds for this platform ({_plat.machine()})'}
+        if not self.find_writable_cores_directory():
+            return {'available': False,
+                    'reason': 'No writable RetroArch cores directory found'}
+        return {'available': True, 'reason': ''}
+
+    def download_core(self, core_name, progress_callback=None):
+        support = self.core_download_support()
+        if not support['available']:
+            return {'success': False, 'core': core_name, 'message': support['reason']}
+
+        """Fetch one core from the libretro buildbot and install it.
+
+        Returns {'success': bool, 'core', 'path'|'message'}. progress_callback
+        receives (downloaded_bytes, total_bytes) — total is 0 when the server
+        sends no Content-Length.
+        """
+        base, ext = self._buildbot_base()
+        if not base:
+            import platform as _plat
+            return {'success': False, 'core': core_name,
+                    'message': f'No libretro builds for this platform ({_plat.machine()})'}
+
+        index = self.list_downloadable_cores()
+        entry = index.get(core_name)
+        if not entry:
+            return {'success': False, 'core': core_name,
+                    'message': f'Core not available on the libretro buildbot: {core_name}'}
+
+        dest_dir = self.find_writable_cores_directory()
+        if not dest_dir:
+            return {'success': False, 'core': core_name,
+                    'message': 'No writable RetroArch cores directory found'}
+
+        core_file = f'{core_name}_libretro{ext}'
+        final = dest_dir / core_file
+        tmp_zip = dest_dir / f'.{core_file}.part'
+        try:
+            with requests.get(f"{base}/{entry['file']}", stream=True, timeout=60) as r:
+                r.raise_for_status()
+                total = int(r.headers.get('Content-Length') or 0)
+                done = 0
+                with open(tmp_zip, 'wb') as fh:
+                    for chunk in r.iter_content(65536):
+                        fh.write(chunk)
+                        done += len(chunk)
+                        if progress_callback:
+                            try:
+                                progress_callback(done, total)
+                            except Exception:
+                                pass
+
+            import zipfile, zlib
+            with zipfile.ZipFile(tmp_zip) as z:
+                member = next((m for m in z.infolist()
+                               if m.filename.endswith(f'_libretro{ext}')), None)
+                if member is None:
+                    raise ValueError('archive contains no libretro core')
+                # The buildbot index CRC is the extracted core's, so this
+                # verifies the whole chain (download + unzip) in one check.
+                if f'{member.CRC:08x}' != entry['crc']:
+                    raise ValueError('checksum mismatch — download corrupted')
+                payload = z.read(member)
+
+            # Write beside the target and rename, so a half-written core is
+            # never visible to a launch happening concurrently.
+            tmp_core = dest_dir / f'.{core_file}.new'
+            tmp_core.write_bytes(payload)
+            if not IS_WINDOWS:
+                tmp_core.chmod(0o755)
+            os.replace(tmp_core, final)
+        except Exception as e:
+            print(f"❌ Core download failed ({core_name}): {e}")
+            return {'success': False, 'core': core_name, 'message': str(e)}
+        finally:
+            for leftover in (tmp_zip, dest_dir / f'.{core_file}.new'):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+
+        # A first-ever download can create the cores dir that didn't exist at
+        # init, so adopt it — otherwise get_available_cores() keeps returning {}.
+        if not self.cores_dir:
+            self.cores_dir = dest_dir
+        self._fetch_core_info(core_name)
+        print(f"✅ Installed core {core_name} → {final}")
+        return {'success': True, 'core': core_name, 'path': str(final)}
+
+    def _fetch_core_info(self, core_name):
+        """Best-effort: drop the core's .info file next to RetroArch's others.
+
+        Without it RetroArch's menus label the core by raw filename and can't
+        tell which content it handles. Never fatal — a core works without it.
+
+        The buildbot publishes .info files only as one ~250 KB bundle, so it's
+        fetched once and cached for a day rather than per core.
+        """
+        try:
+            info_dir = self.get_retroarch_config_setting('libretro_info_path', '')
+            if not info_dir:
+                cfg_dir = self.find_retroarch_config_dir()
+                if not cfg_dir:
+                    return
+                info_dir = cfg_dir / 'info'
+            info_dir = Path(info_dir)
+            if not info_dir.is_dir() or not os.access(info_dir, os.W_OK):
+                return
+
+            bundle = cache_dir() / 'libretro_info.zip'
+            if (not bundle.exists()
+                    or time.time() - bundle.stat().st_mtime > 86400):
+                r = requests.get('https://buildbot.libretro.com/assets/frontend/info.zip',
+                                 timeout=30)
+                r.raise_for_status()
+                bundle.parent.mkdir(parents=True, exist_ok=True)
+                bundle.write_bytes(r.content)
+
+            import zipfile
+            name = f'{core_name}_libretro.info'
+            with zipfile.ZipFile(bundle) as z:
+                member = next((m for m in z.namelist()
+                               if m.rsplit('/', 1)[-1] == name), None)
+                if member:
+                    (info_dir / name).write_bytes(z.read(member))
+        except Exception:
+            pass
 
     def send_command(self, command):
         """Send UDP command to RetroArch"""
