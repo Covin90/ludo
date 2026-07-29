@@ -63,6 +63,12 @@ window.__rommDesktop = {
   launchSpec() {
     try { return ipcRenderer.sendSync("romm:launch-spec"); } catch { return null; }
   },
+  // The OS file chooser, for the shim's openFilePicker. Resolves to the chosen
+  // absolute path, or null when the user cancelled. The shim falls back to its
+  // own in-app picker when this is missing (the GTK shell has no IPC).
+  pickFolder(opts) {
+    return ipcRenderer.invoke("romm:pick-folder", opts || {});
+  },
 };
 
 const OK = 1, CANCEL = 2, SECONDARY = 3, OPTIONS = 4;

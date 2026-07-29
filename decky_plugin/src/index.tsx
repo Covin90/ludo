@@ -3652,7 +3652,7 @@ function ConfigPage() {
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={async () => {
             try {
-              const res = await openFilePicker(FileSelectionType.FOLDER, romDir || '/home/deck', false, true);
+              const res = await openFilePicker(FileSelectionType.FOLDER, pickerStart(romDir), false, true);
               if (res?.realpath) setRomDir(res.realpath);
             } catch { }
           }}>
@@ -3670,7 +3670,7 @@ function ConfigPage() {
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={async () => {
             try {
-              const res = await openFilePicker(FileSelectionType.FOLDER, saveDir || '/home/deck', false, true);
+              const res = await openFilePicker(FileSelectionType.FOLDER, pickerStart(saveDir), false, true);
               if (res?.realpath) setSaveDir(res.realpath);
             } catch { }
           }}>
@@ -3688,7 +3688,7 @@ function ConfigPage() {
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={async () => {
             try {
-              const res = await openFilePicker(FileSelectionType.FOLDER, biosDir || '/home/deck', false, true);
+              const res = await openFilePicker(FileSelectionType.FOLDER, pickerStart(biosDir), false, true);
               if (res?.realpath) setBiosDir(res.realpath);
             } catch { }
           }}>
@@ -7437,6 +7437,54 @@ function V2SettingsRow({ icon, title, subtitle, onClick, right, danger, disabled
   );
 }
 
+// Where a folder picker should open. Prefer the folder already in use; with
+// nothing set the Deck has a known home, while on the desktop we pass '' and let
+// the shell answer with the real one — '/home/deck' does not exist there, which
+// is how the picker ended up opening on an empty listing.
+function pickerStart(current?: string | null): string {
+  if (current) return current;
+  return (window as any).__rommDesktop ? '' : '/home/deck';
+}
+
+// The same row, but flat: no card of its own, so several can live inside ONE
+// surface separated by hairlines (see FoldersSection). Highlight is drawn inset
+// instead of as a border, which keeps the card's outline unbroken.
+function V2CardRow({ icon, title, subtitle, onClick, right, danger, divider }:
+  { icon?: any; title: any; subtitle?: any; onClick?: () => void; right?: any; danger?: boolean; divider?: boolean }) {
+  const { active, highlightHandlers } = useRowHighlight();
+  const interactive = !!onClick;
+  const accent = danger ? V2.danger : V2.brand;
+  return (
+    <Focusable noFocusRing
+      onActivate={interactive ? onClick : undefined}
+      onClick={interactive ? onClick : undefined}
+      {...highlightHandlers}
+      style={{
+        display: 'flex', alignItems: 'center', gap: '14px', padding: '13px 14px',
+        borderRadius: V2.radiusMd,
+        borderTop: divider ? `1px solid ${V2.border}` : 'none',
+        background: active && interactive ? V2.surfaceHover : 'transparent',
+        boxShadow: active && interactive ? `inset 0 0 0 2px ${accent}` : 'none',
+        cursor: interactive ? 'pointer' : 'default',
+        transition: 'background 0.15s, box-shadow 0.15s',
+      }}>
+      {icon && (
+        <div style={{
+          flexShrink: 0, width: '32px', height: '32px', borderRadius: V2.radiusMd,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: danger ? 'rgba(255,80,80,0.12)' : V2.bgElevated,
+          color: danger ? V2.danger : V2.brandHover,
+        }}>{icon}</div>
+      )}
+      <div style={{ flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '2px' }}>
+        <div style={{ fontSize: '14px', fontWeight: 600, color: danger ? V2.danger : V2.fg }}>{title}</div>
+        {subtitle && <div style={{ fontSize: '12px', color: V2.fgMuted, lineHeight: 1.35 }}>{subtitle}</div>}
+      </div>
+      {right != null && <div style={{ flexShrink: 0 }}>{right}</div>}
+    </Focusable>
+  );
+}
+
 // Small pill switch in the V2 palette (the row owns activation).
 function V2Switch({ checked }: { checked: boolean }) {
   return (
@@ -8400,7 +8448,7 @@ function FoldersSection() {
   const pick = async (kind: string, current: string) => {
     try {
       const res = await openFilePicker(
-        FileSelectionType.FOLDER, current || '/home/deck', false, true);
+        FileSelectionType.FOLDER, pickerStart(current), false, true);
       if (res?.realpath) await write(kind, res.realpath);
     } catch { /* the user dismissed the picker */ }
   };
@@ -8415,12 +8463,12 @@ function FoldersSection() {
     finally { setBusy(null); }
   };
 
-  const row = (kind: string, label: string, icon: any, hint: string) => {
+  const row = (kind: string, label: string, icon: any, hint: string, divider?: boolean) => {
     const configured = cfg[kind] || '';
     const inUse = configured || detected[kind] || '';
     const bad = staleFor(kind);
     return (
-      <V2SettingsRow key={kind} icon={icon} danger={!!bad} title={label}
+      <V2CardRow key={kind} icon={icon} danger={!!bad} title={label} divider={divider}
         subtitle={busy === kind ? 'Saving…' : bad ? (
           <span>
             {bad.reason} · <span style={{ textDecoration: 'line-through', opacity: 0.7 }}>{bad.value}</span>
@@ -8448,11 +8496,19 @@ function FoldersSection() {
 
   return (
     <V2SettingsSection title="Folders">
+      {/* One card, not one per folder: these three are a single answer to
+          "where does my library live", and reading them as a block is the
+          point. Rows are separated by hairlines instead of gaps. */}
+      <div style={{
+        display: 'flex', flexDirection: 'column',
+        borderRadius: V2.radiusCard, background: V2.surface,
+        border: `1px solid ${V2.border}`, overflow: 'hidden',
+      }}>
       {row('roms', 'ROM folder', <FaBoxOpen size={15} />, 'set by you')}
-      {row('saves', 'Save folder', <FaSave size={15} />, 'set by you')}
-      {row('bios', 'BIOS folder', <FaPuzzlePiece size={15} />, 'set by you')}
+      {row('saves', 'Save folder', <FaSave size={15} />, 'set by you', true)}
+      {row('bios', 'BIOS folder', <FaPuzzlePiece size={15} />, 'set by you', true)}
       {(exeOverride || exeStale) && (
-        <V2SettingsRow icon={<FaGamepad size={15} />} danger={!!exeStale}
+        <V2CardRow icon={<FaGamepad size={15} />} danger={!!exeStale} divider
           title="Emulator path"
           subtitle={busy === 'exe' ? 'Saving…' : exeStale
             ? `${exeStale.reason} · ${exeStale.value} · A to clear and auto-detect`
@@ -8462,7 +8518,7 @@ function FoldersSection() {
             {exeStale ? 'Fix' : 'Clear'}</span>} />
       )}
       {stale.length > 1 && (
-        <V2SettingsRow icon={<FaCheck size={15} />}
+        <V2CardRow icon={<FaCheck size={15} />} divider
           title={busy === 'all' ? 'Fixing all…' : 'Fix all'}
           subtitle={`Point all ${stale.length} of these back at your emulator.`}
           onClick={busy ? undefined : async () => {
@@ -8473,6 +8529,7 @@ function FoldersSection() {
             } finally { setBusy(null); }
           }} />
       )}
+      </div>
     </V2SettingsSection>
   );
 }
@@ -8915,8 +8972,6 @@ function SettingsPage() {
         <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Settings</div>
       </div>
 
-      <FoldersSection />
-
       {rdDetected && (
         <V2SettingsSection title="RetroDECK">
           <V2SettingsRow
@@ -8970,6 +9025,8 @@ function SettingsPage() {
           </div>
         </V2SettingsSection>
       )}
+
+      <FoldersSection />
 
       <V2SettingsSection title="Updates">
         <div style={{
@@ -9582,7 +9639,7 @@ function SetupWizard() {
     return clean.length > 4 ? `${clean.slice(0, 4)}-${clean.slice(4)}` : clean;
   };
   const browse = (cur: string, set: (v: string) => void) => async () => {
-    try { const res = await openFilePicker(FileSelectionType.FOLDER, cur || '/home/deck', false, true); if (res?.realpath) set(res.realpath); }
+    try { const res = await openFilePicker(FileSelectionType.FOLDER, pickerStart(cur), false, true); if (res?.realpath) set(res.realpath); }
     catch { /* ignore */ }
   };
 

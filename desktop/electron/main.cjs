@@ -12,7 +12,7 @@
 //   • No __NV_DISABLE_EXPLICIT_SYNC: that's a WebKitGTK/NVIDIA-Wayland bug and
 //     doesn't apply to Electron's Chromium renderer.
 
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const { spawn } = require("child_process");
 const net = require("net");
 const path = require("path");
@@ -284,6 +284,33 @@ if (!app.requestSingleInstanceLock()) {
 
     app.relaunch();
     app.quit();
+  });
+
+  // The OS file chooser. The renderer has an in-app picker as a fallback (the
+  // GTK shell has no Electron IPC and a browser can't enumerate the FS), but
+  // when we're running under Electron the real GTK dialog is better in every
+  // way: bookmarks, typed paths, hidden files, mounted drives.
+  ipcMain.handle("romm:pick-folder", async (_e, opts) => {
+    const o = opts || {};
+    try {
+      const res = await dialog.showOpenDialog(BrowserWindow.getFocusedWindow(), {
+        title: o.title || "Choose a folder",
+        defaultPath: o.startPath || app.getPath("home"),
+        buttonLabel: "Select",
+        // showHiddenFiles: RetroArch and RetroDECK keep saves and BIOS under
+        // dotted directories, so hiding them would hide the useful answers.
+        properties: [
+          o.includeFiles ? "openFile" : "openDirectory",
+          "createDirectory",
+          "showHiddenFiles",
+        ],
+      });
+      if (res.canceled || !res.filePaths.length) return null;
+      return res.filePaths[0];
+    } catch (err) {
+      console.error("[pick-folder]", err);
+      return null;
+    }
   });
 
   // Physically-attached gamepads, which the renderer can't discover itself

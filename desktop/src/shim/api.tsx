@@ -164,11 +164,25 @@ export function openFilePicker(
   includeFiles: boolean = false,
   _includeFolders: boolean = true,
 ): Promise<FilePickerRes> {
+  const wantFiles = includeFiles || select === FileSelectionType.FILE;
+
+  // Under Electron, hand off to the OS file chooser — the in-app picker below
+  // exists for the GTK shell, which has no IPC to a native dialog.
+  const native = (window as any).__rommDesktop?.pickFolder;
+  if (typeof native === "function") {
+    return native({ startPath, includeFiles: wantFiles }).then(
+      (picked: string | null) => {
+        if (!picked) throw new Error("cancelled");
+        return { path: picked, realpath: picked };
+      },
+    );
+  }
+
   return new Promise((resolve, reject) => {
     pushModal((handle) => (
       <FolderPicker
-        startPath={startPath || "/"}
-        includeFiles={includeFiles || select === FileSelectionType.FILE}
+        startPath={startPath || "~"}
+        includeFiles={wantFiles}
         closeModal={handle.Close}
         onPick={(res) => (res ? resolve(res) : reject(new Error("cancelled")))}
       />
