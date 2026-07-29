@@ -8524,7 +8524,7 @@ function FoldersSection() {
           </span>
         </span>
       ) : 'Install RetroArch or RetroDECK to play these games.'}
-      onClick={() => Navigation.Navigate('/romm-sync-cores')}
+      onClick={() => libNavigate('/romm-sync-cores')}
       right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />} />
   );
 
