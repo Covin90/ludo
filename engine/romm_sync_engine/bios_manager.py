@@ -73,8 +73,17 @@ class BiosManager:
     def find_system_directory(self):
         """Find RetroArch system/BIOS directory"""
         # Check for custom BIOS path override first
+        dead = getattr(self.retroarch, 'is_dead_install_path', lambda p: False)
         if self.settings:
             custom_bios_path = self.settings.get('BIOS', 'custom_path', '').strip()
+            # A custom path inside an emulator that's gone is worse than no
+            # setting at all: the branch below would recreate that directory and
+            # keep downloading BIOS files into a tree nothing reads. Ignore it and
+            # auto-detect instead; the UI offers to clear the setting.
+            if custom_bios_path and dead(Path(custom_bios_path)):
+                self.log(f"⚠️ Ignoring BIOS path from an uninstalled emulator: "
+                         f"{custom_bios_path}")
+                custom_bios_path = ''
             if custom_bios_path:  # Only use if not empty
                 custom_dir = Path(custom_bios_path)
                 if custom_dir.exists():
@@ -122,14 +131,23 @@ class BiosManager:
                 possible_dirs.insert(0, custom_dir / 'system')
                 possible_dirs.insert(0, custom_dir / 'bios')  # RetroDECK style
         
-        for system_dir in possible_dirs:
+        # Skip BIOS dirs belonging to an uninstalled emulator — ~/retrodeck/bios
+        # and ~/.var/app/<id>/... both outlive the app they came with.
+        for system_dir in (d for d in possible_dirs if not dead(d)):
             if system_dir.exists():
                 self.log(f"📁 Found system/BIOS directory: {system_dir}")
                 return system_dir
         
-        # Create RetroDECK bios directory if RetroDECK is detected
+        # Create RetroDECK's bios directory, but only when RetroDECK is really
+        # there. The test used to be `if Path.home() / 'retrodeck' / 'roms'`,
+        # which is a Path object and therefore always truthy — so every install
+        # with no BIOS dir grew a phantom ~/retrodeck/bios, and that stray
+        # directory then fed the ~/retrodeck-based RetroDECK heuristics elsewhere.
         retrodeck_bios = Path.home() / 'retrodeck' / 'bios'
-        if Path.home() / 'retrodeck' / 'roms' and not retrodeck_bios.exists():
+        is_retrodeck = (Path.home() / 'retrodeck' / 'roms').exists()
+        if hasattr(self.retroarch, 'is_retrodeck_installation'):
+            is_retrodeck = self.retroarch.is_retrodeck_installation()
+        if is_retrodeck and not retrodeck_bios.exists():
             try:
                 retrodeck_bios.mkdir(parents=True, exist_ok=True)
                 self.log(f"📁 Created RetroDECK BIOS directory: {retrodeck_bios}")

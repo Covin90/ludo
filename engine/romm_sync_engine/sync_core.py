@@ -696,31 +696,71 @@ class GameDataCache:
         except Exception as e:
             print(f"❌ Failed to clear cache: {e}")
 
+def flatpak_app_installed(app_id, env=None):
+    """True when ``app_id`` is installed as a flatpak (user or system).
+
+    Detection is filesystem-first rather than ``flatpak list``-first: that
+    subprocess is unreliable in sandboxed / containerized environments (the
+    Decky plugin host, or a distrobox where ``flatpak`` is proxied via
+    distrobox-host-exec), so parsing it would silently find nothing and report
+    "not installed" for an app that is right there.
+
+    The only *definitive* markers are the deployment dirs under a flatpak
+    installation root. ``~/.var/app/<id>`` is NOT one of them — that's the app's
+    DATA dir, and ``flatpak uninstall`` leaves it behind unless ``--delete-data``
+    was passed. Treating it as proof of installation is what let an uninstalled
+    RetroDECK keep winning launch, shortcut and path decisions. It's still
+    useful weak evidence (in a container it can be the only visible trace of a
+    host-wide install, since $HOME is shared but /var/lib is not), so when it's
+    the only hit we corroborate with ``flatpak info``, which is cheap and answers
+    exactly this question.
+
+    ``env`` is the environment for that subprocess; callers with a host env
+    (RetroArchInterface._host_subprocess_env) should pass it, since a bundled
+    loader's LD_LIBRARY_PATH makes host ``flatpak`` fail to start.
+    """
+    deployed = [
+        Path('/var/lib/flatpak/app') / app_id,
+        Path.home() / '.local/share/flatpak/app' / app_id,
+        # Inside a container (distrobox/toolbox, the Decky AppImage host) the
+        # host's system installation is only reachable through /run/host —
+        # /var/lib/flatpak there is the container's own and usually empty.
+        Path('/run/host/var/lib/flatpak/app') / app_id,
+    ]
+    if any(p.exists() for p in deployed):
+        return True
+
+    if not (Path.home() / '.var' / 'app' / app_id).exists():
+        return False
+
+    try:
+        import subprocess
+        result = subprocess.run(['flatpak', 'info', app_id],
+                                capture_output=True, text=True, timeout=10,
+                                env=env)
+        if result.returncode != 0:
+            print(f"🔍 {app_id}: leftover data dir but not installed")
+            return False
+        return True
+    except Exception:
+        # No usable `flatpak` to ask. Stay conservative and trust the data dir,
+        # matching the long-standing behaviour.
+        return True
+
+
 def detect_retrodeck():
     """Detect if RetroDECK is installed.
 
-    Uses lightweight directory checks first (no subprocess).  Falls back to
-    ``flatpak list`` only when the directories are absent.
-
     Returns a dict with ``rom_directory`` and ``save_directory`` set to the
     RetroDECK defaults, or ``None`` when RetroDECK is not detected.
+
+    A bare ``~/retrodeck`` directory is deliberately NOT evidence: it can be any
+    user-created ROM folder, it outlives an uninstall, and older builds of Ludo
+    created ``~/retrodeck/bios`` themselves. Since the caller writes these paths
+    into settings, a false positive silently points downloads and save-watching
+    at a tree nothing reads.
     """
-    retrodeck_home = Path.home() / 'retrodeck'
-    retrodeck_flatpak_config = Path.home() / '.var' / 'app' / 'net.retrodeck.retrodeck'
-
-    found = retrodeck_home.exists() or retrodeck_flatpak_config.exists()
-
-    if not found:
-        try:
-            import subprocess
-            result = subprocess.run(
-                ['flatpak', 'list'], capture_output=True, text=True, timeout=5
-            )
-            found = 'net.retrodeck.retrodeck' in result.stdout
-        except Exception:
-            pass
-
-    if found:
+    if flatpak_app_installed('net.retrodeck.retrodeck'):
         return {
             'rom_directory': str(Path.home() / 'retrodeck' / 'roms'),
             'save_directory': str(Path.home() / 'retrodeck' / 'saves'),
@@ -4210,11 +4250,12 @@ class RetroArchInterface:
     def __init__(self, settings=None):
         self.settings = settings
         self.settings = SettingsManager()
-        self.save_dirs = self.find_retroarch_dirs()
 
-        self.bios_manager = None
-        self._init_bios_manager()
-
+        # Discovery caches come first: everything below consults them, and both
+        # the BIOS manager and (on Windows) config-dir lookup resolve eagerly,
+        # so a cache or self.retroarch_executable that isn't set yet is an
+        # AttributeError rather than a miss.
+        self._flatpak_installed_cache = {}
         # Cache for RetroDECK detection
         self._is_retrodeck_cache = None
         # Cache for the per-system core map parsed from RetroDECK/ES-DE's
@@ -4222,33 +4263,12 @@ class RetroArchInterface:
         self._retrodeck_core_map_cache = None
         # Cache for the libretro buildbot's downloadable-core listing (lazy).
         self._buildbot_index_cache = None
+        self.retroarch_executable = None
+        self.cores_dir = None
+        self.save_dirs = {}
+        self.bios_manager = None
 
-        # Check for custom path override first
-        custom_path = self.settings.get('RetroArch', 'custom_path', '').strip()
-
-        if custom_path and Path(custom_path).exists():
-            self.retroarch_executable = custom_path
-            print(f"🎮 Using custom RetroArch path: {custom_path}")
-            
-            # ALSO CHECK FOR CORES RELATIVE TO CUSTOM PATH
-            custom_config_dir = Path(custom_path).parent
-            if (custom_config_dir / 'config/retroarch').exists():
-                custom_config_dir = custom_config_dir / 'config/retroarch'
-            custom_cores_dir = custom_config_dir / 'cores'
-            if custom_cores_dir.exists():
-                self.cores_dir = custom_cores_dir
-                print(f"🔧 Using custom cores directory: {custom_cores_dir}")
-            else:
-                self.cores_dir = self.find_cores_directory()
-        else:
-            self.retroarch_executable = self.find_retroarch_executable()
-            self.cores_dir = self.find_cores_directory()
-
-        self.thumbnails_dir = self.find_thumbnails_directory()
-
-        self.host = '127.0.0.1'
-        self.port = 55355
-        print(f"🔧 RetroArch network settings: {self.host}:{self.port}")
+        self._resolve_installation()
 
         # Platform to core mapping
         self.platform_core_map = {
@@ -4872,6 +4892,172 @@ class RetroArchInterface:
         except Exception as e:
             return False, f"RetroDECK launch error: {e}"
 
+    def _resolve_installation(self):
+        """Discover the emulator and everything derived from it.
+
+        Order is load-bearing: the executable must be known before config, save,
+        cores and BIOS discovery, which all consult it (Windows config lookup
+        reads it directly; the rest prefer the selected install's tree).
+        """
+        # Check for custom path override first
+        custom_path = self.settings.get('RetroArch', 'custom_path', '').strip()
+
+        if custom_path and Path(custom_path).exists():
+            self.retroarch_executable = custom_path
+            print(f"🎮 Using custom RetroArch path: {custom_path}")
+
+            # ALSO CHECK FOR CORES RELATIVE TO CUSTOM PATH
+            custom_config_dir = Path(custom_path).parent
+            if (custom_config_dir / 'config/retroarch').exists():
+                custom_config_dir = custom_config_dir / 'config/retroarch'
+            custom_cores_dir = custom_config_dir / 'cores'
+            if custom_cores_dir.exists():
+                self.cores_dir = custom_cores_dir
+                print(f"🔧 Using custom cores directory: {custom_cores_dir}")
+            else:
+                self.cores_dir = self.find_cores_directory()
+        else:
+            self.retroarch_executable = self.find_retroarch_executable()
+            self.cores_dir = self.find_cores_directory()
+
+        self.thumbnails_dir = self.find_thumbnails_directory()
+        self.save_dirs = self.find_retroarch_dirs()
+        if self.bios_manager:
+            self.bios_manager.refresh_system_directory()
+        else:
+            self._init_bios_manager()
+
+    def refresh_installation(self):
+        """Re-run discovery from scratch, dropping every cached answer.
+
+        Detection used to happen once per process, so an emulator installed or
+        removed while Ludo was running stayed invisible until a restart — and
+        every launch in between failed against a path that was no longer there.
+        Call this whenever that assumption may have broken: an emulator settings
+        page opening, a failed launch, or an install we performed ourselves.
+        """
+        self._flatpak_installed_cache.clear()
+        self._is_retrodeck_cache = None
+        self._retrodeck_core_map_cache = None
+        self._resolve_installation()
+        print(f"🔄 Emulator re-detected: {self.retroarch_executable or 'none'}")
+        return self.emulator_status()
+
+    def emulator_status(self):
+        """One place that answers "what emulator do we have?" for the UI.
+
+        Everything the frontend needs to render the emulator state, so it never
+        has to infer it from an error string on a failed action.
+        """
+        cores = self.get_available_cores()
+        kind = 'none'
+        exe = self.retroarch_executable or ''
+        if exe:
+            low = exe.lower()
+            kind = ('retrodeck' if 'retrodeck' in low
+                    else 'flatpak' if 'flatpak' in low
+                    else 'snap' if 'snap' in low
+                    else 'native')
+        return {
+            'installed': bool(exe),
+            'kind': kind,
+            'executable': exe,
+            'config_dir': str(self.find_retroarch_config_dir() or ''),
+            'cores_dir': str(self.cores_dir or ''),
+            'core_count': len(cores),
+            'save_dirs': {k: str(v) for k, v in (self.save_dirs or {}).items()},
+            'bios_dir': str((self.bios_manager and self.bios_manager.system_dir) or ''),
+            'stale_paths': self.stale_emulator_paths(),
+            'core_download': self.core_download_support(),
+        }
+
+    # Settings that can outlive the emulator they were configured for. Each is
+    # (section, key, label, kind) — kind drives what a repair suggests.
+    _PATH_SETTINGS = (
+        ('Download', 'rom_directory', 'ROM folder', 'roms'),
+        ('Download', 'save_directory', 'Save folder', 'saves'),
+        ('BIOS', 'custom_path', 'BIOS folder', 'bios'),
+        ('RetroArch', 'custom_path', 'Emulator path', 'exe'),
+    )
+
+    def stale_emulator_paths(self):
+        """Configured paths that point into a vanished install.
+
+        These are the silent failure: a save_directory left over from an
+        uninstalled RetroDECK keeps sync running against a tree nothing reads, so
+        it reports success forever while no save reaches the emulator. Reported
+        rather than auto-corrected — someone may legitimately keep ROMs in
+        ~/retrodeck — with a suggested replacement the UI can apply on request
+        ('' means "clear it and go back to auto-detection").
+        """
+        stale = []
+        for section, key, label, kind in self._PATH_SETTINGS:
+            value = (self.settings.get(section, key, '') or '').strip()
+            if not value:
+                continue
+            path = Path(value)
+            if self.is_dead_install_path(path):
+                reason = 'the emulator it belonged to is no longer installed'
+            elif kind == 'exe' and not path.exists():
+                # Only the executable override has to exist right now. The
+                # folders are created on demand (by the downloader, or by the
+                # BIOS manager), so "not there yet" is normal, not stale — and
+                # flagging it would make a just-applied repair look broken.
+                reason = 'that file is gone'
+            else:
+                continue
+            stale.append({
+                'section': section, 'key': key, 'label': label, 'kind': kind,
+                'value': value, 'reason': reason,
+                'suggested': self._suggested_path(kind),
+            })
+        return stale
+
+    def _suggested_path(self, kind):
+        """Replacement for a stale path setting, or '' to clear it.
+
+        Clearing is the right answer for the two that are auto-detected anyway
+        (the BIOS dir and the emulator override); the download folders need a
+        real destination, so they follow the live emulator when it has an opinion
+        and otherwise fall back to Ludo's own default.
+        """
+        if kind in ('bios', 'exe'):
+            return ''
+        if kind == 'saves' and self.save_dirs.get('saves'):
+            return str(self.save_dirs['saves'])
+        retrodeck = detect_retrodeck()
+        if retrodeck:
+            return retrodeck['rom_directory' if kind == 'roms' else 'save_directory']
+        return str(Path.home() / 'RomMSync' / ('roms' if kind == 'roms' else 'saves'))
+
+    def repair_emulator_paths(self, keys=None):
+        """Apply the suggested fix for stale paths, then re-detect.
+
+        `keys` limits the repair to specific setting keys; None repairs all of
+        them. Returns (repaired, status).
+        """
+        repaired = []
+        for item in self.stale_emulator_paths():
+            if keys and item['key'] not in keys:
+                continue
+            self.settings.set(item['section'], item['key'], item['suggested'])
+            repaired.append({**item, 'applied': item['suggested']})
+            print(f"🔧 Repaired {item['label']}: {item['value']} → "
+                  f"{item['suggested'] or 'auto-detect'}")
+        if repaired:
+            self.settings.save_settings()
+        return repaired, self.refresh_installation()
+
+    def flatpak_app_installed(self, app_id):
+        """Cached, host-env wrapper around the module-level check of the same
+        name (see it for the detection rules)."""
+        cached = self._flatpak_installed_cache.get(app_id)
+        if cached is None:
+            cached = flatpak_app_installed(
+                app_id, env=self._host_subprocess_env())
+            self._flatpak_installed_cache[app_id] = cached
+        return cached
+
     def find_retroarch_executable(self):
         """Find RetroArch executable with comprehensive installation support"""
         import shutil
@@ -4906,30 +5092,18 @@ class RetroArchInterface:
                 return best['command']
             return None
 
-        # Method 1: Flatpak. Detect by filesystem presence (a per-app dir under
-        # ~/.var/app or the system flatpak tree) rather than parsing
-        # `flatpak list` — the latter's subprocess is unreliable in sandboxed /
-        # containerized environments (e.g. the Decky plugin host, or a distrobox
-        # where `flatpak` is proxied via distrobox-host-exec), so it would
-        # silently find nothing and report "RetroArch not found" even when it's
-        # installed. We still use `flatpak run <id>` to launch.
-        def _flatpak_installed(app_id):
-            candidates = [
-                Path.home() / '.var' / 'app' / app_id,
-                Path('/var/lib/flatpak/app') / app_id,
-                Path.home() / '.local/share/flatpak/app' / app_id,
-            ]
-            return any(p.exists() for p in candidates)
-
+        # Method 1: Flatpak — see flatpak_app_installed() for why detection is
+        # filesystem-first. We still use `flatpak run <id>` to launch.
+        #
         # Prefer RetroDECK only when it's actually installed as a flatpak; a bare
         # ~/retrodeck folder is not enough (it can linger after uninstall).
-        if _flatpak_installed('net.retrodeck.retrodeck'):
+        if self.flatpak_app_installed('net.retrodeck.retrodeck'):
             retroarch_candidates.append({
                 'type': 'retrodeck',
                 'command': 'flatpak run net.retrodeck.retrodeck',
                 'priority': 2
             })
-        if _flatpak_installed('org.libretro.RetroArch'):
+        if self.flatpak_app_installed('org.libretro.RetroArch'):
             retroarch_candidates.append({
                 'type': 'flatpak',
                 'command': 'flatpak run org.libretro.RetroArch',
@@ -5671,7 +5845,7 @@ class RetroArchInterface:
             Path('/usr/local/etc/retroarch'),
         ]
 
-        for base_dir in possible_dirs:
+        for base_dir in self._prefer_selected_install(possible_dirs):
             if base_dir.exists():
                 # RetroDECK uses different structure
                 if 'retrodeck' in str(base_dir) and base_dir.name == 'retrodeck':
@@ -5693,6 +5867,53 @@ class RetroArchInterface:
                     break
 
         return save_dirs
+
+    # App ids whose on-disk trees we probe for config/saves/cores. Their data
+    # dirs (~/.var/app/<id>, and ~/retrodeck for RetroDECK) outlive the app, so
+    # every probe has to ask whether the app is still installed.
+    _EMULATOR_APP_IDS = ('net.retrodeck.retrodeck', 'org.libretro.RetroArch')
+
+    def is_dead_install_path(self, path):
+        """True when `path` belongs to an emulator that is no longer installed.
+
+        Without this, an uninstalled emulator keeps winning discovery from its
+        leftover data dir: RetroDECK's ~/.var/app/.../config/retroarch still holds
+        a retroarch.cfg pointing at ~/retrodeck/saves, so Ludo would watch that
+        tree while the emulator the user actually plays on writes somewhere else
+        — sync looks healthy and moves nothing.
+        """
+        s = str(path)
+        for app_id in self._EMULATOR_APP_IDS:
+            if app_id in s and not self.flatpak_app_installed(app_id):
+                return True
+        # RetroDECK's user-visible tree carries no app id in its path.
+        retrodeck_home = Path.home() / 'retrodeck'
+        if (s == str(retrodeck_home) or s.startswith(str(retrodeck_home) + os.sep)) \
+                and not self.flatpak_app_installed('net.retrodeck.retrodeck'):
+            return True
+        return False
+
+    def _prefer_selected_install(self, dirs):
+        """Drop dead installs, then float the dirs belonging to the SELECTED
+        executable to the front.
+
+        Ordering matters as much as liveness: with both emulators installed but
+        bare RetroArch selected, a hardcoded RetroDECK-first list handed back
+        RetroDECK's retroarch.cfg, so saves were watched in RetroDECK's tree
+        while games ran on RetroArch. Mirrors find_cores_directory's approach.
+        """
+        live = [d for d in dirs if not self.is_dead_install_path(d)]
+        exe = (self.retroarch_executable or '').lower()
+        if 'retrodeck' in exe:
+            key = 'net.retrodeck.retrodeck'
+        elif 'org.libretro.retroarch' in exe:
+            key = 'org.libretro.retroarch'
+        else:
+            return live
+        mine = [d for d in live if key in str(d).lower()
+                or (key == 'net.retrodeck.retrodeck'
+                    and str(d).startswith(str(Path.home() / 'retrodeck')))]
+        return mine + [d for d in live if d not in mine]
 
     def find_retroarch_config_dir(self):
         """Find RetroArch config directory for the detected installation"""
@@ -5739,8 +5960,9 @@ class RetroArchInterface:
             Path.home() / '.retroarch-appimage',
         ]
 
-        # Check each directory and verify retroarch.cfg exists
-        for config_dir in possible_dirs:
+        # Check each directory and verify retroarch.cfg exists, skipping trees
+        # left behind by an uninstalled emulator and preferring the selected one.
+        for config_dir in self._prefer_selected_install(possible_dirs):
             if config_dir.exists():
                 # Check if retroarch.cfg actually exists in this directory
                 config_file = config_dir / 'retroarch.cfg'
@@ -5767,23 +5989,16 @@ class RetroArchInterface:
             self._is_retrodeck_cache = True
             return True
 
-        # Method 2: Check the RetroDECK flatpak data directory — this only exists when
-        # RetroDECK is actually installed as a flatpak, unlike ~/retrodeck which can be
-        # any user-created directory (e.g., a ROM storage folder).
-        if (Path.home() / '.var/app/net.retrodeck.retrodeck').exists():
+        # Method 2: Is the flatpak actually installed? Checked via
+        # flatpak_app_installed() rather than the bare existence of
+        # ~/.var/app/net.retrodeck.retrodeck: that data dir outlives
+        # `flatpak uninstall`, so it used to report RetroDECK on a machine that
+        # no longer has it — and then every launch/shortcut went to a missing
+        # app. ~/retrodeck is likewise no evidence; it can be any user-created
+        # ROM folder.
+        if self.flatpak_app_installed('net.retrodeck.retrodeck'):
             self._is_retrodeck_cache = True
             return True
-
-        # Method 4: Check Flatpak list
-        try:
-            import subprocess
-            result = subprocess.run(['flatpak', 'list'], capture_output=True, text=True, timeout=5)
-            if 'net.retrodeck.retrodeck' in result.stdout:
-                print("🔍 RetroDECK detected via Flatpak list")
-                self._is_retrodeck_cache = True
-                return True
-        except:
-            pass
 
         # Cache negative result
         self._is_retrodeck_cache = False
@@ -5953,7 +6168,10 @@ class RetroArchInterface:
         else:
             possible_dirs = other_dirs + retrodeck_dirs
 
-        for cores_dir in possible_dirs:
+        # Skip cores belonging to an uninstalled emulator: RetroArch's flatpak
+        # keeps user-downloaded cores in its DATA dir, which survives uninstall,
+        # so those .so files would otherwise still count as "installed cores".
+        for cores_dir in (d for d in possible_dirs if not self.is_dead_install_path(d)):
             if cores_dir.exists() and any(cores_dir.glob(_CORE_GLOB)):
                 print(f"🔧 Using cores directory: {cores_dir}")
                 return cores_dir
@@ -6106,6 +6324,13 @@ class RetroArchInterface:
         present — someone with both installed but launching bare RetroArch
         should still get downloads.
         """
+        # No emulator at all: a writable cores dir can still exist (RetroArch's
+        # flatpak leaves user-downloaded cores in its data dir on uninstall), so
+        # without this check the UI would offer to download cores for an emulator
+        # that isn't there.
+        if not self.retroarch_executable:
+            return {'available': False,
+                    'reason': 'No emulator installed'}
         if 'retrodeck' in (self.retroarch_executable or '').lower():
             n = len(self.get_available_cores())
             return {'available': False,
@@ -10844,21 +11069,26 @@ class SteamShortcutManager:
         if not self.retroarch:
             return None, None
 
-        # RetroDECK: detect via is_retrodeck_installation() which uses directory/flatpak
-        # checks as fallbacks when retroarch_executable is None or lacks 'retrodeck'.
+        # RetroDECK: keyed on the SELECTED executable, with
+        # is_retrodeck_installation() only as the fallback for when nothing was
+        # resolved. Asking is_retrodeck_installation() first meant that with both
+        # emulators installed, Steam shortcuts went to RetroDECK while in-app
+        # launches (build_launch_command) used the selected bare RetroArch — two
+        # different emulators, so saves and states landed in two different trees.
+        #
         # Use '"flatpak"' (quoted short name, no full path) to match the exact exe format
         # that Steam itself uses for flatpak shortcuts. Steam's overlay recalculates the
         # artwork appid from exe+name at display time, so the exe format here must match
         # what Steam expects — using the full path produces a different appid and the
         # overlay can't find the grid images.
-        if self.retroarch.is_retrodeck_installation():
+        exe = self.retroarch.retroarch_executable
+        if 'retrodeck' in (exe or '').lower() or (
+                not exe and self.retroarch.is_retrodeck_installation()):
             self.log(f"  RetroDECK detected, using: \"flatpak\" run net.retrodeck.retrodeck")
             return '"flatpak"', f'run net.retrodeck.retrodeck "{rom_path}"'
 
-        if not self.retroarch.retroarch_executable:
+        if not exe:
             return None, None
-
-        exe = self.retroarch.retroarch_executable
 
         # Find the right core
         core_name, core_path = self.retroarch.suggest_core_for_platform(platform_name)

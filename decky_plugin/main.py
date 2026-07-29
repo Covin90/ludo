@@ -2095,6 +2095,55 @@ class Plugin:
             logging.warning(f"_maybe_unzip_download error (keeping archive): {e}")
             return dest
 
+    async def get_emulator_status(self, refresh: bool = False):
+        """What emulator Ludo will use, and whether anything about it is broken.
+
+        The single source the UI reads for the emulator banner, so a missing or
+        just-uninstalled emulator is one clear state instead of an error string on
+        whichever action the user happened to try. `refresh` re-runs detection,
+        which is what makes an emulator installed or removed while Ludo was
+        running visible without a restart.
+        """
+        try:
+            ra = self._retroarch
+            if not ra:
+                return {'success': False, 'installed': False,
+                        'message': 'RetroArch interface unavailable'}
+            loop = asyncio.get_event_loop()
+            # Detection touches the filesystem and may shell out to `flatpak
+            # info`, so keep it off the event loop.
+            status = await loop.run_in_executor(
+                None, ra.refresh_installation if refresh else ra.emulator_status)
+            return {'success': True, **status}
+        except Exception as e:
+            logging.error(f"get_emulator_status error: {e}", exc_info=True)
+            return {'success': False, 'installed': False, 'message': str(e)}
+
+    async def repair_emulator_paths(self, keys: list = None):
+        """Point stale ROM/save/BIOS/emulator paths back at the live install (or
+        clear them so they auto-detect again), then re-detect."""
+        try:
+            ra = self._retroarch
+            if not ra:
+                return {'success': False, 'message': 'RetroArch interface unavailable'}
+            loop = asyncio.get_event_loop()
+            repaired, status = await loop.run_in_executor(
+                None, ra.repair_emulator_paths, keys)
+            if repaired:
+                logging.info(f"Repaired stale emulator paths: "
+                             f"{[r['key'] for r in repaired]}")
+                # Save/state watchers were started against the OLD directories,
+                # so the repair only takes effect once sync restarts — the same
+                # thing save_config does after changing these paths.
+                self._stop_sync()
+                time.sleep(0.5)
+                self._start_sync()
+                status = self._retroarch.emulator_status() if self._retroarch else status
+            return {'success': True, 'repaired': repaired, **status}
+        except Exception as e:
+            logging.error(f"repair_emulator_paths error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
     async def get_core_mappings(self):
         """For the core-mapping settings page: one row per platform in the
         user's library, showing how the launch core resolves and the options
