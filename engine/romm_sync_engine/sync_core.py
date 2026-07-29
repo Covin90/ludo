@@ -4968,6 +4968,15 @@ class RetroArchInterface:
             'save_dirs': {k: str(v) for k, v in (self.save_dirs or {}).items()},
             'bios_dir': str((self.bios_manager and self.bios_manager.system_dir) or ''),
             'stale_paths': self.stale_emulator_paths(),
+            # The RAW configured values, so the UI can tell "the user set this"
+            # from "we detected it". get_config() merges in fallbacks, which is
+            # right for the wizard but hides the difference here.
+            # Keyed by kind, not by key: 'custom_path' is both BIOS's and
+            # RetroArch's, so bare keys would collide.
+            'configured_paths': {
+                kind: self.settings.get(section, key, '')
+                for section, key, _label, kind in self._PATH_SETTINGS
+            },
             'core_download': self.core_download_support(),
             # Whether WE can install an emulator for them. Windows, a missing
             # flatpak, or running as root all mean the answer is "not from here",

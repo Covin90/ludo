@@ -1823,6 +1823,65 @@ class Plugin:
             logging.error(f"save_config error: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
+    async def set_library_paths(self, rom_directory: str = None,
+                                save_directory: str = None,
+                                bios_directory: str = None,
+                                emulator_path: str = None):
+        """Change one or more library folders, without touching anything else.
+
+        save_config() is the wizard's method: it rewrites credentials, clears the
+        onboarding flag and records a "Signed in" activity event. Editing a single
+        folder from Settings must do none of that, hence a setter of its own. Only
+        arguments that are not None are written, so '' is a meaningful value —
+        it clears an override and restores auto-detection.
+        """
+        try:
+            if not SYNC_CORE_AVAILABLE:
+                return {'success': False, 'message': 'sync_core not available'}
+            fields = (
+                ('Download', 'rom_directory', rom_directory),
+                ('Download', 'save_directory', save_directory),
+                ('BIOS', 'custom_path', bios_directory),
+                ('RetroArch', 'custom_path', emulator_path),
+            )
+            changed = []
+            for section, key, value in fields:
+                if value is None:
+                    continue
+                value = value.strip()
+                if self._settings.get(section, key, '') == value:
+                    continue
+                self._settings.set(section, key, value)
+                changed.append(f'{section}.{key}')
+            if not changed:
+                status = self._retroarch.emulator_status() if self._retroarch else {}
+                return {'success': True, 'changed': [], **status}
+
+            logging.info(f"Library paths changed: {changed}")   # set() persists
+            # Save/state watchers were bound to the old directories, and cores /
+            # BIOS discovery ran against the old emulator path — the same restart
+            # save_config and repair_emulator_paths do after touching these.
+            self._stop_sync()
+            time.sleep(0.5)
+            self._start_sync()
+            # _start_sync normally rebuilds _retroarch with a fresh
+            # SettingsManager, but it early-returns if the retry thread is still
+            # alive — and a RetroArchInterface caches its own settings instance,
+            # so the status we return would then still describe the OLD paths.
+            # Re-read explicitly rather than depending on that path.
+            ra = self._retroarch
+            status = {}
+            if ra:
+                try:
+                    ra.settings.load_settings()
+                except Exception:
+                    pass
+                status = ra.refresh_installation()
+            return {'success': True, 'changed': changed, **status}
+        except Exception as e:
+            logging.error(f"set_library_paths error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
     async def test_connection(self, url: str, username: str, password: str):
         """Test connection to RomM with the given credentials."""
         try:

@@ -43,6 +43,8 @@ const getEmulatorStatus = callable<[boolean?], any>("get_emulator_status");
 const repairEmulatorPaths = callable<[string[]?], any>("repair_emulator_paths");
 const installEmulator = callable<[], any>("install_emulator");
 const emulatorInstallState = callable<[], any>("emulator_install_state");
+// Folder-only setter — save_config is the wizard's, and rewrites credentials.
+const setLibraryPaths = callable<[string?, string?, string?, string?], any>("set_library_paths");
 const getDownloadableCores = callable<[boolean], any>("get_downloadable_cores");
 const getConfig = callable<[], any>("get_config");
 const logout = callable<[boolean], any>("logout");
@@ -1550,6 +1552,10 @@ type EmuStatus = {
   cores_dir: string | null;
   core_count: number;
   stale_paths: EmuStalePath[];
+  save_dirs: Record<string, string>;
+  bios_dir: string;
+  // Raw configured values by kind — '' means "not set, we detect it".
+  configured_paths: Record<string, string>;
   // Whether Ludo can install an emulator itself. False on Windows, without
   // flatpak, or as root — the reason is what we show instead of the button.
   install: { available: boolean; reason: string };
@@ -1578,6 +1584,9 @@ async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
           cores_dir: r.cores_dir || null,
           core_count: r.core_count || 0,
           stale_paths: r.stale_paths || [],
+          save_dirs: r.save_dirs || {},
+          bios_dir: r.bios_dir || '',
+          configured_paths: r.configured_paths || {},
           install: r.emulator_install || { available: false, reason: '' },
         });
       }
@@ -4336,7 +4345,7 @@ function CardRow({ icon, title, count, children }:
 // nothing installed (games download but can't launch), and a save folder left
 // pointing into an emulator that was uninstalled (sync writes where nothing
 // reads, while still reporting success). Every other stale path is a quiet
-// warning row on the Emulator page instead — see EmulatorHealthSection.
+// warning row in Settings ▸ Folders instead — see FoldersSection.
 function EmulatorBanner() {
   const status = useEmulatorStatus();
   const install = useEmulatorInstall();
@@ -4404,7 +4413,9 @@ function EmulatorBanner() {
                   icon={fixing
                     ? <FaSync size={14} style={{ animation: 'spin 1s linear infinite' }} />
                     : <FaCheck size={14} />} />
-                <GameActionButton variant="surface" onClick={() => libNavigate('/romm-sync-cores')}
+                {/* Review it instead: Settings ▸ Folders shows every path and
+                    what each would become. */}
+                <GameActionButton variant="surface" onClick={() => libNavigate('/romm-sync-settings')}
                   icon={<FaChevronRight size={15} />} />
               </>
             ) : (
@@ -8044,60 +8055,6 @@ function CorePickerModal({ row, availableCores, canDownload, onPick, onDownload,
 // Emulator Cores page: one row per library platform showing how its launch
 // core resolves (user override > RetroDECK/ES-DE > built-in guess). A on a row
 // opens the picker; the trailing badge shows the resolved core + its source.
-// Folders still pointing into an emulator that was uninstalled. Shown as
-// warning rows rather than fixed silently: keeping ROMs in ~/retrodeck after
-// removing RetroDECK is a legitimate choice, so we suggest and let the user
-// confirm. Each row spells out old → new; A applies just that one.
-function EmulatorHealthSection({ status, onStatus }:
-  { status: EmuStatus; onStatus: (s: EmuStatus) => void }) {
-  const [busy, setBusy] = useState<string | null>(null);
-  const stale = status.stale_paths || [];
-  if (!stale.length) return null;
-
-  const fix = async (keys: string[] | null, tag: string) => {
-    setBusy(tag);
-    try {
-      const r = await repairEmulatorPaths(keys ?? undefined);
-      if (r?.success) {
-        onStatus({ ...status, stale_paths: r.stale_paths || [] });
-        toaster.toast({ title: 'Folders', body: r.repaired?.length
-          ? `Updated ${r.repaired.length} ${r.repaired.length === 1 ? 'folder' : 'folders'}`
-          : 'Nothing to change' });
-      } else {
-        toaster.toast({ title: 'Folders', body: r?.message || 'Could not update' });
-      }
-    } catch { toaster.toast({ title: 'Folders', body: 'Could not update' }); }
-    finally { setBusy(null); }
-  };
-
-  return (
-    <V2SettingsSection title="Needs attention">
-      {stale.map((p) => {
-        const tag = `${p.section}.${p.key}`;
-        return (
-          <V2SettingsRow key={tag} danger
-            icon={<FaExclamationTriangle size={15} />}
-            title={p.label}
-            subtitle={busy === tag ? 'Updating…' : (
-              <span>
-                {p.reason} · <span style={{ textDecoration: 'line-through', opacity: 0.7 }}>{p.value}</span>
-                {' → '}<span style={{ color: V2.fg2 }}>{p.suggested || 'auto-detect'}</span>
-              </span>
-            )}
-            onClick={busy ? undefined : () => fix([tag], tag)}
-            right={<span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Fix</span>} />
-        );
-      })}
-      {stale.length > 1 && (
-        <V2SettingsRow icon={<FaCheck size={15} />}
-          title={busy === 'all' ? 'Fixing all…' : 'Fix all'}
-          subtitle={`Update all ${stale.length} folders to the suggested locations.`}
-          onClick={busy ? undefined : () => fix(null, 'all')} />
-      )}
-    </V2SettingsSection>
-  );
-}
-
 // The Emulator page with nothing to configure: no RetroArch, no RetroDECK, so
 // per-platform cores are meaningless until one exists. Offer the install
 // instead of an empty list.
@@ -8234,7 +8191,8 @@ function CoresPage() {
         <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Emulator Cores</div>
       </div>
 
-      {emu && <EmulatorHealthSection status={emu} onStatus={publishEmulatorStatus} />}
+      {/* Stale folders used to be warned about here; they now live in
+          Settings ▸ Folders, beside the folders themselves. */}
 
       {/* Nothing installed: the per-platform list would be a wall of "no core"
           rows that can't be resolved, so it collapses to the install prompt. */}
@@ -8389,6 +8347,133 @@ function UpdateActionBtn({ label, icon, onClick, disabled, primary, progress, bu
         {icon}<span>{label}</span>
       </div>
     </Focusable>
+  );
+}
+
+// Settings ▸ Folders — where ROMs, saves and BIOS files actually live, which
+// until now was only visible inside the setup wizard. Each row shows the path in
+// use and whether it was set by the user or detected; A opens the folder picker.
+// Stale-path warnings live here too, next to the folders they're about.
+function FoldersSection() {
+  const status = useEmulatorStatus();
+  const [busy, setBusy] = useState<string | null>(null);
+  if (!status) return null;
+
+  const cfg = status.configured_paths || {};
+  const stale = status.stale_paths || [];
+  const staleFor = (kind: string) => stale.find((p) => p.kind === kind);
+
+  // Detected fallbacks, shown when the user has set nothing. Only these two are
+  // discoverable — a ROM folder is ours to choose, so it has no detected value.
+  const detected: Record<string, string> = {
+    saves: status.save_dirs?.saves || '',
+    bios: status.bios_dir || '',
+  };
+
+  const write = async (kind: string, value: string) => {
+    setBusy(kind);
+    try {
+      const r = await setLibraryPaths(
+        kind === 'roms' ? value : undefined,
+        kind === 'saves' ? value : undefined,
+        kind === 'bios' ? value : undefined,
+        kind === 'exe' ? value : undefined);
+      if (r?.success) {
+        // The reply IS a fresh emulator_status, so the rows (and any stale
+        // warning that just cleared) update without a second round-trip.
+        publishEmulatorStatus({
+          ...status,
+          installed: !!r.installed, kind: r.kind || status.kind,
+          executable: r.executable || null, cores_dir: r.cores_dir || null,
+          core_count: r.core_count ?? status.core_count,
+          stale_paths: r.stale_paths || [], save_dirs: r.save_dirs || {},
+          bios_dir: r.bios_dir || '', configured_paths: r.configured_paths || {},
+        });
+        toaster.toast({ title: 'Folders', body: value ? 'Folder updated' : 'Back to auto-detect' });
+      } else {
+        toaster.toast({ title: 'Folders', body: r?.message || 'Could not save that folder' });
+      }
+    } catch { toaster.toast({ title: 'Folders', body: 'Could not save that folder' }); }
+    finally { setBusy(null); }
+  };
+
+  const pick = async (kind: string, current: string) => {
+    try {
+      const res = await openFilePicker(
+        FileSelectionType.FOLDER, current || '/home/deck', false, true);
+      if (res?.realpath) await write(kind, res.realpath);
+    } catch { /* the user dismissed the picker */ }
+  };
+
+  const fixStale = async (p: EmuStalePath) => {
+    setBusy(p.kind);
+    try {
+      const r = await repairEmulatorPaths([`${p.section}.${p.key}`]);
+      if (r?.success) await loadEmulatorStatus(true);
+      else toaster.toast({ title: 'Folders', body: r?.message || 'Could not update' });
+    } catch { toaster.toast({ title: 'Folders', body: 'Could not update' }); }
+    finally { setBusy(null); }
+  };
+
+  const row = (kind: string, label: string, icon: any, hint: string) => {
+    const configured = cfg[kind] || '';
+    const inUse = configured || detected[kind] || '';
+    const bad = staleFor(kind);
+    return (
+      <V2SettingsRow key={kind} icon={icon} danger={!!bad} title={label}
+        subtitle={busy === kind ? 'Saving…' : bad ? (
+          <span>
+            {bad.reason} · <span style={{ textDecoration: 'line-through', opacity: 0.7 }}>{bad.value}</span>
+            {' → '}<span style={{ color: V2.fg2 }}>{bad.suggested || 'auto-detect'}</span> · A to fix
+          </span>
+        ) : (
+          <span style={{ wordBreak: 'break-all' }}>
+            {inUse || 'Not set'}
+            <span style={{ color: V2.fgFaint }}>
+              {'  ·  '}{configured ? hint : inUse ? 'detected automatically' : hint}
+            </span>
+          </span>
+        )}
+        onClick={busy ? undefined : () => (bad ? fixStale(bad) : pick(kind, inUse))}
+        right={bad
+          ? <span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Fix</span>
+          : <FaChevronRight size={12} style={{ color: V2.fgFaint }} />} />
+    );
+  };
+
+  // The emulator override is not a folder and has no picker — it only ever needs
+  // clearing, which hands detection back to Ludo.
+  const exeStale = staleFor('exe');
+  const exeOverride = cfg.exe || '';
+
+  return (
+    <V2SettingsSection title="Folders">
+      {row('roms', 'ROM folder', <FaBoxOpen size={15} />, 'set by you')}
+      {row('saves', 'Save folder', <FaSave size={15} />, 'set by you')}
+      {row('bios', 'BIOS folder', <FaPuzzlePiece size={15} />, 'set by you')}
+      {(exeOverride || exeStale) && (
+        <V2SettingsRow icon={<FaGamepad size={15} />} danger={!!exeStale}
+          title="Emulator path"
+          subtitle={busy === 'exe' ? 'Saving…' : exeStale
+            ? `${exeStale.reason} · ${exeStale.value} · A to clear and auto-detect`
+            : `${exeOverride}  ·  overriding auto-detection — A to clear`}
+          onClick={busy ? undefined : () => (exeStale ? fixStale(exeStale) : write('exe', ''))}
+          right={<span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>
+            {exeStale ? 'Fix' : 'Clear'}</span>} />
+      )}
+      {stale.length > 1 && (
+        <V2SettingsRow icon={<FaCheck size={15} />}
+          title={busy === 'all' ? 'Fixing all…' : 'Fix all'}
+          subtitle={`Point all ${stale.length} of these back at your emulator.`}
+          onClick={busy ? undefined : async () => {
+            setBusy('all');
+            try {
+              const r = await repairEmulatorPaths();
+              if (r?.success) await loadEmulatorStatus(true);
+            } finally { setBusy(null); }
+          }} />
+      )}
+    </V2SettingsSection>
   );
 }
 
@@ -8829,6 +8914,8 @@ function SettingsPage() {
         <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-library")} />
         <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Settings</div>
       </div>
+
+      <FoldersSection />
 
       {rdDetected && (
         <V2SettingsSection title="RetroDECK">
