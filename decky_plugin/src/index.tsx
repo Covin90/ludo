@@ -7461,7 +7461,10 @@ function V2CardRow({ icon, title, subtitle, onClick, right, danger, divider }:
       {...highlightHandlers}
       style={{
         display: 'flex', alignItems: 'center', gap: '14px', padding: '13px 14px',
-        borderRadius: V2.radiusMd,
+        // No radius of its own: the card clips the outer corners, and a rounded
+        // highlight inset in a rounded card made every row read as a separate
+        // widget again.
+        borderRadius: 0,
         borderTop: divider ? `1px solid ${V2.border}` : 'none',
         background: active && interactive ? V2.surfaceHover : 'transparent',
         boxShadow: active && interactive ? `inset 0 0 0 2px ${accent}` : 'none',
@@ -9026,8 +9029,6 @@ function SettingsPage() {
         </V2SettingsSection>
       )}
 
-      <FoldersSection />
-
       <V2SettingsSection title="Updates">
         <div style={{
           display: 'flex', flexDirection: 'column', gap: '12px', padding: '16px',
@@ -9121,6 +9122,8 @@ function SettingsPage() {
       </V2SettingsSection>
 
       <RecentActivitySection />
+
+      <FoldersSection />
 
       <V2SettingsSection title="Account">
         {!confirmLogout ? (
