@@ -2237,10 +2237,16 @@ function UserAvatar({ username, avatar, size }: { username: string; avatar: stri
 
 // One RomM RMenuItem row: leading icon + label, hover/focus highlight, optional
 // danger variant. Closes the menu, then runs the action.
-function UserMenuRow({ icon, label, danger, disabled, onSelect }:
-  { icon: any; label: string; danger?: boolean; disabled?: boolean; onSelect: () => void }) {
+// `armed` inverts the danger combination — the tinted-background/red-text row
+// becomes a solid red fill with light text, so a half-pressed destructive row
+// reads as live at a glance rather than as another idle menu entry.
+function UserMenuRow({ icon, label, danger, armed, disabled, onSelect }:
+  { icon: any; label: string; danger?: boolean; armed?: boolean; disabled?: boolean; onSelect: () => void }) {
   const [hot, setHot] = useState(false);
-  const fg = disabled ? V2.fgFaint : (danger ? V2.danger : V2.fg);
+  const fg = disabled ? V2.fgFaint : (armed ? '#fff' : (danger ? V2.danger : V2.fg));
+  const bg = armed
+    ? (hot ? '#ff6a6a' : V2.danger)
+    : ((hot && !disabled) ? (danger ? 'rgba(255,80,80,0.12)' : V2.surfaceHover) : 'transparent');
   return (
     <Focusable noFocusRing onActivate={() => !disabled && onSelect()} onClick={() => !disabled && onSelect()}
       onFocus={() => setHot(true)} onBlur={() => setHot(false)}
@@ -2248,10 +2254,10 @@ function UserMenuRow({ icon, label, danger, disabled, onSelect }:
       style={{
         display: 'flex', alignItems: 'center', gap: '11px', padding: '9px 12px',
         borderRadius: V2.radiusMd, cursor: disabled ? 'default' : 'pointer',
-        background: (hot && !disabled) ? (danger ? 'rgba(255,80,80,0.12)' : V2.surfaceHover) : 'transparent',
-        color: fg, transition: 'background 0.12s ease', opacity: disabled ? 0.55 : 1,
+        background: bg,
+        color: fg, transition: 'background 0.12s ease, color 0.12s ease', opacity: disabled ? 0.55 : 1,
       }}>
-      <div style={{ flexShrink: 0, width: '16px', display: 'flex', justifyContent: 'center', color: disabled ? V2.fgFaint : (danger ? V2.danger : V2.fgMuted) }}>{icon}</div>
+      <div style={{ flexShrink: 0, width: '16px', display: 'flex', justifyContent: 'center', color: disabled ? V2.fgFaint : (armed ? '#fff' : (danger ? V2.danger : V2.fgMuted)) }}>{icon}</div>
       <span style={{ fontSize: '13.5px', fontWeight: 500 }}>{label}</span>
     </Focusable>
   );
@@ -2351,7 +2357,17 @@ function UserMenuModal({ username, role, avatar, closeModal }:
   // Desktop shell exposes a quit bridge; the Deck build has no such object, so
   // the Exit row only appears in the PC app. Logout lives in Settings.
   const desktop = (window as any).__rommDesktop;
-  const doQuit = () => { closeModal?.(); try { desktop?.quit?.(); } catch { /* no-op */ } };
+  // Quit is one keypress away from killing a session, so it arms on the first
+  // activate and only exits on the second (same arm → confirm shape as
+  // CollectionActionsModal's "Remove downloaded"), disarming after 4s.
+  const [quitArmed, setQuitArmed] = useState(false);
+  useEffect(() => { if (!quitArmed) return; const t = setTimeout(() => setQuitArmed(false), 4000); return () => clearTimeout(t); }, [quitArmed]);
+  const doQuit = () => {
+    if (!quitArmed) { setQuitArmed(true); return; }
+    setQuitArmed(false);
+    closeModal?.();
+    try { desktop?.quit?.(); } catch { /* no-op */ }
+  };
 
   return (
     <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}
@@ -2412,7 +2428,8 @@ function UserMenuModal({ username, role, avatar, closeModal }:
           {desktop && (
             <>
               <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-              <UserMenuRow icon={<FaPowerOff size={15} />} label="Quit" danger onSelect={doQuit} />
+              <UserMenuRow icon={quitArmed ? <FaCheck size={15} /> : <FaPowerOff size={15} />}
+                label={quitArmed ? 'Confirm quit' : 'Quit'} danger armed={quitArmed} onSelect={doQuit} />
             </>
           )}
         </Focusable>
