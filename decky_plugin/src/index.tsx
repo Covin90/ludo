@@ -1550,6 +1550,9 @@ type EmuStatus = {
   cores_dir: string | null;
   core_count: number;
   stale_paths: EmuStalePath[];
+  // Whether Ludo can install an emulator itself. False on Windows, without
+  // flatpak, or as root — the reason is what we show instead of the button.
+  install: { available: boolean; reason: string };
 };
 let _emuStatus: EmuStatus | null = null;
 let _emuInflight: Promise<EmuStatus | null> | null = null;
@@ -1575,6 +1578,7 @@ async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
           cores_dir: r.cores_dir || null,
           core_count: r.core_count || 0,
           stale_paths: r.stale_paths || [],
+          install: r.emulator_install || { available: false, reason: '' },
         });
       }
     } catch { /* leave the last known answer in place */ }
@@ -4363,7 +4367,11 @@ function EmulatorBanner() {
     ? (install.pct != null ? `${install.phase || 'Installing RetroArch'} · ${install.pct}%` : (install.phase || 'Installing RetroArch…'))
     : status.installed
       ? 'Your save folder still points into an emulator that was removed. Saves are being written where nothing will read them.'
-      : 'Downloading and syncing still work — you just need an emulator to play. Installing RetroArch takes a few minutes.';
+      : status.install.available
+        ? 'Downloading and syncing still work — you just need an emulator to play. Installing RetroArch takes a few minutes.'
+        // Can't install from here (Windows, no flatpak, running as root): say why
+        // rather than offering a button that can only fail.
+        : `Downloading and syncing still work, but playing needs RetroArch or RetroDECK — ${status.install.reason || 'install one to play'}.`;
 
   return (
     <div style={{ padding: '4px 20px 12px' }}>
@@ -4401,8 +4409,10 @@ function EmulatorBanner() {
               </>
             ) : (
               <>
-                <GameActionButton variant="emphasized" onClick={startEmulatorInstall}
-                  label="Install RetroArch" icon={<FaDownload size={14} />} />
+                {status.install.available && (
+                  <GameActionButton variant="emphasized" onClick={startEmulatorInstall}
+                    label="Install RetroArch" icon={<FaDownload size={14} />} />
+                )}
                 <GameActionButton variant="surface" onClick={() => libNavigate('/romm-sync-cores')}
                   icon={<FaChevronRight size={15} />} />
               </>
@@ -8091,8 +8101,11 @@ function EmulatorHealthSection({ status, onStatus }:
 // The Emulator page with nothing to configure: no RetroArch, no RetroDECK, so
 // per-platform cores are meaningless until one exists. Offer the install
 // instead of an empty list.
-function NoEmulatorSection() {
+function NoEmulatorSection({ status }: { status: EmuStatus }) {
   const install = useEmulatorInstall();
+  // Can't install from here — Windows, no flatpak, running as root. The row
+  // becomes an explanation rather than a button that could only fail.
+  const canInstall = status.install.available;
   return (
     <V2SettingsSection title="Emulator">
       <V2SettingsRow icon={<FaGamepad size={16} />}
@@ -8101,16 +8114,28 @@ function NoEmulatorSection() {
           ? (install.pct != null ? `${install.phase || 'Installing'} · ${install.pct}%` : (install.phase || 'This takes a few minutes.'))
           : install.error
             ? install.error
-            : 'Ludo can download and sync your library, but it needs RetroArch or RetroDECK to launch anything. A installs RetroArch from Flathub (~300 MB).'}
-        onClick={install.active ? undefined : startEmulatorInstall}
+            : canInstall
+              ? 'Ludo can download and sync your library, but it needs RetroArch or RetroDECK to launch anything. A installs RetroArch from Flathub (~300 MB).'
+              : `Ludo can download and sync your library, but it needs RetroArch or RetroDECK to launch anything. ${status.install.reason || 'Install one, then re-check.'}`}
+        onClick={install.active || !canInstall ? undefined : startEmulatorInstall}
         right={install.active
           ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite', color: V2.fgMuted }} />
-          : <span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Install</span>} />
-      <V2SettingsRow icon={<FaInfoCircle size={15} />}
+          : canInstall
+            ? <span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Install</span>
+            : null} />
+      {/* Only worth suggesting where a flatpak install is actually possible —
+          the reasons canInstall is false here are Windows, no flatpak, or root. */}
+      {canInstall && <V2SettingsRow icon={<FaInfoCircle size={15} />}
         title="Prefer RetroDECK?"
         subtitle="Install it from Flathub yourself (net.retrodeck.retrodeck) — it's a ~10 GB suite with its own first-run setup, so Ludo won't pull it in for you. Ludo picks it up automatically once it's there."
         right={<span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Re-check</span>}
-        onClick={() => loadEmulatorStatus(true)} />
+        onClick={() => loadEmulatorStatus(true)} />}
+      {/* Without the RetroDECK row there is nothing to re-detect with, and
+          installing outside Ludo is exactly what needs a re-check. */}
+      {!canInstall && <V2SettingsRow icon={<FaSync size={15} />}
+        title="Re-check"
+        subtitle="Look for RetroArch or RetroDECK again after installing one yourself."
+        onClick={() => loadEmulatorStatus(true)} />}
     </V2SettingsSection>
   );
 }
@@ -8213,7 +8238,7 @@ function CoresPage() {
 
       {/* Nothing installed: the per-platform list would be a wall of "no core"
           rows that can't be resolved, so it collapses to the install prompt. */}
-      {emu && !emu.installed ? <NoEmulatorSection /> : (
+      {emu && !emu.installed ? <NoEmulatorSection status={emu} /> : (
       <V2SettingsSection title="Per-platform core">
         {loading ? (
           <V2SettingsRow icon={<FaPuzzlePiece size={16} />} title="Loading cores…" />

@@ -4969,6 +4969,10 @@ class RetroArchInterface:
             'bios_dir': str((self.bios_manager and self.bios_manager.system_dir) or ''),
             'stale_paths': self.stale_emulator_paths(),
             'core_download': self.core_download_support(),
+            # Whether WE can install an emulator for them. Windows, a missing
+            # flatpak, or running as root all mean the answer is "not from here",
+            # and the UI must say so rather than offering a button that fails.
+            'emulator_install': self.emulator_install_support(),
         }
 
     # Settings that can outlive the emulator they were configured for. Each is
@@ -11264,10 +11268,19 @@ class SteamShortcutManager:
 
         # If no core found, create placeholder shortcut
         if not exe:
-            self.log(f"  ⚠️  No core for {rom_name} ({platform_name}) - creating placeholder shortcut")
+            # Two different failures reach here, and telling the user to install a
+            # core when the whole emulator is missing sends them the wrong way.
+            if not self.retroarch.retroarch_executable:
+                why = ('No emulator installed. Install RetroArch or RetroDECK, '
+                       'then re-sync this collection.')
+            else:
+                why = (f'No RetroArch core found for platform: {platform_name}. '
+                       f'Please install a compatible core.')
+            self.log(f"  ⚠️  {why.split('.')[0]} for {rom_name} ({platform_name}) "
+                     f"- creating placeholder shortcut")
             # Use a simple placeholder that will show an error when launched
             exe = '/usr/bin/echo'
-            launch_options = f'No RetroArch core found for platform: {platform_name}. Please install a compatible core.'
+            launch_options = why
             # Add a tag to identify shortcuts missing cores
             missing_core_tag = 'romm-sync-missing-core'
         else:
