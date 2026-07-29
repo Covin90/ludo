@@ -59,7 +59,7 @@ def record(kind, title, detail=''):
     """Append one activity entry.
 
     kind: free-form tag the UI maps to an icon —
-          'download' | 'sync' | 'save' | 'delete' | 'update' | 'account' | 'error'
+          'download' | 'sync' | 'save' | 'delete' | 'account' | 'error'
     """
     with _lock:
         _load_locked()

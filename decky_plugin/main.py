@@ -1278,10 +1278,18 @@ class Plugin:
 
     async def get_recent_activity(self, limit: int = 10):
         """Recent plugin activity (downloads, syncs, save events) newest-first
-        for the Settings ▸ Recent Activity feed. Persisted across restarts."""
+        for the Settings ▸ Recent Activity feed. Persisted across restarts.
+
+        'update' events are no longer recorded — the updater reports its own
+        progress inline in Settings, so a "Restart to apply" row here just
+        repeated it. Older logs may still hold some, so they are filtered out
+        on read rather than left to age out."""
         try:
             if activity_log:
-                return {'events': activity_log.get_recent(limit)}
+                # Over-fetch so dropping stale 'update' rows doesn't shorten the feed.
+                events = [e for e in activity_log.get_recent(limit * 2)
+                          if e.get('kind') != 'update']
+                return {'events': events[:limit]}
         except Exception as e:
             logging.debug(f"get_recent_activity error: {e}")
         return {'events': []}
@@ -2474,7 +2482,6 @@ class Plugin:
                         if chunk:
                             f.write(chunk)
             logging.info(f"[UPDATE] downloaded {dest.stat().st_size} bytes")
-            _record_activity('update', 'Plugin update downloaded', name)
             return {'success': True, 'path': str(dest), 'name': name}
         except Exception as e:
             logging.error(f"[UPDATE] download_update error: {e}", exc_info=True)
@@ -2541,7 +2548,6 @@ class Plugin:
                 except OSError:
                     logging.warning(f"[UPDATE] could not remove {src}")
             logging.info(f"[UPDATE] replaced {target} ({target.stat().st_size} bytes)")
-            _record_activity('update', 'Update installed', 'Restart to apply')
             return {'success': True, 'restart_required': True, 'path': str(target)}
         except Exception as e:
             logging.error(f"[UPDATE] apply_appimage_update error: {e}", exc_info=True)

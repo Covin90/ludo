@@ -7534,7 +7534,7 @@ function V2Switch({ checked }: { checked: boolean }) {
 // work that happened while no UI was open.
 const ACTIVITY_ICONS: Record<string, any> = {
   download: FaDownload, sync: FaSync, save: FaSave, delete: FaTrash,
-  update: FaBoxOpen, account: FaUser, error: FaExclamationTriangle,
+  account: FaUser, error: FaExclamationTriangle,
 };
 
 function fmtAgo(ts: number): string {
