@@ -4038,16 +4038,29 @@ class Plugin:
                     # grout-style: unpack a single-file .zip/.7z on arrival so
                     # disc cores get a real .cue/.m3u (no-op if disabled/plain ROM).
                     final = self._maybe_unzip_download(dest, rom_id) if ok else dest
-                    if ok and g:
-                        g['is_downloaded'] = True
-                        g['local_path'] = str(final)
+                    # `g` was resolved before the download started, which can be
+                    # minutes ago — long enough for the 5-minute library refresh
+                    # to have replaced _available_games. Re-resolve now, or a rom
+                    # that was missing at the start and arrived in the refresh
+                    # gets appended a SECOND time: two identical, both-downloaded
+                    # entries with the same rom_id, i.e. a doubled tile in Home's
+                    # 'Downloaded' row until the next restart rebuilt the list
+                    # from the (clean) snapshot.
+                    # A refresh may also have left the captured `g` orphaned — no
+                    # longer the dict the library holds — so mutating it would
+                    # silently do nothing. The current index is the only thing
+                    # worth trusting here.
+                    live = self._games_index().get(rom_id) if ok else None
+                    if ok and live:
+                        live['is_downloaded'] = True
+                        live['local_path'] = str(final)
                         is_md, dc = _detect_multi_disc(str(final), True)
-                        g['is_multi_disc'] = is_md
-                        g['disc_count'] = dc
-                    elif ok and not g:
-                        # Sibling ROM downloaded — add to the in-memory index so
-                        # launch_game can find it. Safe under CPython's GIL (same
-                        # assumption as the g[] mutations above).
+                        live['is_multi_disc'] = is_md
+                        live['disc_count'] = dc
+                    elif ok:
+                        # Genuinely not in the library (e.g. a sibling region ROM)
+                        # — add it so launch_game can find it. Safe under
+                        # CPython's GIL (same assumption as the mutations above).
                         is_md, dc = _detect_multi_disc(str(final), True)
                         self._available_games.append({
                             'name': name or 'Unknown',
@@ -4293,7 +4306,7 @@ class Plugin:
                         candidate = download_dir / slug / fn
                         if is_path_validly_downloaded(candidate):
                             is_md, dc = _detect_multi_disc(str(candidate), True)
-                            g = {
+                            found = {
                                 'rom_id': effective_rom_id,
                                 'name': d.get('name') or 'Unknown',
                                 'platform_slug': slug,
@@ -4305,7 +4318,26 @@ class Plugin:
                                 '_sibling_files': [],
                                 'sibling_roms': [],
                             }
-                            self._available_games.append(g)
+                            # Two cases reach here: the rom is genuinely absent
+                            # from the index, or it IS there but stale (marked
+                            # not-downloaded). Appending in the second case left
+                            # two entries with the same rom_id — a doubled tile
+                            # in the library grid and 'Recently added' (both list
+                            # every game), a duplicate React key, and an inflated
+                            # library total. Patch the existing entry instead, so
+                            # covers/siblings/display_name survive as well.
+                            if g is not None:
+                                # Only the download facts — 'name' is the
+                                # filename stem the save-sync matcher keys on
+                                # (not the API title), and the sibling lists here
+                                # are empty placeholders that would clobber real
+                                # ones.
+                                g.update({k: found[k] for k in (
+                                    'is_downloaded', 'local_path',
+                                    'is_multi_disc', 'disc_count')})
+                            else:
+                                g = found
+                                self._available_games.append(g)
                 except Exception:
                     pass
             if not g or not g.get('is_downloaded') or not g.get('local_path'):
