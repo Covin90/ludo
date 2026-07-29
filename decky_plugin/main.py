@@ -389,6 +389,11 @@ class Plugin:
     _collection_sync = None
     _available_games: list = None
 
+    # Live state of an in-progress emulator install (see install_emulator).
+    # Class-level default so emulator_install_state() answers before one starts.
+    _emu_install: dict = {'active': False, 'phase': '', 'pct': None,
+                          'error': None, 'installed': False}
+
     # Background retry thread (reconnect + collection-list refresh every 5 min)
     _stop_event: threading.Event = None
     _retry_thread: threading.Thread = None
@@ -2143,6 +2148,66 @@ class Plugin:
         except Exception as e:
             logging.error(f"repair_emulator_paths error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
+
+    async def install_emulator(self):
+        """Start installing RetroArch (per-user flatpak) in the background.
+
+        Returns as soon as the work is queued; the UI polls
+        emulator_install_state() for progress. Blocking here instead would hold
+        the IPC channel for the length of a ~300 MB download.
+        """
+        try:
+            ra = self._retroarch
+            if not ra:
+                return {'success': False, 'message': 'RetroArch interface unavailable'}
+            if self._emu_install.get('active'):
+                return {'success': True, 'message': 'Install already running'}
+
+            support = ra.emulator_install_support()
+            if not support['available']:
+                return {'success': False, 'message': support['reason']}
+
+            self._emu_install = {'active': True, 'phase': 'Starting…',
+                                 'pct': None, 'error': None, 'installed': False}
+
+            def progress(phase, pct):
+                self._emu_install['phase'] = phase
+                self._emu_install['pct'] = pct
+
+            def run():
+                try:
+                    r = ra.install_emulator(progress_callback=progress)
+                    self._emu_install['installed'] = bool(r.get('success'))
+                    self._emu_install['error'] = None if r.get('success') else r.get('message')
+                    if r.get('success'):
+                        # Sync was started against "no emulator": no cores dir,
+                        # no save dirs to watch. Restart it against the real one.
+                        try:
+                            self._stop_sync()
+                            time.sleep(0.5)
+                            self._start_sync()
+                        except Exception as e:
+                            logging.error(f"restart after emulator install: {e}", exc_info=True)
+                except Exception as e:
+                    logging.error(f"install_emulator error: {e}", exc_info=True)
+                    self._emu_install['error'] = str(e)
+                finally:
+                    self._emu_install['active'] = False
+                    self._emu_install['pct'] = None
+
+            threading.Thread(target=run, daemon=True,
+                             name='emulator-install').start()
+            return {'success': True, 'started': True}
+        except Exception as e:
+            logging.error(f"install_emulator error: {e}", exc_info=True)
+            self._emu_install = {'active': False, 'phase': '', 'pct': None,
+                                 'error': str(e), 'installed': False}
+            return {'success': False, 'message': str(e)}
+
+    async def emulator_install_state(self):
+        """Progress of the install started by install_emulator(). `pct` is None
+        while flatpak reports nothing parseable — show it as indeterminate."""
+        return {'success': True, **self._emu_install}
 
     async def get_core_mappings(self):
         """For the core-mapping settings page: one row per platform in the

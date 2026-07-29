@@ -41,6 +41,8 @@ const setCoreOverride = callable<[string, string], any>("set_core_override");
 const downloadCore = callable<[string], any>("download_core");
 const getEmulatorStatus = callable<[boolean?], any>("get_emulator_status");
 const repairEmulatorPaths = callable<[string[]?], any>("repair_emulator_paths");
+const installEmulator = callable<[], any>("install_emulator");
+const emulatorInstallState = callable<[], any>("emulator_install_state");
 const getDownloadableCores = callable<[boolean], any>("get_downloadable_cores");
 const getConfig = callable<[], any>("get_config");
 const logout = callable<[boolean], any>("logout");
@@ -1127,6 +1129,11 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
   };
   const doLaunch = async () => {
     if (busy) return;
+    // A on a tile has no dimmed state to read, so say it out loud instead.
+    if (_emuStatus && !_emuStatus.installed) {
+      toaster.toast({ title: 'No emulator', body: 'Install RetroArch from Home to play this.' });
+      return;
+    }
     setBusy('launch');
     try {
       const r = await launchGameSmart(game.rom_id);
@@ -1524,6 +1531,137 @@ function useServiceStatus(): any {
   const [, force] = useState(0);
   useEffect(() => _subscribeStatus(() => force((n) => n + 1)), []);
   return _lastStatus;
+}
+
+// ── Emulator status ─────────────────────────────────────────────────────────
+// Whether RetroArch/RetroDECK is actually installed, and whether any saved
+// folder still points into an emulator that was uninstalled. One fetch serves
+// the whole UI (Home banner, Play button, Emulator page). The backend re-detects
+// on every plugin start, so this cache only needs invalidating when WE change
+// something — a path repair or an install — which is what refresh does.
+type EmuStalePath = {
+  section: string; key: string; label: string; kind: string;
+  value: string; reason: string; suggested: string;
+};
+type EmuStatus = {
+  installed: boolean;
+  kind: 'retrodeck' | 'flatpak' | 'snap' | 'native' | 'none';
+  executable: string | null;
+  cores_dir: string | null;
+  core_count: number;
+  stale_paths: EmuStalePath[];
+};
+let _emuStatus: EmuStatus | null = null;
+let _emuInflight: Promise<EmuStatus | null> | null = null;
+const _emuSubs = new Set<() => void>();
+
+function publishEmulatorStatus(s: EmuStatus | null) {
+  _emuStatus = s;
+  [..._emuSubs].forEach((f) => f());
+}
+
+async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
+  // Coalesce: several components mount at once on a cold start and would
+  // otherwise each pay for the (filesystem-probing) detection.
+  if (!refresh && _emuInflight) return _emuInflight;
+  const run = (async () => {
+    try {
+      const r = await getEmulatorStatus(refresh);
+      if (r?.success) {
+        publishEmulatorStatus({
+          installed: !!r.installed,
+          kind: r.kind || 'none',
+          executable: r.executable || null,
+          cores_dir: r.cores_dir || null,
+          core_count: r.core_count || 0,
+          stale_paths: r.stale_paths || [],
+        });
+      }
+    } catch { /* leave the last known answer in place */ }
+    finally { _emuInflight = null; }
+    return _emuStatus;
+  })();
+  _emuInflight = run;
+  return run;
+}
+
+function useEmulatorStatus(): EmuStatus | null {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const f = () => force((n) => n + 1);
+    _emuSubs.add(f);
+    if (!_emuStatus) loadEmulatorStatus();
+    return () => { _emuSubs.delete(f); };
+  }, []);
+  return _emuStatus;
+}
+
+// The save folder is the one stale path that breaks things silently: sync keeps
+// reporting success while writing into a directory nothing reads. That alone
+// earns a Home banner; the rest wait to be noticed on the Emulator page.
+function emuSaveStale(s: EmuStatus | null): boolean {
+  return !!s?.stale_paths?.some((p) => p.kind === 'saves');
+}
+
+// ── RetroArch install ───────────────────────────────────────────────────────
+// The install runs in a backend thread (a ~300 MB flatpak); the UI polls its
+// progress. Module-level so the Home banner and the Emulator page show the same
+// run, and so navigating away mid-install doesn't orphan it.
+type EmuInstall = { active: boolean; phase: string; pct: number | null; error: string | null };
+let _emuInstall: EmuInstall = { active: false, phase: '', pct: null, error: null };
+const _emuInstallSubs = new Set<() => void>();
+let _emuInstallPoll: any = null;
+
+function _publishInstall(next: EmuInstall) {
+  _emuInstall = next;
+  [..._emuInstallSubs].forEach((f) => f());
+}
+
+function _pollInstall() {
+  if (_emuInstallPoll) return;
+  _emuInstallPoll = setInterval(async () => {
+    try {
+      const r = await emulatorInstallState();
+      _publishInstall({
+        active: !!r?.active, phase: r?.phase || '',
+        pct: r?.pct ?? null, error: r?.error || null,
+      });
+      if (!r?.active) {
+        clearInterval(_emuInstallPoll); _emuInstallPoll = null;
+        // The emulator either exists now or the attempt failed — either way the
+        // cached status is stale, and a fresh install ships zero cores, so the
+        // Cores page needs to re-read too.
+        await loadEmulatorStatus(true);
+        if (r?.error) toaster.toast({ title: 'RetroArch', body: r.error });
+        else if (r?.installed) toaster.toast({ title: 'RetroArch', body: 'Installed — pick cores for your platforms' });
+      }
+    } catch { /* keep polling; a dropped IPC frame isn't a failure */ }
+  }, 1000);
+}
+
+async function startEmulatorInstall() {
+  _publishInstall({ active: true, phase: 'Starting…', pct: null, error: null });
+  try {
+    const r = await installEmulator();
+    if (!r?.success) {
+      _publishInstall({ active: false, phase: '', pct: null, error: r?.message || 'Could not start the install' });
+      toaster.toast({ title: 'RetroArch', body: r?.message || 'Could not start the install' });
+      return;
+    }
+    _pollInstall();
+  } catch (e) {
+    _publishInstall({ active: false, phase: '', pct: null, error: String(e) });
+  }
+}
+
+function useEmulatorInstall(): EmuInstall {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const f = () => force((n) => n + 1);
+    _emuInstallSubs.add(f);
+    return () => { _emuInstallSubs.delete(f); };
+  }, []);
+  return _emuInstall;
 }
 
 // Collection tile — mosaic cover + kind badge + name/count below, with the
@@ -4190,6 +4328,92 @@ function CardRow({ icon, title, count, children }:
 
 // Home dashboard — faithful to RomM v2 Home.vue: horizontal CardRows
 // (Continue playing / Recently added / Platforms / Collections).
+// Home banner for the two emulator states that change what the app can do:
+// nothing installed (games download but can't launch), and a save folder left
+// pointing into an emulator that was uninstalled (sync writes where nothing
+// reads, while still reporting success). Every other stale path is a quiet
+// warning row on the Emulator page instead — see EmulatorHealthSection.
+function EmulatorBanner() {
+  const status = useEmulatorStatus();
+  const install = useEmulatorInstall();
+  const [fixing, setFixing] = useState(false);
+  if (!status) return null;
+
+  const saveStale = emuSaveStale(status);
+  if (status.installed && !saveStale && !install.active) return null;
+
+  const tone = status.installed ? V2.warning : V2.brandHover;
+  const fixSaves = async () => {
+    setFixing(true);
+    try {
+      const keys = (status.stale_paths || [])
+        .filter((p) => p.kind === 'saves').map((p) => `${p.section}.${p.key}`);
+      const r = await repairEmulatorPaths(keys);
+      if (r?.success) {
+        publishEmulatorStatus({ ...status, stale_paths: r.stale_paths || [] });
+        toaster.toast({ title: 'Save folder', body: 'Pointed back at your emulator' });
+      } else {
+        toaster.toast({ title: 'Save folder', body: r?.message || 'Could not update it' });
+      }
+    } catch { toaster.toast({ title: 'Save folder', body: 'Could not update it' }); }
+    finally { setFixing(false); }
+  };
+
+  const body = install.active
+    ? (install.pct != null ? `${install.phase || 'Installing RetroArch'} · ${install.pct}%` : (install.phase || 'Installing RetroArch…'))
+    : status.installed
+      ? 'Your save folder still points into an emulator that was removed. Saves are being written where nothing will read them.'
+      : 'Downloading and syncing still work — you just need an emulator to play. Installing RetroArch takes a few minutes.';
+
+  return (
+    <div style={{ padding: '4px 20px 12px' }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: '14px', padding: '14px 16px',
+        borderRadius: V2.radiusCard, background: V2.surface,
+        border: `1px solid ${tone}`, boxShadow: `inset 3px 0 0 ${tone}`,
+      }}>
+        <div style={{
+          flexShrink: 0, width: '36px', height: '36px', borderRadius: V2.radiusMd,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: V2.bgElevated, color: tone,
+        }}>
+          {status.installed ? <FaExclamationTriangle size={16} /> : <FaGamepad size={17} />}
+        </div>
+        <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+          <div style={{ fontSize: '14px', fontWeight: 700 }}>
+            {install.active ? 'Installing RetroArch'
+              : status.installed ? 'Saves are going to the wrong place'
+                : 'No emulator installed'}
+          </div>
+          <div style={{ fontSize: '12px', color: V2.fgMuted, lineHeight: 1.4, marginTop: '2px' }}>{body}</div>
+        </div>
+        {!install.active && (
+          <Focusable noFocusRing flow-children="horizontal" style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+            {status.installed ? (
+              <>
+                <GameActionButton variant="emphasized" disabled={fixing} onClick={fixSaves}
+                  label={fixing ? 'Fixing…' : 'Fix'}
+                  icon={fixing
+                    ? <FaSync size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                    : <FaCheck size={14} />} />
+                <GameActionButton variant="surface" onClick={() => libNavigate('/romm-sync-cores')}
+                  icon={<FaChevronRight size={15} />} />
+              </>
+            ) : (
+              <>
+                <GameActionButton variant="emphasized" onClick={startEmulatorInstall}
+                  label="Install RetroArch" icon={<FaDownload size={14} />} />
+                <GameActionButton variant="surface" onClick={() => libNavigate('/romm-sync-cores')}
+                  icon={<FaChevronRight size={15} />} />
+              </>
+            )}
+          </Focusable>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   { onOpen: (g: LibGame) => void; onOpenGroup: (mode: string, g: LibGroup, gs: LibGroup[]) => void; onBg: (uri: string | null) => void; visible: boolean }) {
   // Seed from the module-level cache so re-mounting (tab switch back to Home)
@@ -4273,6 +4497,7 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   }
   return (
     <div style={{ paddingTop: '8px' }}>
+      <EmulatorBanner />
       {/* Continue playing — per-user last_played from RomM (cross-device). */}
       {continuePlaying.length > 0 && (
         <CardRow icon={<FaPlay size={14} />} title="Continue playing" count={continuePlaying.length}>
@@ -6609,6 +6834,12 @@ function GameDetailPage() {
   const globalDownloading = useIsDownloading(game?.rom_id ?? -1);
   const downloading = busy === 'download' || globalDownloading;
   const smoothPct = useSmoothNumber(dlPct, downloading);
+  // Nothing to launch into: Play dims rather than disappearing, and says why
+  // when focused. Downloading stays available — building a library before you
+  // own an emulator is legitimate.
+  const emu = useEmulatorStatus();
+  const noEmulator = emu != null && !emu.installed;
+  const [ctaFocused, setCtaFocused] = useState(false);
   // Land gamepad focus on the primary CTA (Play / Download) when the page
   // opens. As an internal view (LibraryRootPage) there is no route change, so
   // Steam gives us no focus pass — without this the generic view focus-pull
@@ -6904,14 +7135,20 @@ function GameDetailPage() {
                   : <FaDownload size={15} />} />
             ) : !confirmDelete ? (
               <>
-                <GameActionButton variant="emphasized" focusRef={ctaRef} disabled={!!busy}
+                <GameActionButton variant="emphasized" focusRef={ctaRef} disabled={!!busy || noEmulator}
                   onClick={() => doLaunch()}
-                  onOptionsButton={isMultiDisc ? openDiscMenu : undefined}
-                  optionsHint={isMultiDisc}
+                  onFocused={() => setCtaFocused(true)} onBlurred={() => setCtaFocused(false)}
+                  onOptionsButton={isMultiDisc && !noEmulator ? openDiscMenu : undefined}
+                  optionsHint={isMultiDisc && !noEmulator}
                   label={busy === 'launch' ? 'Launching…' : 'Play'}
                   icon={busy === 'launch'
                     ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite' }} />
                     : <FaPlay size={14} style={{ marginLeft: '2px' }} />} />
+                {noEmulator && ctaFocused && (
+                  <span style={{ fontSize: '12px', color: V2.warning, maxWidth: '260px', lineHeight: 1.35 }}>
+                    No emulator installed — install RetroArch from Home to play.
+                  </span>
+                )}
                 <GameActionButton variant="surface" accent="danger" onClick={() => setConfirmDelete(true)}
                   icon={<FaTrash size={15} />} />
               </>
@@ -7797,6 +8034,87 @@ function CorePickerModal({ row, availableCores, canDownload, onPick, onDownload,
 // Emulator Cores page: one row per library platform showing how its launch
 // core resolves (user override > RetroDECK/ES-DE > built-in guess). A on a row
 // opens the picker; the trailing badge shows the resolved core + its source.
+// Folders still pointing into an emulator that was uninstalled. Shown as
+// warning rows rather than fixed silently: keeping ROMs in ~/retrodeck after
+// removing RetroDECK is a legitimate choice, so we suggest and let the user
+// confirm. Each row spells out old → new; A applies just that one.
+function EmulatorHealthSection({ status, onStatus }:
+  { status: EmuStatus; onStatus: (s: EmuStatus) => void }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const stale = status.stale_paths || [];
+  if (!stale.length) return null;
+
+  const fix = async (keys: string[] | null, tag: string) => {
+    setBusy(tag);
+    try {
+      const r = await repairEmulatorPaths(keys ?? undefined);
+      if (r?.success) {
+        onStatus({ ...status, stale_paths: r.stale_paths || [] });
+        toaster.toast({ title: 'Folders', body: r.repaired?.length
+          ? `Updated ${r.repaired.length} ${r.repaired.length === 1 ? 'folder' : 'folders'}`
+          : 'Nothing to change' });
+      } else {
+        toaster.toast({ title: 'Folders', body: r?.message || 'Could not update' });
+      }
+    } catch { toaster.toast({ title: 'Folders', body: 'Could not update' }); }
+    finally { setBusy(null); }
+  };
+
+  return (
+    <V2SettingsSection title="Needs attention">
+      {stale.map((p) => {
+        const tag = `${p.section}.${p.key}`;
+        return (
+          <V2SettingsRow key={tag} danger
+            icon={<FaExclamationTriangle size={15} />}
+            title={p.label}
+            subtitle={busy === tag ? 'Updating…' : (
+              <span>
+                {p.reason} · <span style={{ textDecoration: 'line-through', opacity: 0.7 }}>{p.value}</span>
+                {' → '}<span style={{ color: V2.fg2 }}>{p.suggested || 'auto-detect'}</span>
+              </span>
+            )}
+            onClick={busy ? undefined : () => fix([tag], tag)}
+            right={<span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Fix</span>} />
+        );
+      })}
+      {stale.length > 1 && (
+        <V2SettingsRow icon={<FaCheck size={15} />}
+          title={busy === 'all' ? 'Fixing all…' : 'Fix all'}
+          subtitle={`Update all ${stale.length} folders to the suggested locations.`}
+          onClick={busy ? undefined : () => fix(null, 'all')} />
+      )}
+    </V2SettingsSection>
+  );
+}
+
+// The Emulator page with nothing to configure: no RetroArch, no RetroDECK, so
+// per-platform cores are meaningless until one exists. Offer the install
+// instead of an empty list.
+function NoEmulatorSection() {
+  const install = useEmulatorInstall();
+  return (
+    <V2SettingsSection title="Emulator">
+      <V2SettingsRow icon={<FaGamepad size={16} />}
+        title={install.active ? 'Installing RetroArch…' : 'No emulator installed'}
+        subtitle={install.active
+          ? (install.pct != null ? `${install.phase || 'Installing'} · ${install.pct}%` : (install.phase || 'This takes a few minutes.'))
+          : install.error
+            ? install.error
+            : 'Ludo can download and sync your library, but it needs RetroArch or RetroDECK to launch anything. A installs RetroArch from Flathub (~300 MB).'}
+        onClick={install.active ? undefined : startEmulatorInstall}
+        right={install.active
+          ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite', color: V2.fgMuted }} />
+          : <span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Install</span>} />
+      <V2SettingsRow icon={<FaInfoCircle size={15} />}
+        title="Prefer RetroDECK?"
+        subtitle="Install it from Flathub yourself (net.retrodeck.retrodeck) — it's a ~10 GB suite with its own first-run setup, so Ludo won't pull it in for you. Ludo picks it up automatically once it's there."
+        right={<span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Re-check</span>}
+        onClick={() => loadEmulatorStatus(true)} />
+    </V2SettingsSection>
+  );
+}
+
 function CoresPage() {
   const [rows, setRows] = useState<any[]>([]);
   const [cores, setCores] = useState<string[]>([]);
@@ -7805,6 +8123,8 @@ function CoresPage() {
   // (RetroDECK bundles them read-only; unsupported CPU; no writable dir).
   const [canDownload, setCanDownload] = useState(false);
   const [noDownloadReason, setNoDownloadReason] = useState('');
+
+  const emu = useEmulatorStatus();
 
   const load = async () => {
     try {
@@ -7819,6 +8139,14 @@ function CoresPage() {
     finally { setLoading(false); }
   };
   useEffect(() => { load(); }, []);
+  // An install finishing while this page is open turns every row from
+  // unresolvable to resolvable — re-read instead of stranding the empty state.
+  const wasInstalled = useRef<boolean | null>(null);
+  useEffect(() => {
+    if (emu == null) return;
+    if (wasInstalled.current != null && wasInstalled.current !== emu.installed) load();
+    wasInstalled.current = emu.installed;
+  }, [emu?.installed]);
 
   const apply = async (slug: string, core: string) => {
     try {
@@ -7881,6 +8209,11 @@ function CoresPage() {
         <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Emulator Cores</div>
       </div>
 
+      {emu && <EmulatorHealthSection status={emu} onStatus={publishEmulatorStatus} />}
+
+      {/* Nothing installed: the per-platform list would be a wall of "no core"
+          rows that can't be resolved, so it collapses to the install prompt. */}
+      {emu && !emu.installed ? <NoEmulatorSection /> : (
       <V2SettingsSection title="Per-platform core">
         {loading ? (
           <V2SettingsRow icon={<FaPuzzlePiece size={16} />} title="Loading cores…" />
@@ -7908,6 +8241,7 @@ function CoresPage() {
             right={badge(row)} />
         ))}
       </V2SettingsSection>
+      )}
     </Focusable>
   );
 }

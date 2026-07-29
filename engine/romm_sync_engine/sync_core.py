@@ -6311,6 +6311,148 @@ class RetroArchInterface:
             fallback = Path.home() / '.config/retroarch/cores'
         return _usable(fallback)
 
+    # Flathub is added per-user so the install needs no root and no polkit
+    # prompt — there is nowhere to answer one from in Gaming Mode.
+    FLATHUB_REPO_URL = 'https://dl.flathub.org/repo/flathub.flatpakrepo'
+    RETROARCH_APP_ID = 'org.libretro.RetroArch'
+
+    def emulator_install_support(self):
+        """{'available': bool, 'reason': str} — whether Ludo can install an
+        emulator for the user.
+
+        Only RetroArch, and only via a per-user flatpak. RetroDECK is
+        deliberately excluded: ~10 GB with its own first-run wizard, which is a
+        decision to make in its own UI, not a button in ours.
+        """
+        if sys.platform != 'linux':
+            return {'available': False,
+                    'reason': 'Automatic install is Linux-only'}
+        if self.retroarch_executable:
+            return {'available': False, 'reason': 'An emulator is already installed'}
+        if not shutil.which('flatpak'):
+            return {'available': False,
+                    'reason': 'flatpak is not available on this system'}
+        # --user installs land in $HOME/.local/share/flatpak. Running as root
+        # would put them in /root, invisible to the user who has to launch them.
+        try:
+            if hasattr(os, 'geteuid') and os.geteuid() == 0:
+                return {'available': False,
+                        'reason': 'Ludo is running as root — install RetroArch from Discover instead'}
+        except Exception:
+            pass
+        return {'available': True, 'reason': ''}
+
+    # `flatpak install` writes progress as a redrawn line, so percentages arrive
+    # as bare "NN%" tokens rather than discrete lines.
+    _FLATPAK_PCT_RE = re.compile(r'(\d{1,3})%')
+
+    def install_emulator(self, progress_callback=None):
+        """Install RetroArch as a per-user flatpak.
+
+        Blocking; run it off the UI thread. progress_callback receives
+        (phase, pct) where pct is None while flatpak reports nothing parseable
+        (resolving refs, verifying) — the caller should show an indeterminate
+        state rather than 0%.
+
+        Returns {'success': bool, 'message': str, 'status': emulator_status()}.
+        """
+        support = self.emulator_install_support()
+        if not support['available']:
+            return {'success': False, 'message': support['reason'],
+                    'status': self.emulator_status()}
+
+        import subprocess
+
+        env = self._host_subprocess_env()
+
+        def report(phase, pct=None):
+            if progress_callback:
+                try:
+                    progress_callback(phase, pct)
+                except Exception:
+                    pass
+
+        # 1. Make sure Flathub exists for this user. Cheap and idempotent; on a
+        #    stock SteamOS the system remote is already there, but a --user
+        #    install can only pull from a remote the user can see.
+        report('Preparing')
+        try:
+            subprocess.run(
+                ['flatpak', 'remote-add', '--if-not-exists', '--user',
+                 'flathub', self.FLATHUB_REPO_URL],
+                capture_output=True, text=True, timeout=60, env=env)
+        except Exception as e:
+            print(f"⚠️  Could not add the Flathub remote: {e}")
+            # Not fatal — the install below may still resolve against an
+            # existing remote, and its error message will be the better one.
+
+        # 2. The install itself. ~300 MB plus the runtime, so the timeout is
+        #    generous and progress is streamed rather than waited on.
+        report('Downloading')
+        cmd = ['flatpak', 'install', '--user', '-y', '--noninteractive',
+               'flathub', self.RETROARCH_APP_ID]
+        print(f"📦 Installing RetroArch: {' '.join(cmd)}")
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env)
+        except Exception as e:
+            return {'success': False, 'message': f'Could not run flatpak: {e}',
+                    'status': self.emulator_status()}
+
+        tail = []
+        deadline = time.time() + 3600   # a slow connection is not a failure
+        try:
+            # Read by character-ish chunks: flatpak's progress line ends in \r,
+            # so iterating lines would block until the whole install finished.
+            buf = ''
+            while True:
+                if time.time() > deadline:
+                    proc.kill()
+                    return {'success': False, 'message': 'Install timed out',
+                            'status': self.emulator_status()}
+                chunk = proc.stdout.read(64)
+                if not chunk:
+                    break
+                buf += chunk
+                # Keep the last fragment (possibly a partial token) for next round.
+                parts = re.split(r'[\r\n]', buf)
+                buf = parts.pop()
+                for line in parts:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    tail.append(line)
+                    del tail[:-8]
+                    m = self._FLATPAK_PCT_RE.search(line)
+                    report('Downloading', min(100, int(m.group(1))) if m else None)
+            proc.wait(timeout=60)
+        except Exception as e:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return {'success': False, 'message': f'Install failed: {e}',
+                    'status': self.emulator_status()}
+
+        if proc.returncode != 0:
+            # flatpak's own last words are far more useful than a generic string.
+            msg = next((l for l in reversed(tail) if 'error' in l.lower()), None)
+            return {'success': False,
+                    'message': msg or f'flatpak install failed (exit {proc.returncode})',
+                    'status': self.emulator_status()}
+
+        # 3. Re-detect. Everything downstream (cores dir, save dirs, launch
+        #    command) was resolved against "no emulator" and is now wrong.
+        report('Finishing')
+        status = self.refresh_installation()
+        if not status.get('installed'):
+            return {'success': False,
+                    'message': 'RetroArch installed but could not be detected — try restarting Ludo',
+                    'status': status}
+        print("✅ RetroArch installed")
+        return {'success': True, 'message': 'RetroArch installed', 'status': status}
+
     def core_download_support(self):
         """{'available': bool, 'reason': str} — whether downloading cores makes
         sense for the CURRENTLY SELECTED RetroArch, and a user-facing reason
