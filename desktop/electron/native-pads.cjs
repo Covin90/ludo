@@ -54,9 +54,12 @@ function isGamepad(dir) {
   return caps ? hasKeyBit(caps, BTN_SOUTH) : false;
 }
 
-// Returns an array of Gamepad.id-style strings, or null when this platform can't
-// answer. Ordered by input index, so [0] is the first-attached pad.
-function listNativePads() {
+// Every attached pad, as {id, name, eventNode}: `id` in Chromium's Gamepad.id
+// shape (so the renderer's detectFamily() parses native and browser-reported pads
+// with one code path), `eventNode` the /dev/input/eventN path native-input.cjs
+// reads. Returns null when this platform can't answer. Ordered by input index, so
+// [0] is the first-attached pad.
+function findNativePads() {
   if (process.platform !== "linux") return null;
 
   let entries;
@@ -71,11 +74,22 @@ function listNativePads() {
     const name = read(dir, "name") || "Gamepad";
     const vendor = read(dir, "id", "vendor") || "0000";
     const product = read(dir, "id", "product") || "0000";
-    // Match Chromium's Gamepad.id shape so detectFamily() in the renderer parses
-    // native and browser-reported pads with one code path.
-    pads.push(`${name} (Vendor: ${vendor} Product: ${product})`);
+    // The eventN child of the same input device — the evdev node. Absent only in
+    // the window between the device appearing and udev finishing with it.
+    let eventNode = null;
+    try {
+      const ev = fs.readdirSync(dir).find((f) => /^event\d+$/.test(f));
+      if (ev) eventNode = `/dev/input/${ev}`;
+    } catch { /* raced with an unplug */ }
+    pads.push({ id: `${name} (Vendor: ${vendor} Product: ${product})`, name, eventNode });
   }
   return pads;
 }
 
-module.exports = { listNativePads };
+// Just the id strings, for the renderer's legend (window.__rommNativePads).
+function listNativePads() {
+  const pads = findNativePads();
+  return pads ? pads.map((p) => p.id) : null;
+}
+
+module.exports = { listNativePads, findNativePads };

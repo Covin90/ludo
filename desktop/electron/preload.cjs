@@ -97,6 +97,10 @@ function pressed(btn) {
 function startPolling() {
   const btnState = {};        // GamepadButtonId → last-sent pressed bool
   let dirState = null;        // last-sent direction string | null
+  // Whether Chromium is currently reporting a pad of its own. When it is, its
+  // poll wins and the main process's kernel reader is ignored, so a pad the
+  // browser can see is never driven by both paths at once.
+  let chromiumHasPad = false;
 
   function emitButton(id, isDown) {
     if (btnState[id] === isDown) return;
@@ -135,9 +139,13 @@ function startPolling() {
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     let gp = null;
     for (const p of pads) { if (p && p.connected) { gp = p; break; } }
+    chromiumHasPad = !!gp;
 
     if (!gp) {
-      releaseAll();
+      // No pad the browser will admit to. Don't releaseAll() here: the kernel
+      // reader may be driving a hot-plugged pad that Chromium never surfaces
+      // (see native-input.cjs), and clearing state every frame would cancel its
+      // presses. Focus loss and real disconnects still release, below.
       requestAnimationFrame(poll);
       return;
     }
@@ -159,6 +167,18 @@ function startPolling() {
 
     requestAnimationFrame(poll);
   }
+
+  // Kernel-read pad events from the main process (native-input.cjs), for the pads
+  // Chromium won't surface here at all. They join the SAME emit path as the
+  // browser poll, so held-button release, focus gating and de-duplication all
+  // behave identically no matter which source produced the press.
+  ipcRenderer.on("romm:native-pad", (_e, kind, payload) => {
+    // Chromium's own report wins whenever it has one, and a pad must not move the
+    // UI while a launched game holds focus.
+    if (chromiumHasPad || !document.hasFocus()) return;
+    if (kind === "button") emitButton(payload.id, payload.down);
+    else if (kind === "direction") emitDir(payload.dir);
+  });
 
   // Chromium only starts exposing a HOT-PLUGGED pad through getGamepads() once
   // the page has a gamepadconnected listener registered — polling alone sees

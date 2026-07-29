@@ -18,6 +18,7 @@ const net = require("net");
 const path = require("path");
 const fs = require("fs");
 const { listNativePads } = require("./native-pads.cjs");
+const { startNativeInput } = require("./native-input.cjs");
 
 // ── GPU / compositing (Linux) ────────────────────────────────────────────────
 //
@@ -55,6 +56,7 @@ const MIN_ZOOM = 0.5;
 
 let backend = null; // the Python child process
 let win = null;
+let stopNativeInput = null; // teardown for the kernel pad reader (native-input.cjs)
 
 // ── Backend lifecycle ────────────────────────────────────────────────────────
 
@@ -216,8 +218,30 @@ function createWindow(url, fullscreen) {
     }
   });
 
-  win.on("closed", () => { win = null; });
+  // Kernel-level pad reading, for controllers Chromium refuses to expose to the
+  // renderer (see native-input.cjs — a pad switched on after launch never reaches
+  // navigator.getGamepads()). preload.cjs ignores these events whenever Chromium
+  // IS reporting a pad, so the two paths can't both drive the UI.
+  //
+  // Focus gating lives in the renderer, not here: preload.cjs already drops input
+  // while the window is unfocused (a running game owns the pad) and, crucially,
+  // releases everything it had held when focus goes — a button that happens to be
+  // down at that moment would otherwise stay stuck down forever.
+  stopNativeInput = startNativeInput({
+    button(id, down) { sendPadEvent(win, "button", { id, down }); },
+    direction(dir) { sendPadEvent(win, "direction", { dir }); },
+  });
+  win.on("closed", () => {
+    win = null;
+    if (stopNativeInput) { stopNativeInput(); stopNativeInput = null; }
+  });
   win.loadURL(url);
+}
+
+function sendPadEvent(target, kind, payload) {
+  if (!target || target.isDestroyed()) return;
+  try { target.webContents.send("romm:native-pad", kind, payload); }
+  catch { /* renderer went away mid-send */ }
 }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
