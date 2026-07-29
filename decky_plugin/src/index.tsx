@@ -7449,11 +7449,17 @@ function pickerStart(current?: string | null): string {
 // The same row, but flat: no card of its own, so several can live inside ONE
 // surface separated by hairlines (see FoldersSection). Highlight is drawn inset
 // instead of as a border, which keeps the card's outline unbroken.
-function V2CardRow({ icon, title, subtitle, onClick, right, danger, divider }:
-  { icon?: any; title: any; subtitle?: any; onClick?: () => void; right?: any; danger?: boolean; divider?: boolean }) {
+function V2CardRow({ icon, title, subtitle, onClick, right, danger, divider, first, last }:
+  { icon?: any; title: any; subtitle?: any; onClick?: () => void; right?: any;
+    danger?: boolean; divider?: boolean; first?: boolean; last?: boolean }) {
   const { active, highlightHandlers } = useRowHighlight();
   const interactive = !!onClick;
   const accent = danger ? V2.danger : V2.brand;
+  // The highlight ring has to follow the CARD's corners, not its own: a row in
+  // the middle is square, but the top and bottom rows sit in the card's rounded
+  // ends. One pixel less than the card radius, because the card's 1px border
+  // sits outside this ring.
+  const end = `calc(${V2.radiusCard} - 1px)`;
   return (
     <Focusable noFocusRing
       onActivate={interactive ? onClick : undefined}
@@ -7461,10 +7467,10 @@ function V2CardRow({ icon, title, subtitle, onClick, right, danger, divider }:
       {...highlightHandlers}
       style={{
         display: 'flex', alignItems: 'center', gap: '14px', padding: '13px 14px',
-        // No radius of its own: the card clips the outer corners, and a rounded
-        // highlight inset in a rounded card made every row read as a separate
-        // widget again.
-        borderRadius: 0,
+        borderTopLeftRadius: first ? end : 0,
+        borderTopRightRadius: first ? end : 0,
+        borderBottomLeftRadius: last ? end : 0,
+        borderBottomRightRadius: last ? end : 0,
         borderTop: divider ? `1px solid ${V2.border}` : 'none',
         background: active && interactive ? V2.surfaceHover : 'transparent',
         boxShadow: active && interactive ? `inset 0 0 0 2px ${accent}` : 'none',
@@ -8466,12 +8472,12 @@ function FoldersSection() {
     finally { setBusy(null); }
   };
 
-  const row = (kind: string, label: string, icon: any, hint: string, divider?: boolean) => {
+  const row = (kind: string, label: string, icon: any, hint: string) => {
     const configured = cfg[kind] || '';
     const inUse = configured || detected[kind] || '';
     const bad = staleFor(kind);
     return (
-      <V2CardRow key={kind} icon={icon} danger={!!bad} title={label} divider={divider}
+      <V2CardRow key={kind} icon={icon} danger={!!bad} title={label}
         subtitle={busy === kind ? 'Saving…' : bad ? (
           <span>
             {bad.reason} · <span style={{ textDecoration: 'line-through', opacity: 0.7 }}>{bad.value}</span>
@@ -8497,41 +8503,76 @@ function FoldersSection() {
   const exeStale = staleFor('exe');
   const exeOverride = cfg.exe || '';
 
+  // What Ludo actually found. Everything below it is derived from this, so it
+  // reads first: a wrong answer here explains a wrong answer in every row.
+  // kind is retrodeck | flatpak | snap | native — the last three are all
+  // RetroArch, so name the flavour rather than dropping it.
+  const emuRow = (
+    <V2CardRow key="emu" icon={<FaGamepad size={15} />} danger={!status.installed}
+      title={!status.installed ? 'No emulator found'
+        : status.kind === 'retrodeck' ? 'RetroDECK'
+          : status.kind === 'flatpak' ? 'RetroArch (Flatpak)'
+            : status.kind === 'snap' ? 'RetroArch (Snap)'
+              : 'RetroArch'}
+      subtitle={status.installed ? (
+        <span style={{ wordBreak: 'break-all' }}>
+          {status.executable || 'detected'}
+          <span style={{ color: V2.fgFaint }}>
+            {'  ·  '}{status.core_count
+              ? `${status.core_count} core${status.core_count === 1 ? '' : 's'}`
+              : 'no cores installed'}
+          </span>
+        </span>
+      ) : 'Install RetroArch or RetroDECK to play these games.'}
+      onClick={() => Navigation.Navigate('/romm-sync-cores')}
+      right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />} />
+  );
+
+  const rows = [
+    emuRow,
+    row('roms', 'ROM folder', <FaBoxOpen size={15} />, 'set by you'),
+    row('saves', 'Save folder', <FaSave size={15} />, 'set by you'),
+    row('bios', 'BIOS folder', <FaPuzzlePiece size={15} />, 'set by you'),
+    (exeOverride || exeStale) ? (
+      <V2CardRow key="exe" icon={<FaGamepad size={15} />} danger={!!exeStale}
+        title="Emulator path"
+        subtitle={busy === 'exe' ? 'Saving…' : exeStale
+          ? `${exeStale.reason} · ${exeStale.value} · A to clear and auto-detect`
+          : `${exeOverride}  ·  overriding auto-detection — A to clear`}
+        onClick={busy ? undefined : () => (exeStale ? fixStale(exeStale) : write('exe', ''))}
+        right={<span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>
+          {exeStale ? 'Fix' : 'Clear'}</span>} />
+    ) : null,
+    stale.length > 1 ? (
+      <V2CardRow key="all" icon={<FaCheck size={15} />}
+        title={busy === 'all' ? 'Fixing all…' : 'Fix all'}
+        subtitle={`Point all ${stale.length} of these back at your emulator.`}
+        onClick={busy ? undefined : async () => {
+          setBusy('all');
+          try {
+            const r = await repairEmulatorPaths();
+            if (r?.success) await loadEmulatorStatus(true);
+          } finally { setBusy(null); }
+        }} />
+    ) : null,
+  ].filter(Boolean) as any[];
+
   return (
-    <V2SettingsSection title="Folders">
-      {/* One card, not one per folder: these three are a single answer to
-          "where does my library live", and reading them as a block is the
-          point. Rows are separated by hairlines instead of gaps. */}
+    <V2SettingsSection title="Emulator & folders">
+      {/* One card, not one per folder: these are a single answer to "what did
+          Ludo find and where does my library live", and reading them as a block
+          is the point. Hairlines instead of gaps, and the first/last rows are
+          told they sit in the card's rounded ends so the focus ring can follow
+          them. Which row is last depends on the conditional ones, hence the
+          clone rather than props at each call site. */}
       <div style={{
         display: 'flex', flexDirection: 'column',
         borderRadius: V2.radiusCard, background: V2.surface,
         border: `1px solid ${V2.border}`, overflow: 'hidden',
       }}>
-      {row('roms', 'ROM folder', <FaBoxOpen size={15} />, 'set by you')}
-      {row('saves', 'Save folder', <FaSave size={15} />, 'set by you', true)}
-      {row('bios', 'BIOS folder', <FaPuzzlePiece size={15} />, 'set by you', true)}
-      {(exeOverride || exeStale) && (
-        <V2CardRow icon={<FaGamepad size={15} />} danger={!!exeStale} divider
-          title="Emulator path"
-          subtitle={busy === 'exe' ? 'Saving…' : exeStale
-            ? `${exeStale.reason} · ${exeStale.value} · A to clear and auto-detect`
-            : `${exeOverride}  ·  overriding auto-detection — A to clear`}
-          onClick={busy ? undefined : () => (exeStale ? fixStale(exeStale) : write('exe', ''))}
-          right={<span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>
-            {exeStale ? 'Fix' : 'Clear'}</span>} />
-      )}
-      {stale.length > 1 && (
-        <V2CardRow icon={<FaCheck size={15} />} divider
-          title={busy === 'all' ? 'Fixing all…' : 'Fix all'}
-          subtitle={`Point all ${stale.length} of these back at your emulator.`}
-          onClick={busy ? undefined : async () => {
-            setBusy('all');
-            try {
-              const r = await repairEmulatorPaths();
-              if (r?.success) await loadEmulatorStatus(true);
-            } finally { setBusy(null); }
-          }} />
-      )}
+        {rows.map((r, i) => cloneElement(r, {
+          divider: i > 0, first: i === 0, last: i === rows.length - 1,
+        }))}
       </div>
     </V2SettingsSection>
   );
