@@ -9034,6 +9034,43 @@ class AutoSyncManager:
         done.wait(timeout=120)
         return choice[0]
 
+    def refresh_save_dirs(self):
+        """Re-resolve the emulator's save directories, re-arming the watcher.
+
+        find_retroarch_dirs() only reports directories that already EXIST, and
+        they are resolved once when sync starts. An emulator installed through
+        Ludo has not run yet at that point, so its saves/ and states/ do not
+        exist and this manager came up watching nothing — then the first game
+        wrote a save into a directory no part of sync knew about. The inventory
+        came back empty and a session reported "0 up, 0 down" one second after
+        the file appeared.
+
+        Cheap enough to call at every session boundary: a handful of stat()s.
+        Returns True when the directories changed.
+        """
+        try:
+            before = dict(self.retroarch.save_dirs or {})
+            found = self.retroarch.find_retroarch_dirs() or {}
+            if not found or found == before:
+                return False
+            self.retroarch.save_dirs = found
+            self.log(f"📁 Save directories moved: "
+                     f"{ {k: str(v) for k, v in found.items()} }")
+            # The watcher is bound to the old paths, so restart it or nothing
+            # will notice a save until the next session boundary.
+            try:
+                if getattr(self, 'observer', None):
+                    self.observer.stop()
+                    self.observer.join(timeout=3)
+                    self.observer = None
+                self.start_file_monitoring()
+            except Exception as e:
+                self.log(f"⚠️ Could not re-arm the save watcher: {e}")
+            return True
+        except Exception as e:
+            self.log(f"⚠️ Could not refresh save directories: {e}")
+            return False
+
     def build_sync_inventory(self):
         """Build the local save inventory for RomM 4.9.0's /api/sync/negotiate.
 
@@ -9049,6 +9086,8 @@ class AutoSyncManager:
         import datetime as _dt
 
         inventory = []
+        # The emulator may have created its save tree since sync started.
+        self.refresh_save_dirs()
         save_files = self.retroarch.get_save_files() or {}
         for entry in save_files.get('saves', []):
             path = Path(entry['path'])
@@ -9169,6 +9208,9 @@ class AutoSyncManager:
             try:
                 if reason:
                     self.log(f"🔄 Save-sync session ({reason})")
+                # Before anything reads the disk: the emulator may have created
+                # (or moved) its save tree since this manager started.
+                self.refresh_save_dirs()
                 # Push any states that drifted (e.g. changed while offline)
                 # BEFORE the negotiate baseline, so they actually reach the
                 # server instead of being marked synced in place.
