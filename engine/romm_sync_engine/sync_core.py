@@ -769,8 +769,28 @@ def detect_retrodeck():
 
 
 class SettingsManager:
-    """Handle saving and loading application settings"""
-    
+    """Handle saving and loading application settings
+
+    One parsed config per file, shared by every instance in the process. Each
+    instance used to own a ConfigParser loaded when it was constructed, and
+    save_settings() writes the WHOLE snapshot — so any long-lived instance
+    silently reverted everything written since it loaded. That is not
+    theoretical: repairing a stale BIOS path wrote the new value, then the sync
+    restart that follows called AutoSyncManager.stop(), whose own months-old
+    instance stamped last_shutdown_time and rewrote the file from its stale
+    copy, restoring the exact path the user had just fixed. The repair reported
+    success, the warning stayed, and nothing in between looked wrong.
+
+    Sharing the parser means every writer mutates the same state, so a save
+    writes the union rather than one instance's view of history.
+    """
+
+    # config_file → ConfigParser. Keyed by path so a different HOME (tests,
+    # a per-user override) gets its own.
+    _shared: dict = {}
+    _mtimes: dict = {}
+    _lock = threading.RLock()
+
     def __init__(self):
         self.config_dir = config_dir()
         self.config_file = self.config_dir / 'settings.ini'
@@ -779,8 +799,37 @@ class SettingsManager:
         # Add encryption setup
         self._setup_encryption()
 
-        self.config = configparser.ConfigParser()
-        self.load_settings()
+        with SettingsManager._lock:
+            existing = SettingsManager._shared.get(str(self.config_file))
+            if existing is not None:
+                # Already parsed (and already migrated) — adopt it, but pick up
+                # an edit made behind our back (the other frontend, a hand-edited
+                # settings.ini). Constructing a manager used to re-read, and
+                # code relies on that for freshness; every write saves
+                # immediately, so there is nothing unsaved to lose by rereading.
+                self.config = existing
+                if self._file_changed():
+                    self.load_settings()
+                return
+            self.config = configparser.ConfigParser()
+            SettingsManager._shared[str(self.config_file)] = self.config
+            self.load_settings()
+
+    def _file_changed(self):
+        """True when settings.ini has been written since we last read it."""
+        try:
+            mtime = self.config_file.stat().st_mtime_ns
+        except OSError:
+            return False
+        return SettingsManager._mtimes.get(str(self.config_file)) != mtime
+
+    def _stamp(self):
+        """Record the file's mtime as the version now in memory."""
+        try:
+            SettingsManager._mtimes[str(self.config_file)] = \
+                self.config_file.stat().st_mtime_ns
+        except OSError:
+            SettingsManager._mtimes.pop(str(self.config_file), None)
 
     def _setup_encryption(self):
         """Setup encryption key.
@@ -852,6 +901,7 @@ class SettingsManager:
         """Load settings from file"""
         if self.config_file.exists():
             self.config.read(self.config_file)
+            self._stamp()
             # Migrate settings from older versions
             self._migrate_settings()
         else:
@@ -964,9 +1014,22 @@ class SettingsManager:
             print(f"✅ Settings migrated to latest version")
     
     def save_settings(self):
-        """Save settings to file"""
-        with open(self.config_file, 'w') as f:
-            self.config.write(f)
+        """Save settings to file.
+
+        Written to a temp file and replaced, so a reader never sees a partial
+        settings.ini — several threads save concurrently (the sync manager, the
+        BIOS manager, the UI), and a truncated file loses everything including
+        the saved credentials. The lock is the same one guarding the shared
+        parser, so a save can't interleave with another writer's mutation.
+        """
+        with SettingsManager._lock:
+            tmp = self.config_file.with_suffix('.ini.tmp')
+            with open(tmp, 'w') as f:
+                self.config.write(f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.config_file)
+            self._stamp()
     
     def get(self, section, key, fallback=''):
         """Get a setting value with decryption for sensitive data"""
@@ -980,15 +1043,17 @@ class SettingsManager:
 
     def set(self, section, key, value):
         """Set a setting value with encryption for sensitive data"""
-        if section not in self.config:
-            self.config[section] = {}
-        
         # Encrypt sensitive fields
         if section == 'RomM' and key in ['username', 'password', 'client_token'] and value:
             value = self._encrypt(value)
-        
-        self.config[section][key] = str(value)
-        self.save_settings()
+
+        # Mutation and save together: the parser is shared process-wide, so a
+        # concurrent save must not catch this half-applied.
+        with SettingsManager._lock:
+            if section not in self.config:
+                self.config[section] = {}
+            self.config[section][key] = str(value)
+            self.save_settings()
 
 class DownloadProgress:
     """Track download progress with speed and ETA calculations"""
