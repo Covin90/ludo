@@ -2313,6 +2313,10 @@ class Plugin:
                             # And the other half of it: RetroArch writes saves
                             # next to the ROM unless told otherwise, so watching
                             # our folder is useless until its config agrees.
+                            # Create the save folders now so the watcher has
+                            # something to watch during the very first session,
+                            # rather than only catching up when it ends.
+                            self._retroarch.ensure_save_dirs_exist()
                             self._retroarch.align_retroarch_config()
                             self._emu_install['repaired'] = [
                                 x.get('label') or x.get('key') for x in repaired]
@@ -4444,6 +4448,13 @@ class Plugin:
             logging.warning("launching without a pre-launch save sync — "
                             "sync is not connected yet")
             return
+        try:
+            # The emulator may have created its save tree since sync started
+            # (first run after an install). Re-resolve BEFORE the session so the
+            # watcher is armed for it, not after the game has already exited.
+            await asyncio.to_thread(auto.refresh_save_dirs)
+        except Exception as e:
+            logging.warning(f"could not refresh save directories: {e}")
         try:
             await asyncio.to_thread(auto.sync_before_launch, game)
         except Exception as e:

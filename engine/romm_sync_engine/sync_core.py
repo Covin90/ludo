@@ -5287,6 +5287,34 @@ class RetroArchInterface:
             return retrodeck['rom_directory' if kind == 'roms' else 'save_directory']
         return str(library_dir() / ('roms' if kind == 'roms' else 'saves'))
 
+    def ensure_save_dirs_exist(self):
+        """Create the emulator's saves/ and states/ folders now, not later.
+
+        Directory discovery only accepts folders that exist, and a freshly
+        installed emulator has none until its first run — so the first session
+        went unwatched and only synced once it ended. Creating them ourselves
+        closes that window: it is what RetroArch does on first run anyway, and
+        it writes no configuration, so RetroArch's own first-run setup is
+        untouched (creating retroarch.cfg is what broke the menu font; creating
+        directories is not the same thing).
+
+        Returns the paths created or already present.
+        """
+        made = []
+        expected = self.expected_save_dir()
+        if not expected:
+            return made
+        parent = Path(expected).parent
+        for d in (Path(expected), parent / 'states'):
+            try:
+                if not d.is_dir():
+                    d.mkdir(parents=True, exist_ok=True)
+                    print(f"📁 Created {d}")
+                made.append(str(d))
+            except Exception as e:
+                print(f"⚠️  Could not create {d}: {e}")
+        return made
+
     def align_retroarch_config(self, save_dir=None):
         """Point RetroArch's own savefile/savestate directories at ours.
 
