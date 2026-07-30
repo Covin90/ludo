@@ -5003,6 +5003,12 @@ class RetroArchInterface:
             self.retroarch_executable = self.find_retroarch_executable()
             self.cores_dir = self.find_cores_directory()
 
+        # Rescue anything an earlier build dropped into a literal '~' folder
+        # before reading the core list, so those cores count as installed.
+        try:
+            self.repair_tilde_core_dir()
+        except Exception as e:
+            print(f"⚠️  '~' core check failed: {e}")
         self.thumbnails_dir = self.find_thumbnails_directory()
         self.save_dirs = self.find_retroarch_dirs()
         if self.bios_manager:
@@ -6109,7 +6115,16 @@ class RetroArchInterface:
                 for line in f:
                     line = line.strip()
                     if line.startswith(f'{key} = '):
-                        return line.split('=', 1)[1].strip().strip('"')
+                        value = line.split('=', 1)[1].strip().strip('"')
+                        # RetroArch writes paths with a literal '~'. Expanding it
+                        # here is not cosmetic: Path('~/x') is not absolute, so
+                        # callers treated it as relative to the config directory
+                        # and built <config>/~/... — which is how a downloaded
+                        # core ended up in a directory actually named '~', where
+                        # RetroArch could never see it.
+                        if value.startswith('~'):
+                            value = str(Path(value).expanduser())
+                        return value
         except Exception:
             pass
         return default
@@ -6648,6 +6663,48 @@ class RetroArchInterface:
             pass
         self._buildbot_index_cache = cores
         return cores
+
+    def repair_tilde_core_dir(self):
+        """Rescue cores written into a directory literally named '~'.
+
+        Fallout from reading RetroArch's '~/...' paths without expanding them
+        (see get_retroarch_config_setting): the cores landed under
+        <config>/~/... where nothing looks for them, so the download reported
+        success and the game still would not start. Moves any core found there
+        into the real cores directory and removes the bogus tree.
+
+        Returns the list of core filenames moved.
+        """
+        moved = []
+        cfg_dir = self.find_retroarch_config_dir()
+        if not cfg_dir:
+            return moved
+        bogus = Path(cfg_dir) / '~'
+        if not bogus.is_dir():
+            return moved
+        dest = self.find_writable_cores_directory()
+        try:
+            for core in bogus.rglob(_CORE_GLOB):
+                if not dest:
+                    break
+                target = Path(dest) / core.name
+                if target.exists():
+                    core.unlink()
+                else:
+                    shutil.move(str(core), str(target))
+                moved.append(core.name)
+            # Only remove it when nothing of the user's is in there. Testing for
+            # FILES specifically — a glob like '*.*' matches the directory named
+            # 'org.libretro.RetroArch' and would leave the tree behind forever.
+            if not any(p.is_file() for p in bogus.rglob('*')):
+                shutil.rmtree(bogus, ignore_errors=True)
+        except Exception as e:
+            print(f"⚠️  Could not tidy the '~' core directory: {e}")
+        if moved:
+            print(f"🔧 Moved {len(moved)} core(s) out of a stray '~' folder: "
+                  f"{', '.join(moved)}")
+            self.cores_dir = self.find_cores_directory()
+        return moved
 
     def find_writable_cores_directory(self):
         """Where a downloaded core should land — which is NOT always where
