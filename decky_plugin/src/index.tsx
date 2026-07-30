@@ -1558,6 +1558,9 @@ type EmuStatus = {
   bios_dir: string;
   // Raw configured values by kind — '' means "not set, we detect it".
   configured_paths: Record<string, string>;
+  // What each folder would be with nothing chosen, so a row can offer to go
+  // back to it. '' means "clear it and let detection answer".
+  default_paths: Record<string, string>;
   // Whether Ludo can install an emulator itself. False on Windows, without
   // flatpak, or as root — the reason is what we show instead of the button.
   install: { available: boolean; reason: string };
@@ -1589,6 +1592,7 @@ async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
           save_dirs: r.save_dirs || {},
           bios_dir: r.bios_dir || '',
           configured_paths: r.configured_paths || {},
+          default_paths: r.default_paths || {},
           install: r.emulator_install || { available: false, reason: '' },
         });
       }
@@ -2479,6 +2483,80 @@ function UserMenuModal({ username, role, avatar, closeModal }:
   );
 }
 
+// Per-folder actions, in the account-menu chrome. A on a folder row opens this
+// rather than jumping straight into the picker: choosing a folder is only half
+// of what people want to do with one, and "back to the default" needs to say
+// what the default IS before you commit to it.
+function FolderActionsModal({ label, current, def, isDefault, onChoose, onReset, closeModal }:
+  {
+    label: string; current: string; def: string; isDefault: boolean;
+    onChoose: () => void; onReset: () => void; closeModal?: () => void;
+  }) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60);
+    return () => clearTimeout(t);
+  }, []);
+  const act = (f: () => void) => { closeModal?.(); f(); };
+  return (
+    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}
+      className="romm-modal-collapse" modalClassName="romm-modal-collapse">
+      <Focusable noFocusRing className="romm-ui"
+        onCancelButton={() => closeModal?.()}
+        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
+        style={{
+          position: 'fixed', inset: 0, zIndex: 9999,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(7,7,15,0.45)',
+          WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
+        }}>
+        <style>{`
+          ${V2_FOCUS_STYLE}
+          .romm-modal-collapse, .romm-modal-collapse > div {
+            background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important;
+          }
+          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }
+        `}</style>
+        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
+        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
+          position: 'relative', width: '380px', maxWidth: '92vw', boxSizing: 'border-box',
+          fontFamily: V2.font, color: V2.fg, padding: '8px',
+          display: 'flex', flexDirection: 'column',
+          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
+          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
+          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
+          boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
+          maxHeight: '82vh', overflowY: 'auto',
+          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
+        }}>
+          <div style={{ padding: '8px 10px 10px', minWidth: 0 }}>
+            <div style={{ fontSize: '14px', fontWeight: 700, lineHeight: 1.3 }}>{label}</div>
+            <div style={{
+              fontSize: '11px', color: V2.fgMuted, marginTop: '3px', wordBreak: 'break-all',
+            }}>{current || 'Not set'}</div>
+          </div>
+          <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
+          <UserMenuRow icon={<FaBoxOpen size={14} />} label="Choose a folder…"
+            onSelect={() => act(onChoose)} />
+          {/* Only when it would actually change something — a reset that is a
+              no-op is noise, and worse, it implies the current value is wrong. */}
+          {!isDefault && (
+            <UserMenuRow icon={<FaUndo size={14} />}
+              label={def ? 'Use the default folder' : 'Back to auto-detect'}
+              onSelect={() => act(onReset)} />
+          )}
+          {!isDefault && def && (
+            <div style={{
+              padding: '2px 12px 8px', fontSize: '10.5px', color: V2.fgFaint,
+              wordBreak: 'break-all',
+            }}>{def}</div>
+          )}
+        </Focusable>
+      </Focusable>
+    </ModalRoot>
+  );
+}
+
 // ── Missing-core picker ──────────────────────────────────────────────────────
 // A launch that fails for a missing core is fixable right there, so instead of a
 // toast that only names the problem, offer the fix: install the recommended core
@@ -2492,6 +2570,10 @@ type CoreGap = {
   can_download: boolean;
   download_reason: string;
 };
+
+// Alternatives shown without asking. Two rows cost less attention than a row
+// that says "two more rows in here".
+const INLINE_CORES = 2;
 
 function coreLabel(name: string): string {
   // Buildbot names are like 'mupen64plus_next' — readable enough once the
@@ -2612,12 +2694,19 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
             <>
               <CoreOption core={recommended} recommended busy={busy === recommended}
                 disabled={!!busy} onSelect={() => install(recommended)} />
-              {others.length > 0 && !showAll && (
+              {/* One or two alternatives are shorter than the row that would
+                  hide them, so show them. Collapse only when the list is long
+                  enough that it would bury the recommendation. */}
+              {others.length > 0 && others.length <= INLINE_CORES && others.map((c) => (
+                <CoreOption key={c} core={c} busy={busy === c} disabled={!!busy}
+                  onSelect={() => install(c)} />
+              ))}
+              {others.length > INLINE_CORES && !showAll && (
                 <UserMenuRow icon={<FaChevronRight size={13} />}
                   label={`Other cores (${others.length})`} disabled={!!busy}
                   onSelect={() => setShowAll(true)} />
               )}
-              {showAll && others.map((c) => (
+              {others.length > INLINE_CORES && showAll && others.map((c) => (
                 <CoreOption key={c} core={c} busy={busy === c} disabled={!!busy}
                   onSelect={() => install(c)} />
               ))}
@@ -8741,6 +8830,7 @@ function FoldersSection() {
   if (!status) return null;
 
   const cfg = status.configured_paths || {};
+  const defaults = status.default_paths || {};
   const stale = status.stale_paths || [];
   const staleFor = (kind: string) => stale.find((p) => p.kind === kind);
 
@@ -8769,6 +8859,7 @@ function FoldersSection() {
           core_count: r.core_count ?? status.core_count,
           stale_paths: r.stale_paths || [], save_dirs: r.save_dirs || {},
           bios_dir: r.bios_dir || '', configured_paths: r.configured_paths || {},
+          default_paths: r.default_paths || status.default_paths || {},
         });
         toaster.toast({ title: 'Folders', body: value ? 'Folder updated' : 'Back to auto-detect' });
       } else {
@@ -8798,6 +8889,22 @@ function FoldersSection() {
       } else toaster.toast({ title: 'Folders', body: r?.message || 'Could not update' });
     } catch { toaster.toast({ title: 'Folders', body: 'Could not update' }); }
     finally { setBusy(null); }
+  };
+
+  // A on a row opens the actions menu (choose / back to default) rather than the
+  // picker directly — see FolderActionsModal.
+  const openActions = (kind: string, label: string, inUse: string) => {
+    const def = defaults[kind] ?? '';
+    const configured = cfg[kind] || '';
+    showModal(
+      <FolderActionsModal
+        label={label} current={inUse} def={def}
+        // Already default when nothing is configured, or when what IS configured
+        // is exactly what we would have chosen anyway.
+        isDefault={!configured || configured === def}
+        onChoose={() => void pick(kind, inUse)}
+        onReset={() => void write(kind, def)} />
+    );
   };
 
   const row = (kind: string, label: string, icon: any, hint: string) => {
@@ -8831,7 +8938,7 @@ function FoldersSection() {
             </span>
           </span>
         )}
-        onClick={busy ? undefined : () => (bad ? fixStale(bad) : pick(kind, inUse))}
+        onClick={busy ? undefined : () => (bad ? fixStale(bad) : openActions(kind, label, inUse))}
         right={bad
           ? <span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Fix</span>
           : <FaChevronRight size={12} style={{ color: V2.fgFaint }} />} />

@@ -5060,6 +5060,13 @@ class RetroArchInterface:
                 kind: self.settings.get(section, key, '')
                 for section, key, _label, kind in self._PATH_SETTINGS
             },
+            # What each folder would be if the user had never chosen one, so the
+            # UI can offer "use the default" and show what that means. '' means
+            # "clear it and let detection answer".
+            'default_paths': {
+                kind: self._suggested_path(kind)
+                for _section, _key, _label, kind in self._PATH_SETTINGS
+            },
             'core_download': self.core_download_support(),
             # Whether WE can install an emulator for them. Windows, a missing
             # flatpak, or running as root all mean the answer is "not from here",
