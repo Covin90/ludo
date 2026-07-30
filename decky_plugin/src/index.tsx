@@ -1609,11 +1609,40 @@ function useEmulatorStatus(): EmuStatus | null {
   return _emuStatus;
 }
 
-// The save folder is the one stale path that breaks things silently: sync keeps
-// reporting success while writing into a directory nothing reads. That alone
-// earns a Home banner; the rest wait to be noticed on the Emulator page.
-function emuSaveStale(s: EmuStatus | null): boolean {
-  return !!s?.stale_paths?.some((p) => p.kind === 'saves');
+// Every stale path now earns a Home banner. That was once saves-only, on the
+// grounds that only saves fail silently — but staleness itself was then loose
+// enough to flag a ROM folder that worked fine, and interrupting for a
+// non-problem is what the restraint was really guarding against. With that false
+// positive gone (see stale_emulator_paths), the survivors all genuinely break
+// the app: saves lose progress, BIOS blocks the games that need it, and a dead
+// executable override stops launching altogether.
+// Headline and detail per kind, worst first. Saves lead when several are broken:
+// it's the only one that loses data you can't recreate.
+const _STALE_RANK: Record<string, number> = { saves: 0, exe: 1, bios: 2, roms: 3 };
+
+function staleCopy(stale: EmuStalePath[]): { title: string; body: string } {
+  const worst = [...stale].sort(
+    (a, b) => (_STALE_RANK[a.kind] ?? 9) - (_STALE_RANK[b.kind] ?? 9))[0];
+  const rest = stale.length < 2 ? ''
+    : stale.length === 2 ? ' One other folder needs the same fix.'
+      : ` ${stale.length - 1} other folders need the same fix.`;
+  switch (worst?.kind) {
+    case 'saves':
+      return { title: 'Saves are going to the wrong place',
+        body: 'Your save folder still points into an emulator that was removed. '
+          + 'Saves are being written where nothing will read them.' + rest };
+    case 'bios':
+      return { title: 'BIOS files are going to the wrong place',
+        body: 'Your BIOS folder still points into an emulator that was removed, so '
+          + 'games that need a BIOS will not start.' + rest };
+    case 'exe':
+      return { title: 'Your emulator path is broken',
+        body: 'Ludo is set to launch an emulator that is no longer there, so nothing '
+          + 'will start until this is cleared.' + rest };
+    default:
+      return { title: 'A folder points at a removed emulator',
+        body: 'One of your folders belongs to an emulator that is gone.' + rest };
+  }
 }
 
 // ── RetroArch install ───────────────────────────────────────────────────────
@@ -4369,35 +4398,40 @@ function EmulatorBanner() {
   const [fixing, setFixing] = useState(false);
   if (!status) return null;
 
-  const saveStale = emuSaveStale(status);
-  if (status.installed && !saveStale && !install.active) return null;
+  const stale = status.stale_paths || [];
+  if (status.installed && !stale.length && !install.active) return null;
+  const copy = staleCopy(stale);
 
   const tone = status.installed ? V2.warning : V2.brandHover;
-  const fixSaves = async () => {
+  // Fixes everything the banner is complaining about, since that is what it now
+  // reports. BIOS repair only redirects where new files go — it moves nothing —
+  // so the toast says which folders changed rather than implying a migration.
+  const fixStale = async () => {
     setFixing(true);
+    const title = 'Emulator folders';
     try {
-      const keys = (status.stale_paths || [])
-        .filter((p) => p.kind === 'saves').map((p) => `${p.section}.${p.key}`);
+      const keys = stale.map((p) => `${p.section}.${p.key}`);
       const r = await repairEmulatorPaths(keys);
       // success with nothing repaired is not success — say so rather than
       // congratulating the user next to a warning that hasn't moved.
       if (r?.success && r.repaired?.length) {
         publishEmulatorStatus({ ...status, stale_paths: r.stale_paths || [] });
-        toaster.toast({ title: 'Save folder', body: 'Pointed back at your emulator' });
+        const names = r.repaired.map((x: any) => x.label || x.key).join(', ');
+        toaster.toast({ title, body: `Pointed back at your emulator: ${names}` });
       } else if (r?.success) {
         await loadEmulatorStatus(true);
-        toaster.toast({ title: 'Save folder', body: 'Nothing changed — check Settings ▸ Emulator & folders' });
+        toaster.toast({ title, body: 'Nothing changed — check Settings ▸ Emulator & folders' });
       } else {
-        toaster.toast({ title: 'Save folder', body: r?.message || 'Could not update it' });
+        toaster.toast({ title, body: r?.message || 'Could not update them' });
       }
-    } catch { toaster.toast({ title: 'Save folder', body: 'Could not update it' }); }
+    } catch { toaster.toast({ title, body: 'Could not update them' }); }
     finally { setFixing(false); }
   };
 
   const body = install.active
     ? (install.pct != null ? `${install.phase || 'Installing RetroArch'} · ${install.pct}%` : (install.phase || 'Installing RetroArch…'))
     : status.installed
-      ? 'Your save folder still points into an emulator that was removed. Saves are being written where nothing will read them.'
+      ? copy.body
       : status.install.available
         ? 'Downloading and syncing still work — you just need an emulator to play. Installing RetroArch takes a few minutes.'
         // Can't install from here (Windows, no flatpak, running as root): say why
@@ -4421,7 +4455,7 @@ function EmulatorBanner() {
         <div style={{ flex: '1 1 auto', minWidth: 0 }}>
           <div style={{ fontSize: '14px', fontWeight: 700 }}>
             {install.active ? 'Installing RetroArch'
-              : status.installed ? 'Saves are going to the wrong place'
+              : status.installed ? copy.title
                 : 'No emulator installed'}
           </div>
           <div style={{ fontSize: '12px', color: V2.fgMuted, lineHeight: 1.4, marginTop: '2px' }}>{body}</div>
@@ -4430,8 +4464,8 @@ function EmulatorBanner() {
           <Focusable noFocusRing flow-children="horizontal" style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
             {status.installed ? (
               <>
-                <GameActionButton variant="emphasized" disabled={fixing} onClick={fixSaves}
-                  label={fixing ? 'Fixing…' : 'Fix'}
+                <GameActionButton variant="emphasized" disabled={fixing} onClick={fixStale}
+                  label={fixing ? 'Fixing…' : stale.length > 1 ? 'Fix all' : 'Fix'}
                   icon={fixing
                     ? <FaSync size={14} style={{ animation: 'spin 1s linear infinite' }} />
                     : <FaCheck size={14} />} />
