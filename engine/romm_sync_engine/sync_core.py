@@ -5009,6 +5009,10 @@ class RetroArchInterface:
             self.repair_tilde_core_dir()
         except Exception as e:
             print(f"⚠️  '~' core check failed: {e}")
+        try:
+            self.repair_retroarch_assets_dir()
+        except Exception as e:
+            print(f"⚠️  assets check failed: {e}")
         self.thumbnails_dir = self.find_thumbnails_directory()
         self.save_dirs = self.find_retroarch_dirs()
         if self.bios_manager:
@@ -5325,6 +5329,16 @@ class RetroArchInterface:
             out['reason'] = 'no config directory'
             return out
         cfg_path = Path(cfg_dir) / 'retroarch.cfg'
+        if not cfg_path.exists():
+            # NEVER create it. RetroArch initialises a fresh config on its first
+            # run — that is when it points assets_directory at the assets it
+            # ships with. Finding a config already there, it skips that step and
+            # leaves the path on an empty default, so the menu falls back to a
+            # bitmap font and looks broken. Ludo creating a two-line stub did
+            # exactly that. Wait for RetroArch to write its own; every caller
+            # here runs again later (install, repair, folder change, discovery).
+            out['reason'] = 'RetroArch has not written its config yet'
+            return out
 
         # If the user has chosen a save folder in RetroArch, that decision wins
         # outright and we touch nothing — not even a missing savestate_directory.
@@ -6663,6 +6677,53 @@ class RetroArchInterface:
             pass
         self._buildbot_index_cache = cores
         return cores
+
+    def repair_retroarch_assets_dir(self):
+        """Undo an assets_directory left pointing at an empty folder.
+
+        The fallout of the stub config above: RetroArch never ran its first-time
+        setup, so its menu assets path names a directory nothing ever filled, and
+        the UI renders in the fallback bitmap font. The flatpak ships the real
+        assets inside the sandbox, so point it back there. Only acts when the
+        configured directory is genuinely empty or missing — a user who has
+        downloaded assets themselves is left alone.
+
+        Returns True when the config was changed.
+        """
+        exe = (self.retroarch_executable or '').lower()
+        if 'org.libretro.retroarch' not in exe:
+            return False        # only the flatpak has a known in-sandbox path
+        cfg_dir = self.find_retroarch_config_dir()
+        if not cfg_dir:
+            return False
+        cfg_path = Path(cfg_dir) / 'retroarch.cfg'
+        if not cfg_path.exists():
+            return False
+        current = self.get_retroarch_config_setting('assets_directory', '')
+        if current:
+            p = Path(current)
+            if p.is_dir() and any(p.iterdir()):
+                return False    # they have assets; nothing to fix
+        sandbox_assets = '/app/share/libretro/assets'
+        try:
+            lines = cfg_path.read_text(encoding='utf-8', errors='replace').splitlines(keepends=True)
+            out_lines, done = [], False
+            for line in lines:
+                if line.split('=', 1)[0].strip() == 'assets_directory':
+                    out_lines.append(f'assets_directory = "{sandbox_assets}"\n')
+                    done = True
+                else:
+                    out_lines.append(line)
+            if not done:
+                out_lines.append(f'assets_directory = "{sandbox_assets}"\n')
+            tmp = cfg_path.with_suffix('.cfg.ludo-tmp')
+            tmp.write_text(''.join(out_lines), encoding='utf-8')
+            os.replace(tmp, cfg_path)
+            print(f"🔧 Pointed RetroArch's menu assets back at {sandbox_assets}")
+            return True
+        except Exception as e:
+            print(f"⚠️  Could not fix assets_directory: {e}")
+            return False
 
     def repair_tilde_core_dir(self):
         """Rescue cores written into a directory literally named '~'.
