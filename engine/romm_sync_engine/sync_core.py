@@ -10681,7 +10681,17 @@ class AutoSyncManager:
                 
                 if downloads_successful > 0:
                     self.log(f"🎮 {game_name} updated with latest server saves/states")
-                    self.retroarch.send_notification(f"Synced: {game_name} ({downloads_successful} file{'s' if downloads_successful != 1 else ''})")
+                    # Say what was ALREADY current too. A second pass (a retry
+                    # after installing a core, say) legitimately reports "1
+                    # file" when the pass before it fetched the other eight —
+                    # accurate per pass, but on screen it reads as though only
+                    # one file ever synced.
+                    files = (f"{downloads_successful} file"
+                             f"{'s' if downloads_successful != 1 else ''}")
+                    already = conflicts_detected - downloads_successful
+                    if already > 0:
+                        files += f", {already} already current"
+                    self.retroarch.send_notification(f"Synced: {game_name} ({files})")
                 elif conflicts_detected > 0:
                     self.log(f"🛡️ {game_name} local saves/states protected from overwrite")
                 else:
