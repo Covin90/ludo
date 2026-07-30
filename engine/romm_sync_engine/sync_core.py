@@ -5002,6 +5002,17 @@ class RetroArchInterface:
         rather than auto-corrected — someone may legitimately keep ROMs in
         ~/retrodeck — with a suggested replacement the UI can apply on request
         ('' means "clear it and go back to auto-detection").
+
+        What counts as stale is per-kind, because the four fail differently and
+        only three fail at all. Belonging to a removed emulator is not itself a
+        failure; writing where the LIVE emulator won't read is. So a ROM folder
+        that still exists is fine — Ludo downloads into it and hands the emulator
+        an absolute file path, which RetroArch reads out of ~/retrodeck as
+        happily as RetroDECK did. Flagging it was a false positive whose one-tap
+        fix pointed downloads at an empty folder and orphaned everything already
+        there. Saves and BIOS are the real cases: both have to land in a tree the
+        live emulator actually looks in, and the executable override has to point
+        at something that exists.
         """
         stale = []
         for section, key, label, kind in self._PATH_SETTINGS:
@@ -5009,6 +5020,12 @@ class RetroArchInterface:
             if not value:
                 continue
             path = Path(value)
+            if kind == 'roms':
+                # Never stale. Not existing yet isn't a fault either — the
+                # downloader creates it on demand, and the default has usually
+                # never been written to, so an existence test just moves the
+                # false positive from "inherited" to "new".
+                continue
             if self.is_dead_install_path(path):
                 reason = 'the emulator it belonged to is no longer installed'
             elif kind == 'exe' and not path.exists():

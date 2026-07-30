@@ -8507,7 +8507,13 @@ function FoldersSection() {
         subtitle={busy === kind ? 'Saving…' : bad ? (
           <span>
             {bad.reason} · <span style={{ textDecoration: 'line-through', opacity: 0.7 }}>{bad.value}</span>
-            {' → '}<span style={{ color: V2.fg2 }}>{bad.suggested || 'auto-detect'}</span> · A to fix
+            {' → '}<span style={{ color: V2.fg2 }}>{bad.suggested || 'auto-detect'}</span>
+            {kind === 'bios' ? (
+              // Fix redirects where BIOS files GO; it moves nothing. Saying so
+              // matters when the old folder holds thousands of them.
+              <span> · A sends new BIOS files to your emulator instead. Files
+                already in that folder stay where they are.</span>
+            ) : ' · A to fix'}
           </span>
         ) : (
           <span style={{ wordBreak: 'break-all' }}>
