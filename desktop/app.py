@@ -120,15 +120,15 @@ class AppWindow:
             self.webview.set_zoom_level(zoom)
 
     def _on_key(self, _widget, event):
+        # Handlers on the window run before the key reaches the focused
+        # webview, so anything claimed here is invisible to the UI. Escape is
+        # the UI's back/cancel key, so the window must not claim it — F11 is
+        # the only fullscreen control.
         from gi.repository import Gdk
         if event.keyval == Gdk.KEY_F11:
             self._fullscreen = not self._fullscreen
             (self.window.fullscreen if self._fullscreen
              else self.window.unfullscreen)()
-            return True
-        if event.keyval == Gdk.KEY_Escape and self._fullscreen:
-            self._fullscreen = False
-            self.window.unfullscreen()
             return True
         return False
 
@@ -146,7 +146,7 @@ def main():
     threading.Thread(target=httpd.serve_forever, name="http", daemon=True).start()
 
     # Fullscreen by default (matches the Deck feel); set ROMM_FULLSCREEN=0 for a
-    # normal maximized window. F11 toggles at runtime; Escape leaves fullscreen.
+    # normal maximized window. F11 toggles fullscreen at runtime.
     fullscreen = os.environ.get("ROMM_FULLSCREEN", "1") not in ("0", "false", "no")
     app = AppWindow(f"http://{host}:{port}/", fullscreen=fullscreen)
     app.show()

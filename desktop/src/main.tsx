@@ -6,6 +6,7 @@ import { seedFocus, startGamepad } from "./shim/gamepad";
 import { ModalHost, ToastHost } from "./shim/overlays";
 import { FooterLegend } from "./shim/footer";
 import { Navigation, matchRoute, useRoutePath, useRouteRegistry } from "./shim/router";
+import { startSound } from "./shim/sound";
 import "./shim/shim.css";
 
 // Importing the plugin runs its definePlugin factory, which registers every
@@ -29,6 +30,10 @@ const getConfig = callable<[], { configured?: boolean }>("get_config");
 // Read the controller and drive focus/navigation. Safe to start once at module
 // load — it polls via requestAnimationFrame and no-ops until a pad reports in.
 startGamepad();
+
+// Deck UI sounds. Imported before the plugin (below) so __ludoSoundBase is set
+// by the time index.tsx's own playSteamSound resolves a URL.
+startSound();
 
 function App() {
   useRouteRegistry(); // re-render when routes are added or removed

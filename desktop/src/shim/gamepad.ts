@@ -19,6 +19,7 @@
 // inputs participate too.
 
 import { GamepadButtonId } from "./gamepad-buttons";
+import { playSound } from "./sound";
 
 // ── Focusable registry (button-event routing) ───────────────────────────────
 
@@ -310,6 +311,12 @@ function focusRoot(): ParentNode {
 // showContextMenu can seed on mount for an immediate highlight; move()/button()
 // call the guard below as a net in case focus later escapes the overlay.
 export function focusFirstIn(root: ParentNode): boolean {
+  // Never in mouse mode: a pointer user has no focus highlight to keep alive, so
+  // seeding one just makes a control light up (and the view scroll to it) on its
+  // own, as if a controller were driving. Reported as elements focusing
+  // themselves when only the mouse is in use. The pad/keyboard flips out of mouse
+  // mode before it needs a target, and move()/button() re-seed then.
+  if (mouseMode) return false;
   const all = (Array.from(root.querySelectorAll(FOCUS_SELECTOR)) as HTMLElement[])
     .filter(isVisible)
     // Don't land on the modal's ✕ close button — start on real content.
@@ -472,6 +479,16 @@ function focusAndReveal(el: HTMLElement, horizontal = false, smooth = true) {
   }
 }
 
+// focusAndReveal with the Deck's navigation tick. Used by move()'s landing
+// paths only — seeding and focus restoration go through focusAndReveal
+// directly, because neither is a move the user made and Steam is silent for
+// both. No-ops when the element is already focused, so a dead-end press (a move
+// that lands back on itself) doesn't click.
+function moveFocus(el: HTMLElement, horizontal = false, smooth = true) {
+  if (el !== document.activeElement) playSound("navigate");
+  focusAndReveal(el, horizontal, smooth);
+}
+
 function center(el: HTMLElement) {
   const r = el.getBoundingClientRect();
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
@@ -513,7 +530,7 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
   const rawActive = document.activeElement as HTMLElement | null;
   const active = rawActive ? fieldFootprint(rawActive) : null;
   if (!active || active === document.body) {
-    focusAndReveal(targets[0], false, smooth);
+    moveFocus(targets[0], false, smooth);
     return;
   }
   // Focus sits on a WRAPPER that encloses the targets rather than on a target
@@ -523,7 +540,7 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
   // move so the overlay looks uncontrollable. Enter from the first target
   // instead, the same as the no-origin seed above.
   if (targets.every((t) => t !== active && active.contains(t))) {
-    focusAndReveal(targets[0], false, smooth);
+    moveFocus(targets[0], false, smooth);
     return;
   }
 
@@ -534,7 +551,7 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
   // (e.g. you switched tabs, so the old cover is gone/hidden).
   if (dir === "down" && inStickyTopBar(active) && _preNavFocus &&
       document.contains(_preNavFocus) && isVisible(_preNavFocus)) {
-    focusAndReveal(_preNavFocus, false, smooth);
+    moveFocus(_preNavFocus, false, smooth);
     return;
   }
 
@@ -683,12 +700,12 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
       }
       // Remember the cover we're leaving so a later Down returns to it.
       _preNavFocus = active;
-      focusAndReveal(tab, false, smooth);
+      moveFocus(tab, false, smooth);
       return;
     }
   }
 
-  if (best) focusAndReveal(best, horizontal, smooth);
+  if (best) moveFocus(best, horizontal, smooth);
 }
 
 // A sticky/fixed bar counts as "pinned to the top" when its box sits within this
@@ -805,6 +822,10 @@ declare global {
 // NOT the programmatic .focus()/.click() this layer uses) and hide the cursor;
 // restore both the instant the real mouse moves.
 let mouseMode = true;
+// True while the pointer is the active input. Exported so the React shim can skip
+// its own focus grabs (a Focusable's autoFocus, restoring a modal's opener) for
+// the same reason focusFirstIn does: with a mouse there's nothing to highlight.
+export function inMouseMode(): boolean { return mouseMode; }
 
 // ── Input mode (drives WHICH glyph set the footer draws) ─────────────────────
 //
@@ -1045,6 +1066,13 @@ export function startGamepad() {
   function button(id: number, pressed: boolean) {
     if (pressed) { enterGamepadMode(); ensureFocusInOverlay(); }
     if (pressed) {
+      // Sound the face buttons Steam sounds on the Deck. OK is played here on
+      // PRESS even though activation happens on release: the click feedback has
+      // to be immediate, and sound.ts's dedupe absorbs the synthetic .click()
+      // that follows. B is the app-wide back gesture whether or not anything
+      // handles it — a silent B reads as a dropped press.
+      if (id === GamepadButtonId.OK) playSound("activate");
+      else if (id === GamepadButtonId.CANCEL) playSound("back");
       routeButton("down", id, false,
         id === GamepadButtonId.OK ? undefined : dedicatedFor(id));
     } else {

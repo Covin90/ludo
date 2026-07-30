@@ -59,7 +59,7 @@ What the shell reproduces from `app.py`:
 - **Zoom-to-fit** — the UI is authored for the Deck's 1280×800 gamepad viewport,
   so `webContents.setZoomFactor` scales the page so the 800px design height fills
   the window height, re-applied on every resize/(un)fullscreen.
-- **Fullscreen by default** — F11 toggles, Escape leaves fullscreen. Set
+- **Fullscreen by default** — F11 toggles it (Escape is the UI's back key). Set
   `ROMM_FULLSCREEN=0` for a normal window.
 - **Gamepad** — `electron/preload.cjs` polls Chromium's native
   `navigator.getGamepads()` and drives the same `window.__rommGamepad` API the UI

@@ -12,7 +12,7 @@
 //   • No __NV_DISABLE_EXPLICIT_SYNC: that's a WebKitGTK/NVIDIA-Wayland bug and
 //     doesn't apply to Electron's Chromium renderer.
 
-const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, protocol, net: enet } = require("electron");
 const { spawn } = require("child_process");
 const net = require("net");
 const path = require("path");
@@ -36,6 +36,70 @@ if (process.platform === "linux") {
     app.commandLine.appendSwitch("ozone-platform-hint", ozone);
     app.commandLine.appendSwitch("enable-features", "WaylandWindowDecorations");
   }
+}
+
+// Chromium blocks audio until the document has been "activated" by a real
+// click/keypress. The UI's navigation sounds are triggered by the CONTROLLER,
+// which is injected programmatically and never counts as activation — so on a
+// pad-only session the app would stay mute forever. This is a kiosk-style app
+// the user launched deliberately, not a web page that might autoplay an ad.
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
+// ── Stable app origin ────────────────────────────────────────────────────────
+//
+// The backend binds a random free port each launch, so loading it directly gives
+// the page a different origin every time (http://127.0.0.1:<random>) — and
+// localStorage/sessionStorage/IndexedDB are keyed by origin. Every launch
+// therefore started with empty web storage, which silently defeated all the
+// renderer's caches (the account-identity pill, platform icons, the browse
+// lists): they wrote to a bucket nothing would ever read again.
+//
+// So the window loads `ludo://app/` instead, and this scheme proxies every
+// request through to whatever port the backend actually got. The origin is now
+// constant across launches, web storage persists, and the renderer needs no
+// changes — its requests are all same-origin relative paths (/api/…).
+const APP_SCHEME = "ludo";
+const APP_ORIGIN = `${APP_SCHEME}://app`;
+// Must be declared before `ready`. `standard` is what makes it a real origin
+// (and makes relative URLs and history.pushState resolve); the rest let fetch,
+// XHR and streamed media work as they do over http.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: APP_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
+  },
+]);
+
+// Point the scheme at the live backend. Called once the port is known.
+function registerAppScheme(host, port) {
+  protocol.handle(APP_SCHEME, async (request) => {
+    const src = new URL(request.url);
+    const target = `http://${host}:${port}${src.pathname}${src.search}`;
+    // Forward only the headers the backend cares about. Passing the request's own
+    // headers wholesale fails: they carry ludo:// values (Referer, Origin) that
+    // Chromium's network stack rejects on an http request, and every subresource
+    // came back ERR_FAILED.
+    const headers = {};
+    for (const name of ["accept", "accept-language", "content-type", "range", "cache-control"]) {
+      const v = request.headers.get(name);
+      if (v) headers[name] = v;
+    }
+    const init = { method: request.method, headers, redirect: "follow" };
+    if (request.body) {
+      init.body = request.body;
+      // Required when a request body is a stream, which it always is here.
+      init.duplex = "half";
+    }
+    try {
+      return await enet.fetch(target, init);
+    } catch (err) {
+      // The backend died or hasn't finished binding. A 502 surfaces as a failed
+      // fetch in the renderer (which already handles RPC failures) instead of a
+      // silently hanging request.
+      console.error(`[proxy] ${request.method} ${src.pathname} failed:`, err);
+      return new Response("backend unavailable", { status: 502 });
+    }
+  });
 }
 
 const DESKTOP_DIR = path.resolve(__dirname, "..");
@@ -206,14 +270,13 @@ function createWindow(url, fullscreen) {
   win.on("enter-full-screen", applyZoom);
   win.on("leave-full-screen", applyZoom);
 
-  // F11 toggles fullscreen; Escape leaves it — matching app.py._on_key.
+  // F11 toggles fullscreen — matching app.py._on_key. before-input-event fires
+  // ahead of the renderer, so anything preventDefault'd here never reaches the
+  // UI; Escape is the UI's back/cancel key, so the window must not claim it.
   win.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown") return;
     if (input.key === "F11") {
       win.setFullScreen(!win.isFullScreen());
-      event.preventDefault();
-    } else if (input.key === "Escape" && win.isFullScreen()) {
-      win.setFullScreen(false);
       event.preventDefault();
     }
   });
@@ -255,14 +318,20 @@ async function boot() {
   await startBackend(host, port);
 
   // Fullscreen by default (matches the Deck feel); ROMM_FULLSCREEN=0 for a normal
-  // window. F11 toggles at runtime; Escape leaves fullscreen.
+  // window. F11 toggles fullscreen at runtime.
   const fullscreen = !["0", "false", "no"].includes(
     (process.env.ROMM_FULLSCREEN || "1").toLowerCase()
   );
 
   // ROMM_URL lets a dev point at the Vite server (which proxies /api to the
-  // backend on ROMM_PORT); default loads the backend-served built UI.
-  const url = process.env.ROMM_URL || `http://${host}:${port}/`;
+  // backend on ROMM_PORT) — that's already a stable origin, so it skips the
+  // proxy scheme. Default loads the backend-served built UI through ludo://,
+  // for an origin that survives the port changing between launches.
+  let url = process.env.ROMM_URL;
+  if (!url) {
+    registerAppScheme(host, port);
+    url = `${APP_ORIGIN}/`;
+  }
   createWindow(url, fullscreen);
 }
 

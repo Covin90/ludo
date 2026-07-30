@@ -74,6 +74,90 @@ except Exception:
 
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "dist"
 
+# ── Deck UI sounds ──────────────────────────────────────────────────────────
+#
+# The plugin plays Steam's own navigation .wav files, which Steam serves to its
+# embedded browser from https://steamloopback.host/sounds/. That host doesn't
+# exist outside Steam, so the desktop app serves the same files from the local
+# Steam install instead (see the UI's playSteamSound). We deliberately don't
+# ship copies: these are Valve's assets, and an install without Steam simply
+# stays silent — playSteamSound swallows the 404.
+#
+# Every packaging of Steam keeps its client files somewhere different, and each
+# one hides the same steamui/sounds under a different prefix:
+#
+#   native            ~/.local/share/Steam        (~/.steam/steam symlinks here)
+#   Flatpak           ~/.var/app/com.valvesoftware.Steam/{data,.local/share}/Steam
+#   Snap              ~/snap/steam/common/.local/share/Steam
+#
+# Relative to a home directory, because Ludo itself may be sandboxed: inside a
+# Flatpak the real home is /run/host/home/<user>, so each candidate is tried
+# under every plausible home (see steam_homes).
+STEAM_SUBPATHS = [
+    ".local/share/Steam",
+    ".steam/steam",
+    ".steam/root",
+    # Flatpak Steam. Older releases put the client under data/, current ones
+    # under the sandboxed XDG data dir; both still occur in the wild.
+    ".var/app/com.valvesoftware.Steam/data/Steam",
+    ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+    # Snap Steam. `common` survives refreshes (`current` is a symlink into the
+    # active revision), so prefer it — but accept either.
+    "snap/steam/common/.local/share/Steam",
+    "snap/steam/current/.local/share/Steam",
+]
+# Prefix-less installs, tried after the per-home ones.
+STEAM_SYSTEM_DIRS = [
+    Path("/usr/share/steam"),
+    Path("/usr/lib/steam"),
+]
+
+
+def steam_homes() -> list[Path]:
+    """Home directories that might hold a Steam install.
+
+    $HOME first. If Ludo is running sandboxed, the user's real home is exposed
+    at /run/host/home/<user> (Flatpak) — where Steam actually lives, whichever
+    way Steam itself was packaged.
+    """
+    homes = [Path.home()]
+    host_home = Path("/run/host/home") / Path.home().name
+    if host_home.is_dir():
+        homes.append(host_home)
+    # A sandboxed Ludo may also see the whole host root mounted at /run/host.
+    homes.append(Path("/run/host") / Path.home().relative_to("/"))
+    return homes
+
+
+def steam_sound_dirs() -> list[Path]:
+    dirs = [h / sub / "steamui/sounds" for h in steam_homes() for sub in STEAM_SUBPATHS]
+    dirs += [d / "steamui/sounds" for d in STEAM_SYSTEM_DIRS]
+    dirs += [Path("/run/host") / str(d).lstrip("/") / "steamui/sounds"
+             for d in STEAM_SYSTEM_DIRS]
+    return dirs
+
+
+_SOUND_DIR: Path | None = None
+_SOUND_DIR_RESOLVED = False
+
+
+def sound_dir() -> Path | None:
+    """First existing Steam sounds directory, resolved once per run."""
+    global _SOUND_DIR, _SOUND_DIR_RESOLVED
+    if not _SOUND_DIR_RESOLVED:
+        _SOUND_DIR_RESOLVED = True
+        for d in steam_sound_dirs():
+            # Several candidates are symlinks into each other (~/.steam/steam →
+            # ~/.local/share/Steam); resolve so the log names the real location.
+            try:
+                if d.is_dir():
+                    _SOUND_DIR = d.resolve()
+                    break
+            except OSError:
+                continue  # unreadable sandbox mount — just try the next one
+        logging.info(f"[sounds] {_SOUND_DIR or 'no Steam install found — silent'}")
+    return _SOUND_DIR
+
 
 # ── Async engine on a background loop ───────────────────────────────────────
 
@@ -265,8 +349,36 @@ class Handler(BaseHTTPRequestHandler):
             # than 500ing, so call sites' try/catch can present it.
             self._json(200, {"error": str(e)})
 
+    def _sound(self, name: str):
+        """Serve one Steam UI .wav by bare filename.
+
+        Name-only (no separators, .wav only) keeps this from becoming a read
+        primitive for the whole filesystem. A missing file or no Steam install
+        is a plain 404: the UI treats every sound as optional.
+        """
+        d = sound_dir()
+        if d is None or "/" in name or "\\" in name or not name.endswith(".wav"):
+            self.send_error(404)
+            return
+        f = d / name
+        if not f.is_file():
+            self.send_error(404)
+            return
+        data = f.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(data)))
+        # These never change under us; let the renderer keep them in its cache
+        # rather than re-fetching a click sound on every navigation.
+        self.send_header("Cache-Control", "public, max-age=604800")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/sounds/"):
+            self._sound(unquote(parsed.path[len("/sounds/"):]))
+            return
         rel = unquote(parsed.path.lstrip("/")) or "index.html"
         target = (STATIC_ROOT / rel).resolve()
         # SPA + traversal guard: anything outside dist/, or any unknown path,

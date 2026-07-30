@@ -2093,6 +2093,37 @@ function NavLaunchButton({ iconSrc, label, onActivate }:
 
 type NavId = 'home' | 'platforms' | 'collections' | 'search';
 
+// Remembered account identity (username / role / avatar data URI), mirrored to
+// localStorage the same way the browse caches are. The identity is the same on
+// every launch, so serving last session's copy paints the real pill on the first
+// frame instead of a placeholder; the fetch below still runs and overwrites it, so
+// a renamed account or a new avatar corrects itself as soon as the answer lands.
+// No TTL — a revalidation happens every launch by construction. Cleared on logout
+// (see handleLogout) so the next user never sees the previous one's pill.
+type NavIdentity = { username: string; role: string; avatar: string | null };
+const _LS_IDENTITY = 'romm:identity:v1';
+function readIdentity(): NavIdentity | null {
+  if (!_lsAvail) return null;
+  try {
+    const o = JSON.parse(localStorage.getItem(_LS_IDENTITY) || 'null');
+    if (o && typeof o.username === 'string' && o.username)
+      return { username: o.username, role: typeof o.role === 'string' ? o.role : '', avatar: o.avatar || null };
+  } catch { }
+  return null;
+}
+function writeIdentity(id: NavIdentity) {
+  if (!_lsAvail) return;
+  // An avatar is a data URI; a huge one would blow the quota and take the browse
+  // caches down with it, so skip persisting anything oversized (the pill just
+  // falls back to the initial for one frame, then the fetched image lands).
+  const avatar = id.avatar && id.avatar.length < 512 * 1024 ? id.avatar : null;
+  try { localStorage.setItem(_LS_IDENTITY, JSON.stringify({ ...id, avatar })); } catch { }
+}
+export function clearIdentityCache() {
+  if (!_lsAvail) return;
+  try { localStorage.removeItem(_LS_IDENTITY); } catch { }
+}
+
 // Everything the top-bar chrome needs (brand marks, account identity, RetroDECK
 // launch button state). Lifted into a hook so the owning page (LibraryGroupsPage)
 // can drive both the V2NavBar rendering AND the controller shortcuts / footer
@@ -2105,9 +2136,15 @@ export type NavChrome = {
 function useNavChrome(): NavChrome {
   const [iso, setIso] = useState<string | null>(null);
   const [word, setWord] = useState<string | null>(null);
-  const [username, setUsername] = useState<string>('Guest');
-  const [role, setRole] = useState<string>('');
-  const [avatar, setAvatar] = useState<string | null>(null);
+  // Last session's identity if we have one, else empty — NOT 'Guest': the fetch
+  // answers a beat after first paint, and seeding the real default made every
+  // cold launch flash "Guest" + a "G" avatar before snapping to the actual
+  // account. While empty the pill renders a neutral placeholder, and 'Guest' is
+  // only set once we know there's no account to show.
+  const cached = useRef(readIdentity()).current;
+  const [username, setUsername] = useState<string>(cached?.username || '');
+  const [role, setRole] = useState<string>(cached?.role || '');
+  const [avatar, setAvatar] = useState<string | null>(cached?.avatar || null);
   const [rdEnabled, setRdEnabled] = useState<boolean>(false);
   const [rdIcon, setRdIcon] = useState<string | null>(null);
   useEffect(() => {
@@ -2120,14 +2157,33 @@ function useNavChrome(): NavChrome {
         if (alive) setRdEnabled(!!on);
         if (on) { const r = await getRetrodeckLogo(); if (alive) setRdIcon(r?.data_uri || null); }
       } catch { }
+      // The fetched values are authoritative over the cached seed above, and
+      // whatever they resolve to becomes next launch's seed. `fresh` starts from
+      // the cache so a failed leg keeps the remembered value rather than
+      // persisting a blank over a good one.
+      const fresh: NavIdentity = {
+        username: cached?.username || '', role: cached?.role || '', avatar: cached?.avatar || null,
+      };
+      let known = false;
       try {
         const acc = await getAccountUsername();
-        if (alive && acc?.username) setUsername(acc.username);
-        if (alive && acc?.role) setRole(acc.role);
-      } catch { }
+        fresh.username = acc?.username || 'Guest';
+        fresh.role = acc?.role || '';
+        known = true;
+        if (alive) { setUsername(fresh.username); setRole(fresh.role); }
+      } catch { if (alive && !fresh.username) setUsername('Guest'); }
       // Avatar fetched raw by the backend (get_avatar) — keeps transparency and
       // logs a wrong path/404 instead of silently showing the initial fallback.
-      try { const av = await getAvatar(); if (alive) setAvatar(av?.data_uri || null); } catch { }
+      try {
+        const av = await getAvatar();
+        fresh.avatar = av?.data_uri || null;
+        if (alive) setAvatar(fresh.avatar);
+      } catch { }
+      // Only remember a real identity: 'Guest' means signed out, and caching it
+      // would paint "Guest" on the next launch before the fetch corrects it —
+      // exactly the flash this cache exists to remove.
+      if (known && fresh.username && fresh.username !== 'Guest') writeIdentity(fresh);
+      else if (known) clearIdentityCache();
     })();
     return () => { alive = false; };
   }, []);
@@ -2277,9 +2333,11 @@ function UserAvatar({ username, avatar, size }: { username: string; avatar: stri
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       fontSize: `${Math.round(size * 0.43)}px`, fontWeight: 700, color: V2.fg2, overflow: 'hidden',
     }}>
+      {/* No initial while the username is still unknown — an empty circle reads
+          as "loading", a letter reads as a real (wrong) account. */}
       {avatar
         ? <img src={avatar} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
-        : (username[0] || 'G').toUpperCase()}
+        : username.slice(0, 1).toUpperCase()}
     </div>
   );
 }
@@ -2945,7 +3003,14 @@ function UserPill({ username, role, avatar, glimpse = true }:
           }}>{dl.count}</span>
         )}
       </div>
-      <span style={{ fontSize: '13px', fontWeight: 500, whiteSpace: 'nowrap' }}>{username}</span>
+      {/* Placeholder bar while the account is still loading, so the pill keeps
+          its shape instead of collapsing and then jumping to full width. */}
+      {username
+        ? <span style={{ fontSize: '13px', fontWeight: 500, whiteSpace: 'nowrap' }}>{username}</span>
+        : <span style={{
+            width: '58px', height: '9px', borderRadius: '5px',
+            background: V2.bgElevated, opacity: 0.7,
+          }} />}
       <FaChevronDown size={11} style={{ color: V2.fgMuted }} />
     </Focusable>
   );
@@ -3565,12 +3630,18 @@ function RouteGuard({ children }: { children: any }) {
 // so a plain Audio element reaches them. Everything is wrapped/swallowed: a
 // missing file or a blocked autoplay must never break navigation. Elements are
 // cached and cloned so rapid LB/RB presses can overlap instead of cutting off.
+// The desktop app has no steamloopback.host, so its shell sets
+// __ludoSoundBase to a backend route that serves the same files off the local
+// Steam install; on the Deck the constant below is used unchanged.
 const _navSoundCache: Record<string, HTMLAudioElement> = {};
+function soundBase(): string {
+  return (window as any).__ludoSoundBase || 'https://steamloopback.host/sounds/';
+}
 function playSteamSound(name: string) {
   try {
     let base = _navSoundCache[name];
     if (!base) {
-      base = new Audio(`https://steamloopback.host/sounds/${name}.wav`);
+      base = new Audio(`${soundBase()}${name}.wav`);
       base.preload = 'auto';
       _navSoundCache[name] = base;
     }
@@ -4681,6 +4752,100 @@ function CardRow({ icon, title, count, children }:
   );
 }
 
+// Placeholder block with a slow left-to-right sheen — the shared building brick
+// for every "we don't know this yet" shape.
+function Shimmer({ style }: { style?: any }) {
+  return (
+    <div style={{
+      background: V2.bgElevated, borderRadius: V2.radiusSm, overflow: 'hidden',
+      position: 'relative', ...style,
+    }}>
+      <div style={{
+        position: 'absolute', inset: 0,
+        background: 'linear-gradient(100deg, transparent 20%, rgba(255,255,255,0.055) 50%, transparent 80%)',
+        animation: 'rommShimmer 1.4s ease-in-out infinite',
+      }} />
+    </div>
+  );
+}
+
+// Home's first-run state: the real layout with its content greyed out, instead
+// of a centred "Loading…". A cold start has no cached lists to seed from, and a
+// single line of text on an empty screen gave no sense of what was coming — the
+// page then snapped from nothing to a full dashboard. Same row count, header
+// sizes, tile widths and paddings as the real CardRows below, so the content
+// lands in place rather than pushing a different layout out of the way.
+function HomeSkeleton() {
+  // Row 1 is landscape (Continue playing's screenshot cards), the rest portrait
+  // covers — matching what usually renders in each slot.
+  const rows: { tiles: number; w: number; ratio: string }[] = [
+    { tiles: 4, w: 234, ratio: '16 / 9' },
+    { tiles: 7, w: 132, ratio: '3 / 4' },
+    { tiles: 7, w: 132, ratio: '3 / 4' },
+  ];
+  return (
+    <div style={{ paddingTop: '8px' }} aria-busy="true">
+      <style>{`
+        @keyframes rommShimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+        @keyframes rommSkelIn { from { opacity: 0; } to { opacity: 1; } }
+      `}</style>
+      {rows.map((row, r) => (
+        // Stagger the rows in so the skeleton itself arrives calmly rather than
+        // all at once — and so a fast backend never flashes the full set.
+        <section key={r} style={{
+          marginBottom: '22px', opacity: 0,
+          animation: `rommSkelIn 0.5s ease ${r * 0.12 + 0.15}s forwards`,
+        }}>
+          <header style={{
+            display: 'flex', alignItems: 'center', gap: '10px',
+            padding: '0 16px', marginBottom: '12px',
+          }}>
+            <Shimmer style={{ width: '14px', height: '14px', borderRadius: '4px' }} />
+            <Shimmer style={{ width: `${110 + r * 22}px`, height: '13px', borderRadius: '4px' }} />
+          </header>
+          <div style={{ display: 'flex', gap: '12px', padding: '24px 16px 28px', overflow: 'hidden' }}>
+            {Array.from({ length: row.tiles }).map((_, i) => (
+              <div key={i} style={{ width: `${row.w}px`, flexShrink: 0 }}>
+                <Shimmer style={{ width: '100%', aspectRatio: row.ratio, borderRadius: V2.radiusArt }} />
+                {/* The title line under each cover, so the row's height matches
+                    the real one and nothing shifts when the data lands. */}
+                <Shimmer style={{ width: `${60 + ((i * 37) % 35)}%`, height: '9px', marginTop: '8px', borderRadius: '4px' }} />
+              </div>
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+// Same idea for the Platforms/Collections index: the real grid geometry, greyed
+// out, so the tiles fade into position instead of replacing a line of text.
+function GroupGridSkeleton() {
+  return (
+    <div style={{ paddingTop: '6px', opacity: 0, animation: 'rommSkelIn 0.5s ease 0.15s forwards' }} aria-busy="true">
+      <style>{`
+        @keyframes rommShimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+        @keyframes rommSkelIn { from { opacity: 0; } to { opacity: 1; } }
+      `}</style>
+      <div style={{ padding: '6px 16px 10px' }}>
+        <Shimmer style={{ width: '92px', height: '10px', borderRadius: '4px' }} />
+      </div>
+      <div style={{
+        display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(132px, 1fr))',
+        gap: '18px 16px', padding: '0 16px 8px',
+      }}>
+        {Array.from({ length: 12 }).map((_, i) => (
+          <div key={i}>
+            <Shimmer style={{ width: '100%', aspectRatio: '3 / 4', borderRadius: V2.radiusArt }} />
+            <Shimmer style={{ width: `${55 + ((i * 41) % 40)}%`, height: '9px', marginTop: '8px', borderRadius: '4px' }} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // Home dashboard — faithful to RomM v2 Home.vue: horizontal CardRows
 // (Continue playing / Recently added / Platforms / Collections).
 // Home banner for the two emulator states that change what the app can do:
@@ -4902,14 +5067,7 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   // focus grab must refire on each return to the tab, not just on mount.
   const firstRef = useAutoFocus(visible && !loading && firstList !== null, firstList);
 
-  if (loading) {
-    return (
-      <div style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        minHeight: '60vh', color: V2.fgMuted, fontSize: '13px',
-      }}>Loading…</div>
-    );
-  }
+  if (loading) return <HomeSkeleton />;
   return (
     <div style={{ paddingTop: '8px' }}>
       <EmulatorBanner />
@@ -5189,9 +5347,7 @@ function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
   const scrubOverlay = <ScrubOverlay letter={scrubLetter} />;
   // -----------------------------------------------------------------------
 
-  if (loading) {
-    return <div style={{ padding: '16px', color: V2.fgMuted, fontSize: '13px' }}>Loading…</div>;
-  }
+  if (loading) return <GroupGridSkeleton />;
   if (groups.length === 0) {
     return (
       <div style={{ padding: '16px', color: V2.fgMuted, fontSize: '13px' }}>
@@ -9438,6 +9594,9 @@ function SettingsPage() {
     try {
       const result = await logout(wipeData);
       if (result?.success) {
+        // Drop the remembered pill identity, or the next launch paints the
+        // signed-out user's name and avatar until the fetch says otherwise.
+        clearIdentityCache();
         toaster.toast({
           title: 'Logged out',
           body: wipeData

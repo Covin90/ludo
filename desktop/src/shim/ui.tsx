@@ -13,8 +13,9 @@ import {
   type Ref,
 } from "react";
 import { pushModal, type ModalHandle } from "./overlays";
-import { focusFirstIn, registerFocusable, registerActions } from "./gamepad";
+import { focusFirstIn, inMouseMode, registerFocusable, registerActions } from "./gamepad";
 import { GamepadButtonId } from "./gamepad-buttons";
+import { playSound } from "./sound";
 
 export { Navigation, Router } from "./router";
 
@@ -159,7 +160,10 @@ export const Focusable = forwardRef(function Focusable(
         (className ? " " + className : "")
       }
       tabIndex={tabIndex}
-      autoFocus={autoFocus}
+      // A caller's autoFocus is a controller affordance ("start the pad here").
+      // With the mouse driving, honouring it lights a control up unprompted, so
+      // drop it and let the pointer decide.
+      autoFocus={autoFocus && !inMouseMode()}
       onClick={(e) => {
         // Shift+click is the alternate action, mirroring Shift+Enter below.
         if (e.shiftKey && onSecondaryButton) {
@@ -199,9 +203,11 @@ export const Focusable = forwardRef(function Focusable(
           onOptionsButton(e);
         } else if (!editable && activate && (e.key === "Enter" || e.key === " ")) {
           e.preventDefault();
+          playSound("activate");
           activate(e);
         } else if ((onCancelButton ?? onCancel) && e.key === "Escape") {
           e.preventDefault();
+          playSound("back");
           (onCancelButton ?? onCancel)!(e);
         }
       }}

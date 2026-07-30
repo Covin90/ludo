@@ -4,6 +4,8 @@
 // toaster comes from @decky/api, and openFilePicker (api) needs to open a modal
 // (ui) — routing both through here avoids a circular import.
 import { useEffect, useState, type ReactNode } from "react";
+import { inMouseMode } from "./gamepad";
+import { playSound } from "./sound";
 
 // ── Modals ──────────────────────────────────────────────────────────────────
 
@@ -27,7 +29,7 @@ const notifyModals = () => modalSubs.forEach((f) => f());
 // Guard on still-connected + not display:none; a plain .focus() re-triggers the
 // gamepad marker mirror so the highlight follows.
 function restoreOpener(el: HTMLElement | null) {
-  if (!el) return;
+  if (!el || inMouseMode()) return;
   requestAnimationFrame(() => {
     if (!el.isConnected || (el.offsetWidth === 0 && el.offsetHeight === 0)) return;
     try { el.focus({ preventScroll: false } as any); } catch { /* gone */ }
@@ -38,6 +40,7 @@ function popModal(id: number) {
   const i = modals.findIndex((m) => m.id === id);
   if (i === -1) return;
   const [entry] = modals.splice(i, 1);
+  playSound("modalClose");
   notifyModals();
   restoreOpener(entry.opener);
 }
@@ -51,6 +54,7 @@ export function pushModal(render: (h: ModalHandle) => ReactNode): ModalHandle {
   const handle: ModalHandle = { Close: () => popModal(id) };
   const ae = document.activeElement as HTMLElement | null;
   modals.push({ id, render, opener: ae && ae !== document.body ? ae : null });
+  playSound("modalOpen");
   notifyModals();
   return handle;
 }
@@ -98,6 +102,7 @@ const notifyToasts = () => toastSubs.forEach((f) => f());
 export function pushToast(opts: ToastOpts) {
   const id = ++toastSeq;
   toasts = [...toasts, { ...opts, id }];
+  playSound("toast");
   notifyToasts();
   const ms = opts.duration ?? 5000;
   window.setTimeout(() => {
