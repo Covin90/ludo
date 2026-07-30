@@ -6188,6 +6188,51 @@ class RetroArchInterface:
     _osd_lock = threading.Lock()
     _osd_thread = None
 
+    def emulator_process_running(self):
+        """True when a RetroArch process is up.
+
+        The same question AutoSyncManager.is_retroarch_running() answers, asked
+        from the side that owns the emulator: this class sends the commands, and
+        reaching across to the sync manager for it left send_notification_when_ready
+        calling a method that does not exist here — every OSD message waited,
+        logged an AttributeError twice a second, and was dropped.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return False
+        me = os.getpid()
+        # Interpreters and shells are never the emulator, and they are exactly
+        # what carries "retroarch" in a command line by accident — a script
+        # about RetroArch, or a grep for it. Matching those reported the
+        # emulator as running when it was not.
+        _NOT_EMULATORS = ('python', 'python3', 'bash', 'sh', 'zsh', 'fish',
+                          'node', 'grep', 'pgrep', 'ugrep', 'awk', 'sed')
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'status']):
+                try:
+                    if proc.info['pid'] == me or proc.info['status'] in ('zombie', 'dead'):
+                        continue
+                    name = (proc.info['name'] or '').lower()
+                    if name == 'retroarch':
+                        return True
+                    if name in _NOT_EMULATORS:
+                        continue
+                    cmd = ' '.join(proc.info['cmdline'] or []).lower()
+                    # A real launch: the flatpak/snap wrapper running the
+                    # emulator with a core.
+                    if (('org.libretro.retroarch' in cmd
+                         or 'net.retrodeck.retrodeck' in cmd
+                         or '/retroarch' in cmd)
+                            and app_id() not in cmd
+                            and ('-l ' in cmd or '--libretro' in cmd or '.so' in cmd)):
+                        return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+        except Exception as e:
+            logging.debug(f"process scan failed: {e}")
+        return False
+
     def send_notification_when_ready(self, message, timeout=30):
         """Deliver an OSD message once RetroArch is actually up.
 
@@ -6209,7 +6254,7 @@ class RetroArchInterface:
                 deadline = time.time() + timeout
                 while time.time() < deadline:
                     try:
-                        if self.is_retroarch_running():
+                        if self.emulator_process_running():
                             # The command interface binds a moment after the
                             # process appears; sending into that gap is silent.
                             time.sleep(2.0)
@@ -9370,7 +9415,7 @@ class AutoSyncManager:
             msg = f"RomM: {', '.join(parts)}"
         # Straight out when the emulator is up (an in-session save), queued for
         # its arrival otherwise (a sync that ran just before launch).
-        if self.retroarch.is_retroarch_running():
+        if self.retroarch.emulator_process_running():
             self.retroarch.send_notification(msg)
         else:
             self.retroarch.send_notification_when_ready(msg)
