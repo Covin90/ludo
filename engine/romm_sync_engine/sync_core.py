@@ -6047,7 +6047,44 @@ class RetroArchInterface:
             gamescope = False
         if not gamescope:
             cmd.append('-f')
+
+        # Network commands drive the OSD messages and the running/idle probe,
+        # and RetroArch ships with them OFF. enable_retroarch_setting() can only
+        # turn them on by editing retroarch.cfg, which does not exist until
+        # RetroArch has run once — so the FIRST session after an install always
+        # went without them. --appendconfig layers a small file over the
+        # config for this run, which needs no config to already exist.
+        overlay = self._launch_overlay_config()
+        if overlay:
+            cmd.extend(['--appendconfig', overlay])
         return cmd, None
+
+    def _launch_overlay_config(self):
+        """Write the per-launch config overlay and return its path, or ''.
+
+        Lives in RetroArch's own config directory rather than Ludo's: the
+        flatpak can always read its own tree, while $HOME/.config/ludo depends
+        on the sandbox's filesystem permissions. It is NOT retroarch.cfg — the
+        name matters, since creating that file suppresses RetroArch's first-run
+        setup (which is how the menu font got broken).
+        """
+        try:
+            cfg_dir = self.find_retroarch_config_dir() or self._install_tree()
+            if not cfg_dir:
+                return ''
+            cfg_dir = Path(cfg_dir)
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            overlay = cfg_dir / 'ludo-launch.cfg'
+            overlay.write_text(
+                '# Written by Ludo before each launch. RetroArch layers this\n'
+                '# over its own configuration for this session only.\n'
+                'network_cmd_enable = "true"\n'
+                f'network_cmd_port = "{self.port}"\n',
+                encoding='utf-8')
+            return str(overlay)
+        except Exception as e:
+            print(f"⚠️  Could not write the launch config overlay: {e}")
+            return ''
 
     @staticmethod
     def _retrodeck_sandbox_core(core_path):
@@ -6122,6 +6159,28 @@ class RetroArchInterface:
             
         except Exception as e:
             return False, f"Launch error: {e}"
+
+    # RetroArch's network command endpoint. These were referenced by
+    # send_command()/send_notification() but never assigned anywhere, so every
+    # send raised AttributeError into a bare except and the OSD messages this
+    # class has always claimed to send were never sent at all.
+    RETROARCH_HOST = '127.0.0.1'
+    RETROARCH_PORT = 55355
+
+    @property
+    def host(self):
+        return self.RETROARCH_HOST
+
+    @property
+    def port(self):
+        """RetroArch's configured command port, or its default."""
+        try:
+            configured = self.get_retroarch_config_setting('network_cmd_port', '')
+            if configured:
+                return int(str(configured).strip())
+        except Exception:
+            pass
+        return self.RETROARCH_PORT
 
     def send_notification(self, message):
         """Send notification to RetroArch using SHOW_MSG command"""

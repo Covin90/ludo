@@ -1203,8 +1203,14 @@ class Plugin:
                 try:
                     network_ok, _ = self._retroarch.check_network_commands_config()
                     if not network_ok:
-                        self._retroarch.enable_retroarch_setting('network_commands')
-                        logging.info("Auto-enabled network commands")
+                        # Only claim it when it worked: this fails by design
+                        # until RetroArch has written a retroarch.cfg, and the
+                        # log said "Auto-enabled" on every poll regardless,
+                        # which hid the fact that it never took. Launches carry
+                        # the setting themselves via --appendconfig anyway.
+                        ok, why = self._retroarch.enable_retroarch_setting('network_commands')
+                        logging.info("Auto-enabled network commands" if ok
+                                     else f"Network commands not enabled yet: {why}")
 
                     thumbnail_ok, _ = self._retroarch.check_savestate_thumbnail_config()
                     if not thumbnail_ok:
