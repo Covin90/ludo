@@ -4556,10 +4556,23 @@ class Plugin:
                 launch_path = self._resolve_launch_path(g['local_path'], None)
             if not launch_path:
                 return {'success': False, 'message': 'No launchable file found'}
+            platform_name = self._platform_name_for(g)
+            # Check for a missing core BEFORE syncing. The launch would fail on
+            # it anyway, and the picker sends the user back here afterwards — so
+            # syncing first means downloading everything twice, and the second
+            # pass then reports "1 file" because the first already fetched the
+            # rest, which reads as though most of the saves never arrived.
+            gap = self._core_gap(g, platform_name)
+            if gap.get('needs_core'):
+                logging.info(f"No core for {platform_name} — offering the picker "
+                             f"before syncing {g.get('name', 'this game')}")
+                return {'success': False,
+                        'message': f'No core installed for {platform_name}',
+                        **gap}
+
             # Pull down the latest saves/states from RomM before launching so the
             # session starts from the most recent progress (no-op if download is off).
             await self._pre_launch_sync(g)
-            platform_name = self._platform_name_for(g)
             ok, msg = self._retroarch.launch_game(Path(launch_path), platform_name)
             # Remember an explicit disc choice so the next plain Play resumes it.
             if ok and disc:
@@ -4641,8 +4654,14 @@ class Plugin:
             if not launch_path:
                 return {'success': False, 'steam_host': False,
                         'message': 'No launchable file found'}
-            await self._pre_launch_sync(g)
             platform_name = self._platform_name_for(g)
+            # Same order as launch_game: a missing core makes the sync wasted
+            # work, since the picker sends the user back through here.
+            gap = self._core_gap(g, platform_name)
+            if gap.get('needs_core'):
+                return {'success': False, 'steam_host': False,
+                        'message': f'No core installed for {platform_name}', **gap}
+            await self._pre_launch_sync(g)
             cmd, err = self._retroarch.build_launch_command(Path(launch_path), platform_name)
             if err or not cmd:
                 return {'success': False, 'steam_host': False,
