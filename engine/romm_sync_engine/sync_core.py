@@ -6182,6 +6182,55 @@ class RetroArchInterface:
             pass
         return self.RETROARCH_PORT
 
+    # A pending OSD message and the thread waiting to deliver it. One at a
+    # time: a newer message supersedes an undelivered older one.
+    _pending_osd = None
+    _osd_lock = threading.Lock()
+    _osd_thread = None
+
+    def send_notification_when_ready(self, message, timeout=30):
+        """Deliver an OSD message once RetroArch is actually up.
+
+        The pre-launch sync finishes BEFORE the emulator starts — that is the
+        point of it — so sending immediately fires a UDP packet at a port
+        nothing is bound to yet and the player sees nothing. This waits for the
+        process, gives its command interface a moment to bind, then sends. Gives
+        up quietly after `timeout`: a launch that never happened should not
+        surface a message minutes later.
+        """
+        with RetroArchInterface._osd_lock:
+            RetroArchInterface._pending_osd = message
+            alive = (RetroArchInterface._osd_thread
+                     and RetroArchInterface._osd_thread.is_alive())
+            if alive:
+                return True      # the running waiter will pick up the new text
+
+            def _wait_and_send():
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    try:
+                        if self.is_retroarch_running():
+                            # The command interface binds a moment after the
+                            # process appears; sending into that gap is silent.
+                            time.sleep(2.0)
+                            with RetroArchInterface._osd_lock:
+                                msg = RetroArchInterface._pending_osd
+                                RetroArchInterface._pending_osd = None
+                            if msg:
+                                self.send_notification(msg)
+                            return
+                    except Exception as e:
+                        logging.debug(f"OSD wait error: {e}")
+                    time.sleep(0.5)
+                with RetroArchInterface._osd_lock:
+                    RetroArchInterface._pending_osd = None
+                logging.debug("RetroArch never came up; dropping the OSD message")
+
+            RetroArchInterface._osd_thread = threading.Thread(
+                target=_wait_and_send, daemon=True, name='romm-osd')
+            RetroArchInterface._osd_thread.start()
+            return True
+
     def send_notification(self, message):
         """Send notification to RetroArch using SHOW_MSG command"""
         try:
@@ -9305,9 +9354,6 @@ class AutoSyncManager:
         conflicts, errors = len(summary.get('conflicts') or []), summary.get('errors', 0)
         if not (up or down or conflicts or errors):
             return
-        if not self.retroarch.is_retroarch_running():
-            return
-
         def plural(n, word):
             return f"{n} {word}{'' if n == 1 else 's'}"
 
@@ -9322,7 +9368,12 @@ class AutoSyncManager:
             if down:
                 parts.append(f"{plural(down, 'save')} downloaded")
             msg = f"RomM: {', '.join(parts)}"
-        self.retroarch.send_notification(msg)
+        # Straight out when the emulator is up (an in-session save), queued for
+        # its arrival otherwise (a sync that ran just before launch).
+        if self.retroarch.is_retroarch_running():
+            self.retroarch.send_notification(msg)
+        else:
+            self.retroarch.send_notification_when_ready(msg)
 
     def build_sync_inventory(self):
         """Build the local save inventory for RomM 4.9.0's /api/sync/negotiate.
@@ -10691,7 +10742,10 @@ class AutoSyncManager:
                     already = conflicts_detected - downloads_successful
                     if already > 0:
                         files += f", {already} already current"
-                    self.retroarch.send_notification(f"Synced: {game_name} ({files})")
+                    # Pre-launch: RetroArch is not up yet, so this has to wait
+                    # for it rather than shout into a closed socket.
+                    self.retroarch.send_notification_when_ready(
+                        f"Synced: {game_name} ({files})")
                 elif conflicts_detected > 0:
                     self.log(f"🛡️ {game_name} local saves/states protected from overwrite")
                 else:
