@@ -748,6 +748,24 @@ def flatpak_app_installed(app_id, env=None):
         return True
 
 
+# Our own AppImages, which carry "RetroArch" in their filenames and so keep
+# turning up in RetroArch detection. Both frontends are listed, not just the one
+# running: the engine is shared, the GTK build ships as RomM-RetroArch-Sync-*
+# and Ludo as Ludo-*, and a user can easily have both on disk. Matching only
+# client_name() meant each build recognised its own AppImage and adopted the
+# other's as an emulator.
+_OWN_APPIMAGE_MARKERS = ('romm-retroarch-sync', 'romm_retroarch_sync', 'ludo')
+
+
+def _is_own_appimage(name):
+    """True when `name` is one of our own AppImages rather than an emulator."""
+    low = name.lower()
+    if any(m in low for m in _OWN_APPIMAGE_MARKERS):
+        return True
+    # Whatever this build calls itself, in case either name ever changes.
+    return client_name().lower() in low or app_id().lower() in low
+
+
 def detect_retrodeck():
     """Detect if RetroDECK is installed.
 
@@ -5267,12 +5285,21 @@ class RetroArchInterface:
         
         for location in appimage_locations:
             if location.exists():
-                for appimage in location.glob('*RetroArch*.AppImage'):
+                for appimage in location.glob('*.AppImage'):
                     if appimage.is_file() and os.access(appimage, os.X_OK):
-                        # Skip our own app: the GTK build ships as
-                        # RomM-RetroArch-Sync-v*.AppImage, which matches the
-                        # *RetroArch* glob above.
-                        if client_name() in appimage.name:
+                        # The name must START with RetroArch, which its official
+                        # AppImages do (RetroArch-Linux-x86_64.AppImage). A
+                        # contains-match picked up RomM-RetroArch-Sync-*.AppImage
+                        # — our OWN app, and any sibling tool with RetroArch in
+                        # its name — and then reported an emulator that cannot
+                        # play anything.
+                        if not appimage.name.lower().startswith('retroarch'):
+                            continue
+                        # Belt: the client-name check this replaces only ever
+                        # excluded whichever frontend was running (it compares
+                        # against client_name(), so Ludo did not recognise the
+                        # GTK build's own AppImage, and vice versa).
+                        if _is_own_appimage(appimage.name):
                             continue
                         retroarch_candidates.append({
                             'type': 'appimage', 
