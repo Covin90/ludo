@@ -98,34 +98,31 @@ unzip -p "$OUT_ZIP" "${PLUGIN_NAME}/py_modules/sync_core.py" | grep -c "_host_su
 ```
 
 The output zip is at the **repo root**: `Ludo-v<VERSION>-decky.zip` (~11 MB with
-bundled libs), where `<VERSION>` comes from `decky_plugin/package.json`. To release a new
-version, bump `"version"` in that file — the zip name (and this whole flow) follows. (The GTK app lives in the separate romm-retroarch-sync repo and
-versions independently.)
+bundled libs), where `<VERSION>` comes from `decky_plugin/package.json`, which the zip name
+follows automatically. Don't bump that version by hand to cut a release: it has to stay in
+lockstep with `desktop/package.json` and the tag, so use `scripts/release.sh` (see
+[RELEASING.md](../RELEASING.md)). (The GTK app lives in the separate romm-retroarch-sync
+repo and versions independently.)
 
 ## Publish a release
 
-The zip is named for the exact version, so it can be handed to `gh` as-is:
+**Don't publish by hand — see [RELEASING.md](../RELEASING.md).** Releases are cut by
+pushing a tag; CI builds this zip *and* the desktop AppImage from that tag, refuses to
+publish unless both are present, and sets the prerelease flag from the version string:
 
 ```bash
-VERSION="$(node -p "require('./decky_plugin/package.json').version")"
-git tag "v${VERSION}" && git push origin "v${VERSION}"
-gh release create "v${VERSION}" \
-  --prerelease \
-  --notes-file notes.md \
-  "Ludo-v${VERSION}-decky.zip"
+scripts/release.sh 1.0.0-beta.8
 ```
 
-**Push the tag before creating the release.** `gh` creates the release against `tag_name`;
-if that tag doesn't exist on the remote yet, GitHub silently creates it pointing at the
-default branch, anchoring the release to the wrong commit.
+The manual `gh release create` flow this section used to describe is no longer correct.
+It publishes a release carrying only the `-decky.zip`, which the desktop updater then
+skips — and because `select_release` picks the semver *maximum*, that release also
+outranks the last complete one, so desktop users see "no update available" instead of an
+error. It also left the prerelease flag to be remembered by hand, which pushes a beta to
+every stable user when it's forgotten.
 
-**Pass `--prerelease` for any `-beta.N` version.** The updater's stable channel serves the
-newest non-prerelease release, so a beta published without the flag is offered to every user
-on stable. Omit it only for a real stable release.
-
-Every release must carry a `*-decky.zip` asset — `check_for_update` skips releases that lack
-one when picking the newest (see `select_release` in `main.py`), so a release published
-without it is invisible to the updater rather than breaking it.
+The recipe above is still the right way to build a zip for **loose deploy, testing, or
+handoff** — just don't attach the result to a GitHub release yourself.
 
 **Why `cp -rL`?** `py_modules/sync_core.py` and `py_modules/bios_manager.py` are symlinks in
 the dev tree. The `-L` flag dereferences all symlinks so real file content goes into the zip.

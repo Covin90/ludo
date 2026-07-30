@@ -69,6 +69,23 @@ What the shell reproduces from `app.py`:
   table in `preload.cjs`). If some pad ever misbehaves, `preload.cjs` is the one
   place to add a `node-hid`/XInput fallback.
 
+## Packaging (AppImage)
+
+```bash
+npm run dist     # build UI → prepare-runtime.sh → electron-builder
+```
+
+`tools/prepare-runtime.sh` is the part that matters: the AppImage has no venv and
+no source tree, so it bundles a pinned standalone CPython with the engine
+installed into it, plus a mirror of the repo layout the backend expects. The
+output lands in `release/` at ~170 MB — an image dramatically smaller than that
+means the runtime failed to bundle.
+
+Cutting an actual release is tag-driven and builds this *and* the Decky zip
+together — see [RELEASING.md](../RELEASING.md). Don't publish an AppImage to a
+GitHub release by hand: the two front-ends share an updater that skips releases
+missing either asset.
+
 ## Button-hint legend
 
 `src/shim/footer.tsx` rebuilds the Deck's bottom hint bar. Its glyph art comes
