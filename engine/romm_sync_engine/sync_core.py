@@ -6189,11 +6189,68 @@ class RetroArchInterface:
             enable_key = 'sort_savestates_enable'
             content_key = 'sort_savestates_by_content_enable'
 
-        if self.get_retroarch_config_setting(enable_key, 'false').lower() == 'true':
-            return 'core'
-        if self.get_retroarch_config_setting(content_key, 'false').lower() == 'true':
-            return 'content'
-        return 'flat'
+        cfg_dir = self.find_retroarch_config_dir()
+        have_cfg = bool(cfg_dir and (Path(cfg_dir) / 'retroarch.cfg').exists())
+        if have_cfg:
+            if self.get_retroarch_config_setting(enable_key, 'false').lower() == 'true':
+                mode = 'core'
+            elif self.get_retroarch_config_setting(content_key, 'false').lower() == 'true':
+                mode = 'content'
+            else:
+                mode = 'flat'
+            # Remember it: the answer is unavailable exactly when it matters
+            # most — the first launch after an install, before RetroArch has
+            # written a config — and it does not change often.
+            try:
+                if self.settings.get('RetroArch', f'subdir_mode_{save_type}', '') != mode:
+                    self.settings.set('RetroArch', f'subdir_mode_{save_type}', mode)
+            except Exception:
+                pass
+            return mode
+
+        # No config yet. Guessing wrong puts the save where the emulator will
+        # never read it, so use the best evidence available, in order.
+        remembered = ''
+        try:
+            remembered = self.settings.get('RetroArch', f'subdir_mode_{save_type}', '')
+        except Exception:
+            pass
+        if remembered in ('core', 'content', 'flat'):
+            return remembered
+        bundled = self._bundled_cfg_setting(enable_key)
+        if bundled:
+            return 'core' if bundled.lower() == 'true' else 'flat'
+        # RetroArch's own default in current versions sorts saves per core —
+        # verified against a fresh 1.22 flatpak, which wrote
+        # sort_savefiles_enable = "true" into the config it generated.
+        return 'core'
+
+    def _bundled_cfg_setting(self, key):
+        """Read a key from the emulator's shipped default config, or ''.
+
+        The flatpak carries /app/etc/retroarch.cfg — reachable from the host
+        under the deployment directory — which is what RetroArch seeds a new
+        install from. It is the only authority available before the user's own
+        config exists.
+        """
+        try:
+            roots = [Path('/var/lib/flatpak/app'),
+                     Path.home() / '.local/share/flatpak/app',
+                     Path('/run/host/var/lib/flatpak/app')]
+            for root in roots:
+                cfg = (root / self.RETROARCH_APP_ID
+                       / 'current/active/files/etc/retroarch.cfg')
+                if not cfg.exists():
+                    continue
+                prefix = f'{key} = '
+                with open(cfg, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith(prefix):
+                            return line.split('=', 1)[1].strip().strip('"')
+        except Exception:
+            pass
+        return ''
 
     def parse_retroarch_save_dirs_from_config(self, config_dir):
         """Parse savefile_directory and savestate_directory from retroarch.cfg
@@ -9103,28 +9160,16 @@ class AutoSyncManager:
                 return ''
             newest = max(found, key=lambda f: f.stat().st_mtime)
 
-            cfg_dir = self.retroarch.find_retroarch_config_dir()
-            cfg_known = bool(cfg_dir and (Path(cfg_dir) / 'retroarch.cfg').exists())
             core_dir = None
             if core_name:
                 core_dir = base / self.retroarch.get_retroarch_directory_name(core_name)
 
-            if not cfg_known:
-                if not core_dir:
-                    return ''
-                mirrored = []
-                for target in (base, core_dir):
-                    dest = target / newest.name
-                    if dest.exists() and dest.stat().st_mtime >= newest.stat().st_mtime:
-                        continue
-                    target.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(newest, dest)
-                    mirrored.append(str(dest))
-                if mirrored:
-                    self.log(f"📁 RetroArch has not written its config yet — save "
-                             f"mirrored so either layout finds it")
-                return 'mirrored' if mirrored else ''
-
+            # Placing a copy in BOTH layouts was tried and is worse: negotiate
+            # then sees two files for one slot and alternates between them
+            # ("Duplicate local save ... ignoring stale ..."), which is the
+            # ping-pong build_sync_inventory's dedupe exists to prevent. There
+            # is one right place; get_save_subdir_mode decides it even before
+            # RetroArch has written a config.
             mode = self.retroarch.get_save_subdir_mode('saves')
             target_dir = core_dir if (mode == 'core' and core_dir) else base
             if mode == 'content':
