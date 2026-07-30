@@ -2284,6 +2284,12 @@ class Plugin:
                         # watchers come up on the corrected directories.
                         try:
                             repaired, _ = self._retroarch.repair_emulator_paths()
+                            # And the save folder if it is still Ludo's
+                            # no-emulator fallback, which no staleness rule
+                            # covers but the emulator will never read.
+                            moved = self._retroarch.align_saves_with_emulator()
+                            if moved:
+                                repaired = list(repaired) + [moved]
                             self._emu_install['repaired'] = [
                                 x.get('label') or x.get('key') for x in repaired]
                             if repaired:
@@ -4483,10 +4489,45 @@ class Plugin:
                     self._settings.set('LastDisc', str(effective_rom_id), disc)
                 except Exception as e:
                     logging.warning(f"could not persist last disc: {e}")
-            return {'success': bool(ok), 'message': msg or ('Launched' if ok else 'Launch failed')}
+            out = {'success': bool(ok),
+                   'message': msg or ('Launched' if ok else 'Launch failed')}
+            if not ok:
+                # A missing core is the one launch failure the user can fix on
+                # the spot, so hand the UI what it needs to offer that instead of
+                # a dead-end toast: which platform, and which cores would work.
+                out.update(self._core_gap(g, platform_name))
+            return out
         except Exception as e:
             logging.error(f"launch_game error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
+
+    def _core_gap(self, game: dict, platform_name: str) -> dict:
+        """{needs_core, platform_name, platform_slug, candidates, installed_cores}
+        when this platform resolves to no core, else {}."""
+        try:
+            ra = self._retroarch
+            if not ra or not platform_name:
+                return {}
+            slug = (game.get('platform_slug')
+                    or (game.get('romm_data') or {}).get('platform_slug') or None)
+            info = ra.describe_core_resolution(platform_name, system_slug=slug)
+            if info.get('resolved_core'):
+                return {}          # a core WAS resolved; the failure is something else
+            support = ra.core_download_support()
+            return {
+                'needs_core': True,
+                'platform_name': platform_name,
+                'platform_slug': slug or '',
+                # Best guess first, already aliased to buildbot names, so each
+                # can be passed straight to download_core().
+                'candidates': info.get('download_candidates') or [],
+                'installed_cores': sorted(ra.get_available_cores().keys()),
+                'can_download': bool(support.get('available')),
+                'download_reason': support.get('reason') or '',
+            }
+        except Exception as e:
+            logging.warning(f"could not describe the core gap: {e}")
+            return {}
 
     async def prepare_steam_launch(self, rom_id: int, disc: str = None,
                                    sibling_rom_id: int = None):

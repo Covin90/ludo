@@ -5174,6 +5174,35 @@ class RetroArchInterface:
             return retrodeck['rom_directory' if kind == 'roms' else 'save_directory']
         return str(Path.home() / 'RomMSync' / ('roms' if kind == 'roms' else 'saves'))
 
+    def align_saves_with_emulator(self):
+        """Move the save folder off Ludo's own fallback once an emulator exists.
+
+        ~/RomMSync/saves is what gets chosen when there is no emulator to ask —
+        a reasonable answer then, and wrong the moment one is installed, because
+        the emulator writes its saves somewhere else entirely. It is not "stale"
+        by any rule (it belongs to no removed emulator), so nothing else will
+        ever correct it, and sync would report success forever while moving
+        nothing. Only touches the value when it IS that fallback or empty; a
+        folder the user deliberately chose is left alone.
+
+        Returns a repair record like repair_emulator_paths' entries, or None.
+        """
+        expected = self.expected_save_dir()
+        if not expected:
+            return None
+        current = (self.settings.get('Download', 'save_directory', '') or '').strip()
+        fallback = str(Path.home() / 'RomMSync' / 'saves')
+        if current and current != fallback:
+            return None
+        if current == expected:
+            return None
+        self.settings.set('Download', 'save_directory', expected)
+        print(f"🔧 Save folder now follows the emulator: "
+              f"{current or '(unset)'} → {expected}")
+        return {'section': 'Download', 'key': 'save_directory',
+                'label': 'Save folder', 'kind': 'saves',
+                'value': current, 'suggested': expected, 'applied': expected}
+
     def repair_emulator_paths(self, keys=None):
         """Apply the suggested fix for stale paths, then re-detect.
 

@@ -1141,7 +1141,9 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
       const r = await launchGameSmart(game.rom_id);
       // No success toast — the screen transitions to the launch immediately, so
       // the toast just races the thing it announces. Surface failures only.
-      if (!r?.success) toaster.toast({ title: 'Launch failed', body: r?.message || 'Error' });
+      if (!r?.success && !offerCoreInstall(r, () => void doLaunch())) {
+        toaster.toast({ title: 'Launch failed', body: r?.message || 'Error' });
+      }
     } catch (e) { toaster.toast({ title: 'Launch failed', body: String(e) }); }
     finally { setBusy(null); }
   };
@@ -2474,6 +2476,197 @@ function UserMenuModal({ username, role, avatar, closeModal }:
         </Focusable>
       </Focusable>
     </ModalRoot>
+  );
+}
+
+// ── Missing-core picker ──────────────────────────────────────────────────────
+// A launch that fails for a missing core is fixable right there, so instead of a
+// toast that only names the problem, offer the fix: install the recommended core
+// for that platform (or a different one), then start the game. Same glass chrome
+// as the user menu.
+type CoreGap = {
+  platform_name: string;
+  platform_slug: string;
+  candidates: string[];
+  installed_cores: string[];
+  can_download: boolean;
+  download_reason: string;
+};
+
+function coreLabel(name: string): string {
+  // Buildbot names are like 'mupen64plus_next' — readable enough once the
+  // separators are spaces, and the real identifier still shows underneath.
+  return name.replace(/_libretro$/, '').replace(/_/g, ' ');
+}
+
+function MissingCoreModal({ gap, onPlay, closeModal }:
+  { gap: CoreGap; onPlay: () => void; closeModal?: () => void }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+  const [failed, setFailed] = useState<string>('');
+  const [showAll, setShowAll] = useState(false);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  const recommended = gap.candidates[0] || '';
+  const others = gap.candidates.slice(1);
+
+  const install = async (core: string) => {
+    setBusy(core); setFailed('');
+    try {
+      const r = await downloadCore(core);
+      if (!r?.success) {
+        setFailed(r?.message || `Could not install ${core}`);
+        return;
+      }
+      // Pin it for this platform when it isn't the one we'd have guessed:
+      // otherwise resolution could pick a different installed core next time and
+      // the user's choice here would look ignored.
+      if (core !== recommended && gap.platform_slug) {
+        try { await setCoreOverride(gap.platform_slug, core); } catch { /* non-fatal */ }
+      }
+      setDone(core);
+      // The cores page and the emulator status both cache a core count.
+      try { await loadEmulatorStatus(true); } catch { /* non-fatal */ }
+    } catch (e) {
+      setFailed(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const playNow = () => { closeModal?.(); onPlay(); };
+
+  return (
+    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}
+      className="romm-modal-collapse" modalClassName="romm-modal-collapse">
+      <Focusable noFocusRing className="romm-ui"
+        onCancelButton={() => closeModal?.()}
+        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
+        style={{
+          position: 'fixed', inset: 0, zIndex: 9999,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(7,7,15,0.45)',
+          WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
+        }}>
+        <style>{`
+          ${V2_FOCUS_STYLE}
+          .romm-modal-collapse, .romm-modal-collapse > div {
+            background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important;
+          }
+          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }
+        `}</style>
+        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
+        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
+          position: 'relative', width: '420px', maxWidth: '92vw', boxSizing: 'border-box',
+          fontFamily: V2.font, color: V2.fg, padding: '8px',
+          display: 'flex', flexDirection: 'column',
+          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
+          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
+          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
+          boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
+          maxHeight: '82vh', overflowY: 'auto',
+          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
+        }}>
+          {/* Header */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '11px', padding: '10px 10px 12px', minWidth: 0 }}>
+            <div style={{
+              flexShrink: 0, width: '34px', height: '34px', borderRadius: V2.radiusMd,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: V2.bgElevated, color: V2.brandHover,
+            }}><FaPuzzlePiece size={16} /></div>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: '14px', fontWeight: 700, lineHeight: 1.3 }}>
+                {done ? 'Core installed' : `${gap.platform_name} needs a core`}
+              </div>
+              <div style={{ fontSize: '11.5px', color: V2.fgMuted, marginTop: '2px' }}>
+                {done
+                  ? `${coreLabel(done)} is ready — start the game.`
+                  : 'A core is the emulator that actually runs the game.'}
+              </div>
+            </div>
+          </div>
+          <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
+
+          {failed && (
+            <div style={{
+              margin: '4px', padding: '9px 11px', borderRadius: V2.radiusMd,
+              background: 'rgba(255,80,80,0.10)', color: V2.danger,
+              fontSize: '11.5px', lineHeight: 1.4,
+            }}>{failed}</div>
+          )}
+
+          {done ? (
+            <UserMenuRow icon={<FaPlay size={14} />} label="Play now" onSelect={playNow} />
+          ) : !gap.can_download ? (
+            <div style={{ padding: '4px 12px 10px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
+              {gap.download_reason
+                || 'Cores cannot be installed from here. Add one in RetroArch, then try again.'}
+            </div>
+          ) : !gap.candidates.length ? (
+            <div style={{ padding: '4px 12px 10px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
+              No core for {gap.platform_name} is available from the libretro
+              buildbot for this system. You can install one inside RetroArch and
+              pick it in Settings ▸ Emulator Cores.
+            </div>
+          ) : (
+            <>
+              <CoreOption core={recommended} recommended busy={busy === recommended}
+                disabled={!!busy} onSelect={() => install(recommended)} />
+              {others.length > 0 && !showAll && (
+                <UserMenuRow icon={<FaChevronRight size={13} />}
+                  label={`Other cores (${others.length})`} disabled={!!busy}
+                  onSelect={() => setShowAll(true)} />
+              )}
+              {showAll && others.map((c) => (
+                <CoreOption key={c} core={c} busy={busy === c} disabled={!!busy}
+                  onSelect={() => install(c)} />
+              ))}
+              <div style={{ height: '1px', background: V2.border, margin: '4px' }} />
+              <UserMenuRow icon={<FaCog size={14} />} label="Manage cores"
+                disabled={!!busy}
+                onSelect={() => { closeModal?.(); libNavigate('/romm-sync-cores'); }} />
+            </>
+          )}
+        </Focusable>
+      </Focusable>
+    </ModalRoot>
+  );
+}
+
+// One installable core in the picker: name, what it is, and its state.
+function CoreOption({ core, recommended, busy, disabled, onSelect }:
+  { core: string; recommended?: boolean; busy?: boolean; disabled?: boolean; onSelect: () => void }) {
+  const [hot, setHot] = useState(false);
+  return (
+    <Focusable noFocusRing onActivate={() => !disabled && onSelect()} onClick={() => !disabled && onSelect()}
+      onFocus={() => setHot(true)} onBlur={() => setHot(false)}
+      onMouseEnter={() => setHot(true)} onMouseLeave={() => setHot(false)}
+      style={{
+        display: 'flex', alignItems: 'center', gap: '11px', padding: '9px 12px',
+        borderRadius: V2.radiusMd, cursor: disabled ? 'default' : 'pointer',
+        background: (hot && !disabled) ? V2.surfaceHover : 'transparent',
+        transition: 'background 0.12s ease', opacity: disabled && !busy ? 0.55 : 1,
+      }}>
+      <div style={{ flexShrink: 0, width: '16px', display: 'flex', justifyContent: 'center', color: V2.fgMuted }}>
+        {busy
+          ? <FaSync size={13} style={{ animation: 'spin 1s linear infinite' }} />
+          : <FaDownload size={13} />}
+      </div>
+      <div style={{ minWidth: 0, flex: '1 1 auto' }}>
+        <div style={{ fontSize: '13.5px', fontWeight: 500, textTransform: 'capitalize' }}>
+          {coreLabel(core)}
+          {recommended && (
+            <span style={{
+              marginLeft: '7px', fontSize: '9.5px', fontWeight: 800, letterSpacing: '0.04em',
+              textTransform: 'uppercase', color: V2.brandHover,
+            }}>recommended</span>
+          )}
+        </div>
+        <div style={{ fontSize: '10.5px', color: V2.fgFaint, marginTop: '1px' }}>
+          {busy ? 'Installing…' : core}
+        </div>
+      </div>
+    </Focusable>
   );
 }
 
@@ -6797,13 +6990,36 @@ async function launchGameSmart(romId: number, disc: string | null = null,
   return await launchGame(romId, disc, siblingRomId);
 }
 
+// A launch that failed for a missing core: offer to install one and start the
+// game, instead of a toast that only names the problem. Returns true when the
+// picker took over, so the caller skips its own error toast.
+function offerCoreInstall(r: any, retry: () => void): boolean {
+  if (!r?.needs_core) return false;
+  showModal(
+    <MissingCoreModal
+      gap={{
+        platform_name: r.platform_name || 'This platform',
+        platform_slug: r.platform_slug || '',
+        candidates: r.candidates || [],
+        installed_cores: r.installed_cores || [],
+        can_download: !!r.can_download,
+        download_reason: r.download_reason || '',
+      }}
+      onPlay={retry} />
+  );
+  return true;
+}
+
 async function runLaunch(romId: number, gameName: string, disc: string | null,
   label?: string, setBusy?: (b: any) => void, onDone?: () => void, siblingRomId?: number | null) {
   if (setBusy) setBusy('launch');
   try {
     const r = await launchGameSmart(romId, disc, siblingRomId ?? null);
     if (r?.success) toaster.toast({ title: 'Launching', body: label || gameName });
-    else {
+    else if (offerCoreInstall(r, () => void runLaunch(
+      romId, gameName, disc, label, setBusy, onDone, siblingRomId))) {
+      // The picker owns the outcome now — no toast.
+    } else {
       toaster.toast({ title: 'Launch failed', body: r?.message || 'Error' });
       // Self-heal a stale "downloaded" tile: if launch failed because the files
       // aren't actually there (deleted off-device in a prior session, cache not
