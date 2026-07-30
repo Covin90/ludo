@@ -9235,6 +9235,36 @@ class AutoSyncManager:
             self.log(f"⚠️ Could not refresh save directories: {e}")
             return False
 
+    def _notify_sync_result(self, summary):
+        """Put the outcome of a save-sync on RetroArch's on-screen display.
+
+        Only while RetroArch is actually running — the command is UDP to its
+        network-command port, so it would otherwise vanish into a closed socket
+        — and only when something moved or failed.
+        """
+        up, down = summary.get('uploaded', 0), summary.get('downloaded', 0)
+        conflicts, errors = len(summary.get('conflicts') or []), summary.get('errors', 0)
+        if not (up or down or conflicts or errors):
+            return
+        if not self.retroarch.is_retroarch_running():
+            return
+
+        def plural(n, word):
+            return f"{n} {word}{'' if n == 1 else 's'}"
+
+        if errors:
+            msg = f"RomM: sync failed ({plural(errors, 'error')})"
+        elif conflicts:
+            msg = f"RomM: {plural(conflicts, 'conflict')} — resolve in Ludo"
+        else:
+            parts = []
+            if up:
+                parts.append(f"{plural(up, 'save')} uploaded")
+            if down:
+                parts.append(f"{plural(down, 'save')} downloaded")
+            msg = f"RomM: {', '.join(parts)}"
+        self.retroarch.send_notification(msg)
+
     def build_sync_inventory(self):
         """Build the local save inventory for RomM 4.9.0's /api/sync/negotiate.
 
@@ -9584,6 +9614,16 @@ class AutoSyncManager:
         self.log(f"🔄 Save-sync: {summary['uploaded']} up, {summary['downloaded']} down, "
                  f"{len(summary['conflicts'])} conflict(s), {summary['no_op']} in-sync, "
                  f"{summary['errors']} error(s)")
+
+        # Tell the player, in the emulator, when something actually moved. The
+        # per-file watcher used to do this; the session engine that replaced it
+        # never did, so saves synced silently and the only evidence was the log.
+        # Nothing is said for an all-quiet cycle ("0 up, 0 down, 1 in-sync"):
+        # an OSD popup on every session boundary would be noise.
+        try:
+            self._notify_sync_result(summary)
+        except Exception as e:
+            logging.debug(f"could not send the RetroArch notification: {e}")
         # Feed entries only when the cycle actually moved data or hit trouble —
         # a pure "everything already in sync" pass would just be noise. One
         # entry per game so the feed reads "Save sync — Pokémon Emerald".
