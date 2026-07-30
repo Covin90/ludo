@@ -5047,11 +5047,17 @@ class RetroArchInterface:
         """Apply the suggested fix for stale paths, then re-detect.
 
         `keys` limits the repair to specific setting keys; None repairs all of
-        them. Returns (repaired, status).
+        them. A key may be given bare ('save_directory') or qualified with its
+        section ('RetroArch.save_directory') — the qualified form is what the UI
+        sends, since two sections can hold the same key name, and matching only
+        the bare form silently repaired nothing while still reporting success.
+        Returns (repaired, status).
         """
         repaired = []
+        wanted = set(keys or ())
         for item in self.stale_emulator_paths():
-            if keys and item['key'] not in keys:
+            if wanted and not ({item['key'], f"{item['section']}.{item['key']}"}
+                               & wanted):
                 continue
             self.settings.set(item['section'], item['key'], item['suggested'])
             repaired.append({**item, 'applied': item['suggested']})

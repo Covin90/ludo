@@ -4379,9 +4379,14 @@ function EmulatorBanner() {
       const keys = (status.stale_paths || [])
         .filter((p) => p.kind === 'saves').map((p) => `${p.section}.${p.key}`);
       const r = await repairEmulatorPaths(keys);
-      if (r?.success) {
+      // success with nothing repaired is not success — say so rather than
+      // congratulating the user next to a warning that hasn't moved.
+      if (r?.success && r.repaired?.length) {
         publishEmulatorStatus({ ...status, stale_paths: r.stale_paths || [] });
         toaster.toast({ title: 'Save folder', body: 'Pointed back at your emulator' });
+      } else if (r?.success) {
+        await loadEmulatorStatus(true);
+        toaster.toast({ title: 'Save folder', body: 'Nothing changed — check Settings ▸ Emulator & folders' });
       } else {
         toaster.toast({ title: 'Save folder', body: r?.message || 'Could not update it' });
       }
@@ -8483,8 +8488,12 @@ function FoldersSection() {
     setBusy(p.kind);
     try {
       const r = await repairEmulatorPaths([`${p.section}.${p.key}`]);
-      if (r?.success) await loadEmulatorStatus(true);
-      else toaster.toast({ title: 'Folders', body: r?.message || 'Could not update' });
+      if (r?.success) {
+        await loadEmulatorStatus(true);
+        if (!r.repaired?.length) {
+          toaster.toast({ title: 'Folders', body: 'Nothing to change here' });
+        }
+      } else toaster.toast({ title: 'Folders', body: r?.message || 'Could not update' });
     } catch { toaster.toast({ title: 'Folders', body: 'Could not update' }); }
     finally { setBusy(null); }
   };
