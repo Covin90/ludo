@@ -5277,6 +5277,103 @@ class RetroArchInterface:
             return retrodeck['rom_directory' if kind == 'roms' else 'save_directory']
         return str(library_dir() / ('roms' if kind == 'roms' else 'saves'))
 
+    def align_retroarch_config(self, save_dir=None):
+        """Point RetroArch's own savefile/savestate directories at ours.
+
+        The missing half of save sync. RetroArch's default is to write .srm and
+        .state next to the content, so Ludo watched <config>/saves while the
+        emulator wrote into the ROM folder — sync ran, found nothing, and
+        reported success. Nothing here ever read that config back into agreement
+        because nothing ever WROTE it.
+
+        Conservative on purpose:
+          * RetroDECK manages its own retroarch.cfg, so it is left alone.
+          * A directory the user has already chosen is never overwritten; only
+            an unset value or RetroArch's own 'default'/':'-relative placeholder
+            is filled in.
+          * The file is written whole via a temp file, keeping every other line
+            byte-identical.
+
+        Returns {'changed': bool, 'saves': str, 'states': str, 'reason': str}.
+        """
+        out = {'changed': False, 'saves': '', 'states': '', 'reason': ''}
+        exe = (self.retroarch_executable or '').lower()
+        if not exe:
+            out['reason'] = 'no emulator detected'
+            return out
+        if 'retrodeck' in exe:
+            out['reason'] = 'RetroDECK manages its own configuration'
+            return out
+
+        saves = str(save_dir or self.settings.get('Download', 'save_directory', '')
+                    or self.expected_save_dir())
+        if not saves:
+            out['reason'] = 'no save folder to point at'
+            return out
+        states = str(Path(saves).parent / 'states') if Path(saves).name == 'saves' \
+            else str(Path(saves) / 'states')
+
+        tree = self._install_tree()
+        cfg_dir = self.find_retroarch_config_dir() or tree
+        if not cfg_dir:
+            out['reason'] = 'no config directory'
+            return out
+        cfg_path = Path(cfg_dir) / 'retroarch.cfg'
+
+        # If the user has chosen a save folder in RetroArch, that decision wins
+        # outright and we touch nothing — not even a missing savestate_directory.
+        # Adding one of ours would scatter saves and states across two trees, and
+        # Ludo follows RetroArch's value anyway (see expected_save_dir).
+        chosen = self._retroarch_cfg_value('savefile_directory')
+        if chosen and chosen != saves:
+            out['saves'] = chosen
+            out['reason'] = 'RetroArch already has its own save folder'
+            return out
+
+        wanted = {'savefile_directory': saves, 'savestate_directory': states}
+        try:
+            lines = (cfg_path.read_text(encoding='utf-8', errors='replace')
+                     .splitlines(keepends=True) if cfg_path.exists() else [])
+            out_lines, seen = [], set()
+            for line in lines:
+                key = line.split('=', 1)[0].strip() if '=' in line else ''
+                if key in wanted:
+                    seen.add(key)
+                    raw = line.split('=', 1)[1].strip().strip('"').strip()
+                    # Respect a real choice; replace only a placeholder.
+                    if raw and raw != 'default' and not raw.startswith(':'):
+                        out_lines.append(line)
+                        continue
+                    out_lines.append(f'{key} = "{wanted[key]}"\n')
+                    out['changed'] = True
+                    continue
+                out_lines.append(line)
+            for key, value in wanted.items():
+                if key not in seen:
+                    if out_lines and not out_lines[-1].endswith('\n'):
+                        out_lines.append('\n')
+                    out_lines.append(f'{key} = "{value}"\n')
+                    out['changed'] = True
+
+            if out['changed']:
+                for d in (saves, states):
+                    try:
+                        Path(d).mkdir(parents=True, exist_ok=True)
+                    except Exception as e:
+                        print(f"⚠️  Could not create {d}: {e}")
+                cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cfg_path.with_suffix('.cfg.ludo-tmp')
+                tmp.write_text(''.join(out_lines), encoding='utf-8')
+                os.replace(tmp, cfg_path)
+                print(f"🔧 RetroArch will now save to {saves}")
+            out['saves'], out['states'] = saves, states
+            if not out['changed']:
+                out['reason'] = 'RetroArch already has its own save folders'
+        except Exception as e:
+            out['reason'] = str(e)
+            print(f"⚠️  Could not update retroarch.cfg: {e}")
+        return out
+
     def align_saves_with_emulator(self):
         """Move the save folder off Ludo's own fallback once an emulator exists.
 

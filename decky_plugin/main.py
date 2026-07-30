@@ -1896,6 +1896,13 @@ class Plugin:
                     ra.settings.load_settings()
                 except Exception:
                     pass
+                # A save folder is only half a decision — RetroArch has to be
+                # told, or it keeps writing next to the ROM.
+                if save_directory is not None:
+                    try:
+                        ra.align_retroarch_config()
+                    except Exception as e:
+                        logging.warning(f"could not point RetroArch at the save folder: {e}")
                 status = ra.refresh_installation()
             return {'success': True, 'changed': changed, **status}
         except Exception as e:
@@ -2226,6 +2233,8 @@ class Plugin:
                 # has in fact fixed, which is indistinguishable from the repair
                 # silently doing nothing.
                 try:
+                    if any(r.get('kind') == 'saves' for r in repaired):
+                        self._retroarch.align_retroarch_config()
                     self._stop_sync()
                     time.sleep(0.5)
                     self._start_sync()
@@ -2301,6 +2310,10 @@ class Plugin:
                             moved = self._retroarch.align_saves_with_emulator()
                             if moved:
                                 repaired = list(repaired) + [moved]
+                            # And the other half of it: RetroArch writes saves
+                            # next to the ROM unless told otherwise, so watching
+                            # our folder is useless until its config agrees.
+                            self._retroarch.align_retroarch_config()
                             self._emu_install['repaired'] = [
                                 x.get('label') or x.get('key') for x in repaired]
                             if repaired:
@@ -4408,6 +4421,34 @@ class Plugin:
             logging.error(f"get_home_data error: {e}", exc_info=True)
             return {'success': False, 'stats': {}, 'recent': [], 'downloaded_games': [], 'continue_playing': None, 'message': str(e)}
 
+    async def _pre_launch_sync(self, game: dict):
+        """Pull this game's saves/states down before it starts.
+
+        Waits briefly when sync is still connecting. Installing an emulator or a
+        core restarts sync, and the connect runs on a background thread — a game
+        launched in the seconds that follow used to skip the save download in
+        silence, which reads as "my saves aren't there" and appears to fix itself
+        only on the next app start. Never blocks the launch for long: five
+        seconds, then go.
+        """
+        auto = self._auto_sync
+        if auto is None and self._romm_client is not None:
+            for _ in range(20):
+                await asyncio.sleep(0.25)
+                auto = self._auto_sync
+                if auto is not None:
+                    break
+            logging.info("pre-launch sync waited for auto-sync: "
+                         f"{'ready' if auto else 'not up, launching anyway'}")
+        if auto is None:
+            logging.warning("launching without a pre-launch save sync — "
+                            "sync is not connected yet")
+            return
+        try:
+            await asyncio.to_thread(auto.sync_before_launch, game)
+        except Exception as e:
+            logging.warning(f"pre-launch sync failed (continuing): {e}")
+
     async def launch_game(self, rom_id: int, disc: str = None, sibling_rom_id: int = None):
         """Launch a downloaded game in RetroArch (A button on a downloaded card).
 
@@ -4487,11 +4528,7 @@ class Plugin:
                 return {'success': False, 'message': 'No launchable file found'}
             # Pull down the latest saves/states from RomM before launching so the
             # session starts from the most recent progress (no-op if download is off).
-            if self._auto_sync is not None:
-                try:
-                    await asyncio.to_thread(self._auto_sync.sync_before_launch, g)
-                except Exception as e:
-                    logging.warning(f"pre-launch sync failed (continuing): {e}")
+            await self._pre_launch_sync(g)
             platform_name = self._platform_name_for(g)
             ok, msg = self._retroarch.launch_game(Path(launch_path), platform_name)
             # Remember an explicit disc choice so the next plain Play resumes it.
@@ -4574,11 +4611,7 @@ class Plugin:
             if not launch_path:
                 return {'success': False, 'steam_host': False,
                         'message': 'No launchable file found'}
-            if self._auto_sync is not None:
-                try:
-                    await asyncio.to_thread(self._auto_sync.sync_before_launch, g)
-                except Exception as e:
-                    logging.warning(f"pre-launch sync failed (continuing): {e}")
+            await self._pre_launch_sync(g)
             platform_name = self._platform_name_for(g)
             cmd, err = self._retroarch.build_launch_command(Path(launch_path), platform_name)
             if err or not cmd:
