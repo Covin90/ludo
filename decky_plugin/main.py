@@ -392,7 +392,7 @@ class Plugin:
     # Live state of an in-progress emulator install (see install_emulator).
     # Class-level default so emulator_install_state() answers before one starts.
     _emu_install: dict = {'active': False, 'phase': '', 'pct': None,
-                          'error': None, 'installed': False}
+                          'detail': '', 'error': None, 'installed': False}
 
     # Background retry thread (reconnect + collection-list refresh every 5 min)
     _stop_event: threading.Event = None
@@ -2247,11 +2247,24 @@ class Plugin:
                 return {'success': False, 'message': support['reason']}
 
             self._emu_install = {'active': True, 'phase': 'Starting…',
-                                 'pct': None, 'error': None, 'installed': False}
+                                 'pct': None, 'detail': '', 'error': None,
+                                 'installed': False}
 
-            def progress(phase, pct):
+            def progress(phase, pct, detail=''):
+                # Never let the reported percentage go backwards: flatpak
+                # restarts its own counter per component, and a bar that jumps
+                # back reads as a failed retry.
+                prev = self._emu_install.get('pct')
+                if pct is None:
+                    # Lines like "Installation complete." carry no number. Hold
+                    # the last one rather than dropping the bar back to
+                    # indeterminate right as the install finishes.
+                    pct = prev
+                elif prev is not None and pct < prev:
+                    pct = prev
                 self._emu_install['phase'] = phase
                 self._emu_install['pct'] = pct
+                self._emu_install['detail'] = detail or ''
 
             def run():
                 try:
@@ -2272,7 +2285,11 @@ class Plugin:
                     self._emu_install['error'] = str(e)
                 finally:
                     self._emu_install['active'] = False
-                    self._emu_install['pct'] = None
+                    # Leave pct alone: on success it is 100, and the poll reads
+                    # this same dict one last time before hiding the bar —
+                    # blanking it made the bar flick to indeterminate on the
+                    # final frame. On failure the error is what gets shown.
+                    self._emu_install['detail'] = ''
 
             threading.Thread(target=run, daemon=True,
                              name='emulator-install').start()

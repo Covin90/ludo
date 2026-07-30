@@ -1649,8 +1649,8 @@ function staleCopy(stale: EmuStalePath[]): { title: string; body: string } {
 // The install runs in a backend thread (a ~300 MB flatpak); the UI polls its
 // progress. Module-level so the Home banner and the Emulator page show the same
 // run, and so navigating away mid-install doesn't orphan it.
-type EmuInstall = { active: boolean; phase: string; pct: number | null; error: string | null };
-let _emuInstall: EmuInstall = { active: false, phase: '', pct: null, error: null };
+type EmuInstall = { active: boolean; phase: string; pct: number | null; detail: string; error: string | null };
+let _emuInstall: EmuInstall = { active: false, phase: '', pct: null, detail: '', error: null };
 const _emuInstallSubs = new Set<() => void>();
 let _emuInstallPoll: any = null;
 
@@ -1666,7 +1666,7 @@ function _pollInstall() {
       const r = await emulatorInstallState();
       _publishInstall({
         active: !!r?.active, phase: r?.phase || '',
-        pct: r?.pct ?? null, error: r?.error || null,
+        pct: r?.pct ?? null, detail: r?.detail || '', error: r?.error || null,
       });
       if (!r?.active) {
         clearInterval(_emuInstallPoll); _emuInstallPoll = null;
@@ -1682,17 +1682,17 @@ function _pollInstall() {
 }
 
 async function startEmulatorInstall() {
-  _publishInstall({ active: true, phase: 'Starting…', pct: null, error: null });
+  _publishInstall({ active: true, phase: 'Starting…', pct: null, detail: '', error: null });
   try {
     const r = await installEmulator();
     if (!r?.success) {
-      _publishInstall({ active: false, phase: '', pct: null, error: r?.message || 'Could not start the install' });
+      _publishInstall({ active: false, phase: '', pct: null, detail: '', error: r?.message || 'Could not start the install' });
       toaster.toast({ title: 'RetroArch', body: r?.message || 'Could not start the install' });
       return;
     }
     _pollInstall();
   } catch (e) {
-    _publishInstall({ active: false, phase: '', pct: null, error: String(e) });
+    _publishInstall({ active: false, phase: '', pct: null, detail: '', error: String(e) });
   }
 }
 
@@ -4392,6 +4392,44 @@ function CardRow({ icon, title, count, children }:
 // pointing into an emulator that was uninstalled (sync writes where nothing
 // reads, while still reporting success). Every other stale path is a quiet
 // warning row in Settings ▸ Folders instead — see FoldersSection.
+// Install progress. Determinate once flatpak reports a percentage, and a moving
+// indeterminate sweep before that — resolving refs and verifying take a while
+// with no numbers attached, and a bar frozen at 0% looks like a hung download.
+function InstallProgressBar({ pct }: { pct: number | null }) {
+  const known = pct != null;
+  return (
+    <div style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '10px' }}>
+      <div style={{
+        flex: '1 1 auto', height: '6px', borderRadius: V2.radiusPill,
+        background: 'rgba(255,255,255,0.12)', overflow: 'hidden', position: 'relative',
+      }}>
+        <div style={{
+          position: 'absolute', top: 0, bottom: 0,
+          left: known ? 0 : undefined,
+          width: known ? `${Math.max(2, Math.min(100, pct!))}%` : '35%',
+          borderRadius: V2.radiusPill,
+          background: `linear-gradient(90deg, ${V2.brand}, ${V2.brandHover})`,
+          transition: known ? 'width 0.4s ease-out' : 'none',
+          animation: known ? undefined : 'rommIndet 1.4s ease-in-out infinite',
+        }} />
+      </div>
+      <span style={{
+        fontSize: '11px', fontWeight: 700, color: V2.fg2,
+        minWidth: '34px', textAlign: 'right', fontVariantNumeric: 'tabular-nums',
+      }}>{known ? `${pct}%` : '…'}</span>
+      {/* Per-component keyframes, the convention everywhere else in this file.
+          `spin` is here too because the banner's own Fix button asks for it. */}
+      <style>{`
+        @keyframes rommIndet {
+          0%   { transform: translateX(-40%); }
+          100% { transform: translateX(300%); }
+        }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+      `}</style>
+    </div>
+  );
+}
+
 function EmulatorBanner() {
   const status = useEmulatorStatus();
   const install = useEmulatorInstall();
@@ -4429,7 +4467,10 @@ function EmulatorBanner() {
   };
 
   const body = install.active
-    ? (install.pct != null ? `${install.phase || 'Installing RetroArch'} · ${install.pct}%` : (install.phase || 'Installing RetroArch…'))
+    ? [install.phase || 'Installing RetroArch',
+       install.detail,
+       'This is a ~300 MB download — you can keep browsing while it runs.']
+      .filter(Boolean).join(' · ')
     : status.installed
       ? copy.body
       : status.install.available
@@ -4459,6 +4500,7 @@ function EmulatorBanner() {
                 : 'No emulator installed'}
           </div>
           <div style={{ fontSize: '12px', color: V2.fgMuted, lineHeight: 1.4, marginTop: '2px' }}>{body}</div>
+          {install.active && <InstallProgressBar pct={install.pct} />}
         </div>
         {!install.active && (
           <Focusable noFocusRing flow-children="horizontal" style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>

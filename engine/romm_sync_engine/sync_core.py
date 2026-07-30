@@ -6472,15 +6472,26 @@ class RetroArchInterface:
 
     # `flatpak install` writes progress as a redrawn line, so percentages arrive
     # as bare "NN%" tokens rather than discrete lines.
+    # flatpak's progress line looks like
+    #   Installing 1/2…       ████████ 45%  1,2 MB/s
+    # so there are three useful things in it: which step of how many, the
+    # percentage of THAT step, and the transfer rate. The step counter matters —
+    # RetroArch pulls its runtime first, so a bare percentage runs 0→100 more
+    # than once and looks like the install restarting.
     _FLATPAK_PCT_RE = re.compile(r'(\d{1,3})%')
+    _FLATPAK_STEP_RE = re.compile(r'(\d+)\s*/\s*(\d+)')
+    # Rate uses the locale's decimal separator, hence [.,].
+    _FLATPAK_RATE_RE = re.compile(r'(\d+(?:[.,]\d+)?\s*[kKMGT]?i?B/s)')
 
     def install_emulator(self, progress_callback=None):
         """Install RetroArch as a per-user flatpak.
 
         Blocking; run it off the UI thread. progress_callback receives
-        (phase, pct) where pct is None while flatpak reports nothing parseable
-        (resolving refs, verifying) — the caller should show an indeterminate
-        state rather than 0%.
+        (phase, pct, detail) where pct is None while flatpak reports nothing
+        parseable (resolving refs, verifying) — the caller should show an
+        indeterminate state rather than 0% — and detail is a short human string
+        like '1,2 MB/s' or '' when there is nothing to add. pct is progress
+        across the WHOLE install, not the current step.
 
         Returns {'success': bool, 'message': str, 'status': emulator_status()}.
         """
@@ -6493,10 +6504,10 @@ class RetroArchInterface:
 
         env = self._host_subprocess_env()
 
-        def report(phase, pct=None):
+        def report(phase, pct=None, detail=''):
             if progress_callback:
                 try:
-                    progress_callback(phase, pct)
+                    progress_callback(phase, pct, detail)
                 except Exception:
                     pass
 
@@ -6552,8 +6563,29 @@ class RetroArchInterface:
                         continue
                     tail.append(line)
                     del tail[:-8]
+
                     m = self._FLATPAK_PCT_RE.search(line)
-                    report('Downloading', min(100, int(m.group(1))) if m else None)
+                    step = self._FLATPAK_STEP_RE.search(line)
+                    rate = self._FLATPAK_RATE_RE.search(line)
+
+                    if step:
+                        i, total = int(step.group(1)), max(1, int(step.group(2)))
+                        i = min(i, total)
+                        phase = f'Downloading {i} of {total}'
+                    else:
+                        phase = 'Downloading'
+
+                    pct = None
+                    if m:
+                        pct = min(100, int(m.group(1)))
+                        if step:
+                            # Fold the step's own percentage into one number that
+                            # only ever goes up: finished steps plus this one's
+                            # share. Otherwise the bar resets per component.
+                            i, total = int(step.group(1)), max(1, int(step.group(2)))
+                            pct = int(min(100, ((min(i, total) - 1) + pct / 100)
+                                          / total * 100))
+                    report(phase, pct, rate.group(1).replace(',', '.') if rate else '')
             proc.wait(timeout=60)
         except Exception as e:
             try:
