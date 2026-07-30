@@ -1675,7 +1675,17 @@ function _pollInstall() {
         // Cores page needs to re-read too.
         await loadEmulatorStatus(true);
         if (r?.error) toaster.toast({ title: 'RetroArch', body: r.error });
-        else if (r?.installed) toaster.toast({ title: 'RetroArch', body: 'Installed — pick cores for your platforms' });
+        else if (r?.installed) {
+          // Folders the install moved off the emulator that was removed. Worth
+          // saying: it changes where saves and BIOS files land from now on.
+          const fixed: string[] = r?.repaired || [];
+          toaster.toast({
+            title: 'RetroArch',
+            body: fixed.length
+              ? `Installed, and pointed ${fixed.join(' and ').toLowerCase()} at it. Now pick cores for your platforms.`
+              : 'Installed — pick cores for your platforms',
+          });
+        }
       }
     } catch { /* keep polling; a dropped IPC frame isn't a failure */ }
   }, 1000);

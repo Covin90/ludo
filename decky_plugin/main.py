@@ -392,7 +392,8 @@ class Plugin:
     # Live state of an in-progress emulator install (see install_emulator).
     # Class-level default so emulator_install_state() answers before one starts.
     _emu_install: dict = {'active': False, 'phase': '', 'pct': None,
-                          'detail': '', 'error': None, 'installed': False}
+                          'detail': '', 'error': None, 'installed': False,
+                          'repaired': []}
 
     # Background retry thread (reconnect + collection-list refresh every 5 min)
     _stop_event: threading.Event = None
@@ -2248,7 +2249,7 @@ class Plugin:
 
             self._emu_install = {'active': True, 'phase': 'Starting…',
                                  'pct': None, 'detail': '', 'error': None,
-                                 'installed': False}
+                                 'installed': False, 'repaired': []}
 
             def progress(phase, pct, detail=''):
                 # Never let the reported percentage go backwards: flatpak
@@ -2272,6 +2273,26 @@ class Plugin:
                     self._emu_install['installed'] = bool(r.get('success'))
                     self._emu_install['error'] = None if r.get('success') else r.get('message')
                     if r.get('success'):
+                        # Point the folders at the emulator that now exists.
+                        # Normally a stale path is only ever suggested, never
+                        # applied — but this is the one moment where there is no
+                        # ambiguity: the user just asked us to install an
+                        # emulator, and a save or BIOS folder still aimed at a
+                        # removed one has no defensible reading. Greeting someone
+                        # with a warning immediately after a successful install
+                        # is the worse outcome. Before the restart, so the
+                        # watchers come up on the corrected directories.
+                        try:
+                            repaired, _ = self._retroarch.repair_emulator_paths()
+                            self._emu_install['repaired'] = [
+                                x.get('label') or x.get('key') for x in repaired]
+                            if repaired:
+                                logging.info(f"Install repaired stale paths: "
+                                             f"{self._emu_install['repaired']}")
+                        except Exception as e:
+                            logging.error(f"repair after emulator install: {e}",
+                                          exc_info=True)
+
                         # Sync was started against "no emulator": no cores dir,
                         # no save dirs to watch. Restart it against the real one.
                         try:
