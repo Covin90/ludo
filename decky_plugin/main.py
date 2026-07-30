@@ -2207,10 +2207,22 @@ class Plugin:
                 # Save/state watchers were started against the OLD directories,
                 # so the repair only takes effect once sync restarts — the same
                 # thing save_config does after changing these paths.
-                self._stop_sync()
-                time.sleep(0.5)
-                self._start_sync()
-                status = self._retroarch.emulator_status() if self._retroarch else status
+                #
+                # Guarded separately: the settings are already written by now, so
+                # a failure restarting sync must not be reported as "could not
+                # update" — that leaves the UI showing a warning for a path it
+                # has in fact fixed, which is indistinguishable from the repair
+                # silently doing nothing.
+                try:
+                    self._stop_sync()
+                    time.sleep(0.5)
+                    self._start_sync()
+                    if self._retroarch:
+                        status = self._retroarch.emulator_status()
+                except Exception as e:
+                    logging.error(f"repair applied but sync restart failed: {e}",
+                                  exc_info=True)
+                    status = {**status, 'restart_failed': str(e)}
             return {'success': True, 'repaired': repaired, **status}
         except Exception as e:
             logging.error(f"repair_emulator_paths error: {e}", exc_info=True)
