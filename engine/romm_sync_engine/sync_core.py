@@ -9062,6 +9062,97 @@ class AutoSyncManager:
         done.wait(timeout=120)
         return choice[0]
 
+    _SAVE_EXTS = ('.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra')
+
+    def reconcile_game_saves(self, game, core_name=None):
+        """Put this game's save where RetroArch will actually read it.
+
+        RetroArch can sort saves into a per-core subdirectory
+        (sort_savefiles_enable), and which it does is only knowable from
+        retroarch.cfg — which does not exist until it has run once. So on the
+        first launch after an install, Ludo downloaded the server's save into
+        the flat folder while RetroArch went on to read
+        saves/<Core>/, and the game started with no progress.
+
+        Two cases:
+          * config known — one copy survives, the newest, in the folder the
+            config says; any other copy of the same save is a stale duplicate
+            and is removed (they otherwise ping-pong through negotiate).
+          * config not written yet — mirror the newest into both locations, so
+            whichever RetroArch turns out to use, the data is there. The loser
+            is cleaned up by this same method on the next launch.
+
+        Returns a short description of what it did, or '' for nothing.
+        """
+        try:
+            base = (getattr(self.retroarch, 'save_dirs', {}) or {}).get('saves')
+            if not base:
+                return ''
+            base = Path(base)
+            local_path = game.get('local_path') or ''
+            stem = Path(local_path).stem if local_path else (game.get('name') or '')
+            if not stem:
+                return ''
+
+            found = []
+            for d in [base] + [p for p in base.iterdir() if p.is_dir()]:
+                for f in d.glob('*'):
+                    if f.is_file() and f.stem == stem and f.suffix.lower() in self._SAVE_EXTS:
+                        found.append(f)
+            if not found:
+                return ''
+            newest = max(found, key=lambda f: f.stat().st_mtime)
+
+            cfg_dir = self.retroarch.find_retroarch_config_dir()
+            cfg_known = bool(cfg_dir and (Path(cfg_dir) / 'retroarch.cfg').exists())
+            core_dir = None
+            if core_name:
+                core_dir = base / self.retroarch.get_retroarch_directory_name(core_name)
+
+            if not cfg_known:
+                if not core_dir:
+                    return ''
+                mirrored = []
+                for target in (base, core_dir):
+                    dest = target / newest.name
+                    if dest.exists() and dest.stat().st_mtime >= newest.stat().st_mtime:
+                        continue
+                    target.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(newest, dest)
+                    mirrored.append(str(dest))
+                if mirrored:
+                    self.log(f"📁 RetroArch has not written its config yet — save "
+                             f"mirrored so either layout finds it")
+                return 'mirrored' if mirrored else ''
+
+            mode = self.retroarch.get_save_subdir_mode('saves')
+            target_dir = core_dir if (mode == 'core' and core_dir) else base
+            if mode == 'content':
+                return ''      # content mode names the folder after the ROM dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dest = target_dir / newest.name
+            moved = False
+            if newest.parent != target_dir:
+                shutil.copy2(newest, dest)
+                moved = True
+            for f in found:
+                if f != dest and f.exists() and f.samefile(dest) is False:
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+            if moved:
+                self.log(f"📁 Save moved where RetroArch reads it: {dest}")
+                return f'moved to {dest}'
+            if len(found) > 1:
+                self.log(f"📁 Removed {len(found) - 1} stale copy/copies of {newest.name}")
+                return 'deduped'
+            return ''
+        except Exception as e:
+            self.log(f"⚠️ Could not reconcile saves for "
+                     f"{game.get('name', 'this game')}: {e}")
+            return ''
+
     def refresh_save_dirs(self):
         """Re-resolve the emulator's save directories, re-arming the watcher.
 

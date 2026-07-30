@@ -4459,6 +4459,19 @@ class Plugin:
             await asyncio.to_thread(auto.sync_before_launch, game)
         except Exception as e:
             logging.warning(f"pre-launch sync failed (continuing): {e}")
+        # Whatever just came down has to sit where RetroArch will look for it,
+        # which depends on a config it has not written yet on a first run.
+        try:
+            core = None
+            ra = self._retroarch
+            if ra:
+                slug = (game.get('platform_slug')
+                        or (game.get('romm_data') or {}).get('platform_slug'))
+                core, _ = ra.suggest_core_for_platform(
+                    self._platform_name_for(game), system_slug=slug)
+            await asyncio.to_thread(auto.reconcile_game_saves, game, core)
+        except Exception as e:
+            logging.warning(f"could not reconcile save locations: {e}")
 
     async def launch_game(self, rom_id: int, disc: str = None, sibling_rom_id: int = None):
         """Launch a downloaded game in RetroArch (A button on a downloaded card).
