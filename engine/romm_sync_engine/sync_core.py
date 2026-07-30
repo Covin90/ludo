@@ -5126,6 +5126,31 @@ class RetroArchInterface:
             })
         return stale
 
+    def expected_save_dir(self):
+        """Where the DETECTED emulator will keep saves, existing or not.
+
+        find_retroarch_dirs() only reports directories that are already there,
+        which is right for discovery and wrong for a suggestion: an emulator we
+        just installed has never run, so its tree does not exist yet. Falling
+        back to Ludo's own ~/RomMSync/saves then produced the silent failure this
+        whole feature exists to prevent — sync watching a folder the emulator
+        will never read, reporting success forever.
+
+        Returns '' when no emulator is detected, since there is nothing to guess
+        from.
+        """
+        exe = (self.retroarch_executable or '').lower()
+        if not exe:
+            return ''
+        if 'retrodeck' in exe:
+            return str(Path.home() / 'retrodeck' / 'saves')
+        if 'org.libretro.retroarch' in exe:
+            return str(Path.home() / '.var/app/org.libretro.RetroArch'
+                                     '/config/retroarch/saves')
+        if 'snap' in exe:
+            return str(Path.home() / 'snap/retroarch/current/.config/retroarch/saves')
+        return str(Path.home() / '.config' / 'retroarch' / 'saves')
+
     def _suggested_path(self, kind):
         """Replacement for a stale path setting, or '' to clear it.
 
@@ -5136,8 +5161,14 @@ class RetroArchInterface:
         """
         if kind in ('bios', 'exe'):
             return ''
-        if kind == 'saves' and self.save_dirs.get('saves'):
-            return str(self.save_dirs['saves'])
+        if kind == 'saves':
+            if self.save_dirs.get('saves'):
+                return str(self.save_dirs['saves'])
+            # Nothing on disk yet — use where the detected emulator WILL write
+            # rather than a folder of ours it never reads.
+            expected = self.expected_save_dir()
+            if expected:
+                return expected
         retrodeck = detect_retrodeck()
         if retrodeck:
             return retrodeck['rom_directory' if kind == 'roms' else 'save_directory']
@@ -6528,13 +6559,17 @@ class RetroArchInterface:
         # 2. The install itself. ~300 MB plus the runtime, so the timeout is
         #    generous and progress is streamed rather than waited on.
         report('Downloading')
-        cmd = ['flatpak', 'install', '--user', '-y', '--noninteractive',
+        # -y (assume yes) but NOT --noninteractive: that flag suppresses the
+        # per-operation progress output this method parses, so the UI could only
+        # ever show an indeterminate bar. stdin is closed below, so an
+        # unanticipated prompt fails fast instead of hanging for the deadline.
+        cmd = ['flatpak', 'install', '--user', '-y',
                'flathub', self.RETROARCH_APP_ID]
         print(f"📦 Installing RetroArch: {' '.join(cmd)}")
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env)
+                stdin=subprocess.DEVNULL, text=True, bufsize=1, env=env)
         except Exception as e:
             return {'success': False, 'message': f'Could not run flatpak: {e}',
                     'status': self.emulator_status()}

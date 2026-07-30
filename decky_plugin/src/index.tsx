@@ -8605,7 +8605,13 @@ function FoldersSection() {
           <span style={{ wordBreak: 'break-all' }}>
             {inUse || 'Not set'}
             <span style={{ color: V2.fgFaint }}>
-              {'  ·  '}{configured ? hint : inUse ? 'detected automatically' : hint}
+              {'  ·  '}{configured ? hint
+                : inUse ? 'detected automatically'
+                  // Nothing set and nothing detected. "set by you" was plainly
+                  // wrong here — it read "Not set · set by you" — and so was
+                  // implying a problem: the BIOS folder is legitimately empty
+                  // until the emulator's own one is known.
+                  : 'Ludo will use your emulator\u2019s own folder'}
             </span>
           </span>
         )}
