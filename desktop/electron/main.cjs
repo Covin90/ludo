@@ -112,6 +112,16 @@ const RES = process.resourcesPath || "";
 const SRC_ROOT = PACKAGED ? path.join(RES, "app-src", "desktop") : DESKTOP_DIR;
 const SERVER_PY = path.join(SRC_ROOT, "backend", "server.py");
 
+// Window icon. This is separate from the AppImage's icon (build.linux.icon in
+// package.json, which feeds the .desktop entry): the desktop entry is what most
+// launchers read, but some Wayland/X11 setups take the icon from the window
+// itself rather than matching StartupWMClass, and would otherwise fall back to
+// Electron's stock logo. Both point at the same file — electron-builder copies
+// it to resources/icon.png via extraResources.
+const ICON = PACKAGED
+  ? path.join(RES, "icon.png")
+  : path.join(DESKTOP_DIR, "..", "assets", "icons", "romm_icon.png");
+
 // The plugin UI is authored against the Deck's fixed 1280x800 gamepad viewport,
 // where SteamOS scales the whole design to the screen. We reproduce that by
 // zooming the page so the 800px design height fills the window height.
@@ -246,6 +256,7 @@ function createWindow(url, fullscreen) {
     width: 1280,
     height: 800,
     title: "Ludo",
+    icon: ICON,
     backgroundColor: "#0b0e14",
     fullscreen,
     autoHideMenuBar: true,

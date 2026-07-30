@@ -52,9 +52,14 @@
       {
         "from": "runtime/app-src",
         "to": "app-src"
+      },
+      {
+        "from": "../assets/icons/romm_icon.png",
+        "to": "icon.png"
       }
     ],
     "linux": {
+      "icon": "../assets/icons/romm_icon.png",
       "target": [
         "AppImage"
       ],
