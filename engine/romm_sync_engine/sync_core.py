@@ -5067,6 +5067,14 @@ class RetroArchInterface:
                 kind: self._suggested_path(kind)
                 for _section, _key, _label, kind in self._PATH_SETTINGS
             },
+            # Where the detected emulator keeps things, whether or not those
+            # directories exist yet — so a row can show the real answer instead
+            # of "Not set" for an emulator that simply has not run.
+            'expected_paths': {
+                'roms': self.expected_rom_dir(),
+                'saves': self.expected_save_dir(),
+                'bios': self.expected_bios_dir(),
+            },
             'core_download': self.core_download_support(),
             # Whether WE can install an emulator for them. Windows, a missing
             # flatpak, or running as root all mean the answer is "not from here",
@@ -5133,6 +5141,90 @@ class RetroArchInterface:
             })
         return stale
 
+    def _retroarch_cfg_value(self, key):
+        """One key out of the detected install's retroarch.cfg, or ''.
+
+        Only the value as written — no existence check, because these feed
+        expectations ("where WILL this go?") rather than discovery. RetroArch's
+        placeholders are skipped: 'default' means its built-in location, and a
+        value starting with ':' is relative to the content directory, neither of
+        which is a path we can hand to a folder picker.
+        """
+        try:
+            cfg_dir = self.find_retroarch_config_dir()
+            if not cfg_dir:
+                return ''
+            cfg = Path(cfg_dir) / 'retroarch.cfg'
+            if not cfg.exists():
+                return ''
+            prefix = f'{key} = '
+            with open(cfg, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line.startswith(prefix):
+                        continue
+                    raw = line.split('=', 1)[1].strip().strip('"').strip()
+                    if not raw or raw == 'default' or raw.startswith(':'):
+                        return ''
+                    return str(Path(raw).expanduser())
+        except Exception as e:
+            print(f"⚠️  Could not read {key} from retroarch.cfg: {e}")
+        return ''
+
+    def _install_tree(self):
+        """Root of the detected emulator's config tree, existing or not.
+
+        The one place that maps "which emulator did we find" onto "where does it
+        keep its things", so saves/BIOS/content answers cannot drift apart.
+        """
+        exe = (self.retroarch_executable or '').lower()
+        if not exe:
+            return None
+        if 'retrodeck' in exe:
+            return Path.home() / 'retrodeck'
+        if 'org.libretro.retroarch' in exe:
+            return Path.home() / '.var/app/org.libretro.RetroArch/config/retroarch'
+        if 'snap' in exe:
+            return Path.home() / 'snap/retroarch/current/.config/retroarch'
+        return Path.home() / '.config' / 'retroarch'
+
+    def expected_bios_dir(self):
+        """Where the DETECTED emulator looks for BIOS files, existing or not.
+
+        Same reason as expected_save_dir: bios_manager only reports directories
+        that already exist, so a freshly installed emulator answers "nowhere" and
+        the UI showed "Not set" for a folder that very much has a correct value.
+        RetroArch's own system_directory wins when the user has set one.
+        """
+        configured = self._retroarch_cfg_value('system_directory')
+        if configured:
+            return configured
+        tree = self._install_tree()
+        if not tree:
+            return ''
+        # RetroDECK exposes a user-facing bios/ instead of RetroArch's system/.
+        if tree.name == 'retrodeck':
+            return str(tree / 'bios')
+        return str(tree / 'system')
+
+    def expected_rom_dir(self):
+        """Where ROMs would live by default.
+
+        Unlike saves and BIOS, RetroArch has no canonical ROM folder — it opens
+        whatever you point it at — so this is only an answer when the user has
+        set a browser/content directory, or when RetroDECK (which does define
+        one) is what we found. Otherwise it stays Ludo's own folder, which is a
+        real answer and not a fallback: we are the one downloading them.
+        """
+        for key in ('content_directory', 'rgui_browser_directory'):
+            configured = self._retroarch_cfg_value(key)
+            if configured:
+                return configured
+        tree = self._install_tree()
+        if tree is not None and tree.name == 'retrodeck':
+            return str(tree / 'roms')
+        return str(Path.home() / 'RomMSync' / 'roms')
+
     def expected_save_dir(self):
         """Where the DETECTED emulator will keep saves, existing or not.
 
@@ -5146,17 +5238,13 @@ class RetroArchInterface:
         Returns '' when no emulator is detected, since there is nothing to guess
         from.
         """
-        exe = (self.retroarch_executable or '').lower()
-        if not exe:
+        configured = self._retroarch_cfg_value('savefile_directory')
+        if configured:
+            return configured
+        tree = self._install_tree()
+        if tree is None:
             return ''
-        if 'retrodeck' in exe:
-            return str(Path.home() / 'retrodeck' / 'saves')
-        if 'org.libretro.retroarch' in exe:
-            return str(Path.home() / '.var/app/org.libretro.RetroArch'
-                                     '/config/retroarch/saves')
-        if 'snap' in exe:
-            return str(Path.home() / 'snap/retroarch/current/.config/retroarch/saves')
-        return str(Path.home() / '.config' / 'retroarch' / 'saves')
+        return str(tree / 'saves')
 
     def _suggested_path(self, kind):
         """Replacement for a stale path setting, or '' to clear it.
@@ -5166,8 +5254,14 @@ class RetroArchInterface:
         real destination, so they follow the live emulator when it has an opinion
         and otherwise fall back to Ludo's own default.
         """
-        if kind in ('bios', 'exe'):
+        if kind == 'exe':
             return ''
+        if kind == 'bios':
+            # A concrete path, not '' — clearing only works when auto-detection
+            # can still find something, and it can't for an emulator that has
+            # never run (nothing on disk to find). This is the same folder
+            # auto-detection would settle on once it exists.
+            return self.expected_bios_dir()
         if kind == 'saves':
             if self.save_dirs.get('saves'):
                 return str(self.save_dirs['saves'])
@@ -5176,6 +5270,8 @@ class RetroArchInterface:
             expected = self.expected_save_dir()
             if expected:
                 return expected
+        if kind == 'roms':
+            return self.expected_rom_dir()
         retrodeck = detect_retrodeck()
         if retrodeck:
             return retrodeck['rom_directory' if kind == 'roms' else 'save_directory']

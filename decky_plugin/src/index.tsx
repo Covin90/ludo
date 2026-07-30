@@ -1561,6 +1561,9 @@ type EmuStatus = {
   // What each folder would be with nothing chosen, so a row can offer to go
   // back to it. '' means "clear it and let detection answer".
   default_paths: Record<string, string>;
+  // Where the detected emulator keeps things, existing yet or not — what a row
+  // shows when nothing is configured and nothing is on disk to detect.
+  expected_paths: Record<string, string>;
   // Whether Ludo can install an emulator itself. False on Windows, without
   // flatpak, or as root — the reason is what we show instead of the button.
   install: { available: boolean; reason: string };
@@ -1593,6 +1596,7 @@ async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
           bios_dir: r.bios_dir || '',
           configured_paths: r.configured_paths || {},
           default_paths: r.default_paths || {},
+          expected_paths: r.expected_paths || {},
           install: r.emulator_install || { available: false, reason: '' },
         });
       }
@@ -8834,11 +8838,14 @@ function FoldersSection() {
   const stale = status.stale_paths || [];
   const staleFor = (kind: string) => stale.find((p) => p.kind === kind);
 
-  // Detected fallbacks, shown when the user has set nothing. Only these two are
-  // discoverable — a ROM folder is ours to choose, so it has no detected value.
+  // Shown when the user has set nothing. What's on disk first, then where the
+  // emulator WILL keep it: a freshly installed emulator has created neither its
+  // saves nor its system folder, and "Not set" was a worse answer than the
+  // correct path. A ROM folder is ours to choose, so it has no detected value.
+  const expected = status.expected_paths || {};
   const detected: Record<string, string> = {
-    saves: status.save_dirs?.saves || '',
-    bios: status.bios_dir || '',
+    saves: status.save_dirs?.saves || expected.saves || '',
+    bios: status.bios_dir || expected.bios || '',
   };
 
   const write = async (kind: string, value: string) => {
@@ -8860,6 +8867,7 @@ function FoldersSection() {
           stale_paths: r.stale_paths || [], save_dirs: r.save_dirs || {},
           bios_dir: r.bios_dir || '', configured_paths: r.configured_paths || {},
           default_paths: r.default_paths || status.default_paths || {},
+          expected_paths: r.expected_paths || status.expected_paths || {},
         });
         toaster.toast({ title: 'Folders', body: value ? 'Folder updated' : 'Back to auto-detect' });
       } else {
