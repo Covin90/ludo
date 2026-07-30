@@ -55,20 +55,30 @@ def _save_locked():
         logging.debug(f"activity_log save failed: {e}")
 
 
-def record(kind, title, detail=''):
+def record(kind, title, detail='', rom_id=None):
     """Append one activity entry.
 
     kind: free-form tag the UI maps to an icon —
           'download' | 'sync' | 'save' | 'delete' | 'account' | 'error'
+    rom_id: optional, for entries that name one rom. Lets the UI turn the row
+          into a link to that game. Omitted from the entry entirely when not
+          given, so older logs and callers that don't pass it read back
+          unchanged.
     """
     with _lock:
         _load_locked()
-        _entries.append({
+        entry = {
             'kind': str(kind),
             'title': str(title),
             'detail': str(detail or ''),
             'timestamp': time.time(),
-        })
+        }
+        if rom_id is not None:
+            try:
+                entry['rom_id'] = int(rom_id)
+            except (TypeError, ValueError):
+                pass
+        _entries.append(entry)
         _save_locked()
 
 

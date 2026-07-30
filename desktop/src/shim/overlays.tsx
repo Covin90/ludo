@@ -87,6 +87,10 @@ export function ModalHost() {
 export type ToastOpts = {
   title?: ReactNode;
   body?: ReactNode;
+  // Decky's toast art slot — we render it leading the text, same as Steam.
+  // Callers pass a node that may render nothing (e.g. a game with no cover),
+  // so the layout has to survive an empty logo without leaving a gap.
+  logo?: ReactNode;
   duration?: number;
   critical?: boolean;
   onClick?: () => void;
@@ -121,7 +125,7 @@ function readToastPos(): string {
     const v = localStorage.getItem(TOAST_POS_KEY);
     if (v && TOAST_POSITIONS.includes(v)) return v;
   } catch { /* private mode / no storage */ }
-  return "top-right";
+  return "bottom-right";
 }
 
 export function ToastHost() {
@@ -143,11 +147,17 @@ export function ToastHost() {
       {toasts.map((t) => (
         <div
           key={t.id}
-          className={"shim-toast" + (t.critical ? " shim-toast-critical" : "")}
+          className={"shim-toast" + (t.critical ? " shim-toast-critical" : "")
+            // Only a toast that actually does something gets the pointer — most
+            // are pure notifications and shouldn't look pressable.
+            + (t.onClick ? " shim-toast-clickable" : "")}
           onClick={t.onClick}
         >
-          {t.title ? <div className="shim-toast-title">{t.title}</div> : null}
-          {t.body ? <div className="shim-toast-body">{t.body}</div> : null}
+          {t.logo ? <div className="shim-toast-logo">{t.logo}</div> : null}
+          <div className="shim-toast-text">
+            {t.title ? <div className="shim-toast-title">{t.title}</div> : null}
+            {t.body ? <div className="shim-toast-body">{t.body}</div> : null}
+          </div>
         </div>
       ))}
     </div>

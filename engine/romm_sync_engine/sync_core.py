@@ -7098,16 +7098,66 @@ class RetroArchInterface:
     _FLATPAK_STEP_RE = re.compile(r'(\d+)\s*/\s*(\d+)')
     # Rate uses the locale's decimal separator, hence [.,].
     _FLATPAK_RATE_RE = re.compile(r'(\d+(?:[.,]\d+)?\s*[kKMGT]?i?B/s)')
+    # A row of the pre-install table, e.g.
+    #   2.       org.libretro.RetroArch  stable  i  flathub  409,0 MB
+    # The leading "N." is what separates a ref row from flatpak's prose; the
+    # size is the trailing field, sometimes prefixed "< " and/or suffixed
+    # "(partial)" for a ref only part of which needs fetching.
+    _FLATPAK_ROW_RE = re.compile(
+        r'^\s*\d+\.\s.*?(?:<\s*)?(\d+(?:[.,]\d+)?)\s*(bytes|B|kB|KB|MB|GB|TB)'
+        r'\s*(?:\(partial\))?\s*$')
+    _SIZE_UNITS = {'bytes': 1, 'b': 1, 'kb': 1000, 'mb': 1000 ** 2,
+                   'gb': 1000 ** 3, 'tb': 1000 ** 4}
+
+    def _probe_install_size(self, env):
+        """Ask flatpak what the RetroArch install would download, without
+        downloading it: answer "n" to the confirmation prompt and read the ref
+        table it prints first.
+
+        Returns (total_bytes, [bytes per ref, in the order flatpak listed them])
+        or (0, []) when the table can't be read — an estimate is a nicety, so
+        every failure here is silent and the install proceeds without one.
+
+        The per-ref list matters as much as the total: flatpak's progress line
+        counts steps ("Installing 1/2"), and steps differ in size by an order of
+        magnitude — the KDE runtime dwarfs RetroArch itself — so weighting the
+        bar by these sizes is what stops it crawling through one step and
+        leaping through another. Sizes already account for what this user has:
+        an installed runtime is listed "(partial)" or not at all.
+        """
+        import subprocess
+        try:
+            p = subprocess.run(
+                ['flatpak', 'install', '--user', 'flathub', self.RETROARCH_APP_ID],
+                input='n\n', capture_output=True, text=True, timeout=120, env=env)
+        except Exception as e:
+            print(f"⚠️  Could not measure the download size: {e}")
+            return 0, []
+        sizes = []
+        for line in (p.stdout or '').splitlines():
+            m = self._FLATPAK_ROW_RE.match(line.strip())
+            if not m:
+                continue
+            # Locale decimal separator: "409,0 MB". No thousands separators
+            # appear at these magnitudes, so a lone comma is always decimal.
+            try:
+                n = float(m.group(1).replace(',', '.'))
+            except ValueError:
+                continue
+            sizes.append(int(n * self._SIZE_UNITS.get(m.group(2).lower(), 1)))
+        return sum(sizes), sizes
 
     def install_emulator(self, progress_callback=None):
         """Install RetroArch as a per-user flatpak.
 
         Blocking; run it off the UI thread. progress_callback receives
-        (phase, pct, detail) where pct is None while flatpak reports nothing
+        (phase, pct, detail, done_bytes, total_bytes) — or (phase, pct, detail)
+        if that is all it accepts. pct is None while flatpak reports nothing
         parseable (resolving refs, verifying) — the caller should show an
         indeterminate state rather than 0% — and detail is a short human string
         like '1,2 MB/s' or '' when there is nothing to add. pct is progress
-        across the WHOLE install, not the current step.
+        across the WHOLE install, not the current step. done_bytes/total_bytes
+        are None when the size probe came up empty.
 
         Returns {'success': bool, 'message': str, 'status': emulator_status()}.
         """
@@ -7120,10 +7170,26 @@ class RetroArchInterface:
 
         env = self._host_subprocess_env()
 
-        def report(phase, pct=None, detail=''):
+        # Byte counts are new; callers written against the older three-argument
+        # callback (this module is shared) must keep working, so ask the
+        # callback what it accepts once rather than guessing per call.
+        wants_bytes = True
+        if progress_callback:
+            try:
+                import inspect
+                inspect.signature(progress_callback).bind('', None, '', None, None)
+            except TypeError:
+                wants_bytes = False
+            except Exception:
+                pass
+
+        def report(phase, pct=None, detail='', done=None, total=None):
             if progress_callback:
                 try:
-                    progress_callback(phase, pct, detail)
+                    if wants_bytes:
+                        progress_callback(phase, pct, detail, done, total)
+                    else:
+                        progress_callback(phase, pct, detail)
                 except Exception:
                     pass
 
@@ -7141,9 +7207,18 @@ class RetroArchInterface:
             # Not fatal — the install below may still resolve against an
             # existing remote, and its error message will be the better one.
 
-        # 2. The install itself. ~300 MB plus the runtime, so the timeout is
-        #    generous and progress is streamed rather than waited on.
-        report('Downloading')
+        # 2. How big is this? Only flatpak knows: the app is a few hundred MB,
+        #    but whether the KDE runtime rides along (another ~1 GB) depends on
+        #    what this machine already has. A few seconds here buys a real
+        #    "X of Y MB" instead of a hardcoded guess.
+        total_bytes, step_sizes = self._probe_install_size(env)
+        if total_bytes:
+            print(f"📦 RetroArch install: {total_bytes / 1000 ** 2:.0f} MB to download")
+
+        # 3. The install itself. Hundreds of MB plus the runtime, so the timeout
+        #    is generous and progress is streamed rather than waited on.
+        report('Downloading', None, '', 0 if total_bytes else None,
+               total_bytes or None)
         # -y (assume yes) but NOT --noninteractive: that flag suppresses the
         # per-operation progress output this method parses, so the UI could only
         # ever show an indeterminate bar. stdin is closed below, so an
@@ -7195,7 +7270,7 @@ class RetroArchInterface:
                     else:
                         phase = 'Downloading'
 
-                    pct = None
+                    pct, done = None, None
                     if m:
                         pct = min(100, int(m.group(1)))
                         if step:
@@ -7203,9 +7278,26 @@ class RetroArchInterface:
                             # only ever goes up: finished steps plus this one's
                             # share. Otherwise the bar resets per component.
                             i, total = int(step.group(1)), max(1, int(step.group(2)))
-                            pct = int(min(100, ((min(i, total) - 1) + pct / 100)
-                                          / total * 100))
-                    report(phase, pct, rate.group(1).replace(',', '.') if rate else '')
+                            i = min(i, total)
+                            frac = pct / 100
+                            if total_bytes and len(step_sizes) == total:
+                                # Weight by real sizes when the probe's ref list
+                                # lines up with the steps flatpak is counting.
+                                done = sum(step_sizes[:i - 1]) + step_sizes[i - 1] * frac
+                                pct = int(min(100, done / total_bytes * 100))
+                            else:
+                                pct = int(min(100, (i - 1 + frac) / total * 100))
+                        # No step counter in this line — flatpak omits it when
+                        # there is only one operation, and that is the common
+                        # case (the runtime is usually already installed). The
+                        # percentage is then already whole-install progress, so
+                        # scale the total by it rather than leaving the byte
+                        # counter pinned at 0 while the bar climbs.
+                        if total_bytes and done is None:
+                            done = total_bytes * pct / 100
+                    report(phase, pct, rate.group(1).replace(',', '.') if rate else '',
+                           int(done) if done is not None else None,
+                           total_bytes or None)
             proc.wait(timeout=60)
         except Exception as e:
             try:
@@ -7222,7 +7314,7 @@ class RetroArchInterface:
                     'message': msg or f'flatpak install failed (exit {proc.returncode})',
                     'status': self.emulator_status()}
 
-        # 3. Re-detect. Everything downstream (cores dir, save dirs, launch
+        # 4. Re-detect. Everything downstream (cores dir, save dirs, launch
         #    command) was resolved against "no emulator" and is now wrong.
         report('Finishing')
         status = self.refresh_installation()

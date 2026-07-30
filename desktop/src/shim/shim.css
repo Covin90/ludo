@@ -32,6 +32,21 @@ body {
   font-size: 14px;
 }
 
+/* This is a console-style UI driven by a gamepad, not a document — dragging a
+   selection across a game title only ever leaves stray blue highlight behind.
+   Text inputs are exempted: they still need caret placement and drag-select. */
+body {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+input,
+textarea,
+[contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 .shim-app {
   min-height: 100%;
   position: relative;
@@ -406,11 +421,33 @@ div[class*="v2pf-"] > div {
   -webkit-backdrop-filter: blur(12px);
   backdrop-filter: blur(12px);
   max-width: 360px;
-  padding: 12px 14px 12px 16px;
+  /* Roomy on purpose: the whole surface is the hover/click target on clickable
+     toasts, so the tint needs space between the text and the border. Extra on
+     the left clears the accent rail (::before). */
+  padding: 14px 18px 14px 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
   overflow: hidden;
   pointer-events: auto;
   font-family: "Motiva Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
   animation: shimToastIn 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Toasts that navigate somewhere (a finished download → the game) read as
+   pressable; the rest stay inert. */
+.shim-toast-clickable {
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.shim-toast-clickable:hover {
+  border-color: #8b74e8;
+  background: rgba(28, 26, 46, 0.94);
+  /* Border + flush 1px ring, the same hover the pill-shaped triggers use in
+     index.tsx (UserPill, the group header's count). Stacked on the drop shadow
+     so the toast keeps its elevation while hovered. */
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px #8b74e8;
 }
 
 /* Brand accent rail down the leading edge. */
@@ -429,6 +466,23 @@ div[class*="v2pf-"] > div {
 }
 .shim-toast-critical::before {
   background: #ff5050;
+}
+
+/* Art (game cover) leading the text, when the caller supplied a logo.
+   `:empty` hides the slot when the node rendered nothing — a rom with no
+   cover art returns null, and without this the flex gap would leave the text
+   indented for art that isn't there. */
+.shim-toast-logo {
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+.shim-toast-logo:empty {
+  display: none;
+}
+
+.shim-toast-text {
+  min-width: 0;
 }
 
 .shim-toast-title {

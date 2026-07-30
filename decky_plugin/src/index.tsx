@@ -26,7 +26,9 @@ const getServiceStatus = callable<[], any>("get_service_status");
 const notifyNetworkState = callable<[boolean], any>("notify_network_state");
 const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number }> }>("drain_notifications");
 const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
-const getRecentActivity = callable<[number], { events: Array<{ kind: string, title: string, detail: string, timestamp: number }> }>("get_recent_activity");
+// `rom_id` is present only on entries that name a single rom (downloads), and
+// only on entries written since it was added — older persisted logs lack it.
+const getRecentActivity = callable<[number], { events: Array<{ kind: string, title: string, detail: string, timestamp: number, rom_id?: number }> }>("get_recent_activity");
 const clearRecentActivity = callable<[], any>("clear_recent_activity");
 const getLoggingEnabled = callable<[], boolean>("get_logging_enabled");
 const updateLoggingEnabled = callable<[boolean], boolean>("set_logging_enabled");
@@ -402,6 +404,32 @@ function CoverPip({ romId, hasCover, hidden }:
   );
 }
 
+// Box art for a toast's logo slot, so a "Downloaded" notification shows the
+// game rather than just naming it. The cover is nearly always already in
+// `_coverCache` — the tile the user pressed painted it — so this renders on the
+// first frame; a cache miss loads in behind nothing rather than reserving an
+// empty box, and a rom with no art renders nothing at all, which lets the host
+// fall back to its own icon instead of showing a grey rectangle.
+function ToastCover({ romId, hasCover }: { romId: number; hasCover: boolean }) {
+  const ck = `cover:${romId}:false`;
+  const [uri, setUri] = useState<string | null>(peekCover(ck) ?? null);
+  useEffect(() => {
+    if (!hasCover || peekCover(ck) !== undefined) return;
+    let alive = true;
+    awaitCover(ck, () => qGetGameCover(romId, false))
+      .then((u) => { if (alive) setUri(u); })
+      .catch(() => { /* no art, no logo */ });
+    return () => { alive = false; };
+  }, [romId]);
+  if (!uri) return null;
+  return (
+    <img src={uri} style={{
+      width: '32px', aspectRatio: '3 / 4', objectFit: 'cover', display: 'block',
+      borderRadius: V2.radiusSm, border: '1px solid rgba(255,255,255,0.12)',
+    }} />
+  );
+}
+
 // A single library grid card: art-only with a centered, single-line label
 // underneath (RomM's GameCard language). Focus/hover scales the art and paints
 // the brand glow; activating it opens the game; gaining focus feeds the cover
@@ -509,11 +537,15 @@ function useBatchJob(key: string | null): BatchJob | null {
   }, []);
   return key ? (_batchJobs.get(key) || null) : null;
 }
-async function runCollectionBatch(jobKey: string, items: { id: number; name: string }[]): Promise<void> {
+// `onOpen` (optional) makes this batch's toasts clickable — it should navigate
+// to the collection the batch belongs to. Passed in rather than derived from
+// jobKey because only the caller knows the mode and the sibling groups the
+// grid header pages through.
+async function runCollectionBatch(jobKey: string, items: { id: number; name: string }[], onOpen?: () => void): Promise<void> {
   if (_batchJobs.has(jobKey) || items.length === 0) return;
   _batchJobs.set(jobKey, { done: 0, ok: 0, total: items.length, ids: items.map((i) => i.id) });
   _notifyDl();
-  toaster.toast({ title: 'Syncing collection', body: `Downloading ${items.length} game${items.length === 1 ? '' : 's'}` });
+  toaster.toast({ title: 'Syncing collection', body: `Downloading ${items.length} game${items.length === 1 ? '' : 's'}`, onClick: onOpen });
   let ok = 0;
   try {
     ok = await downloadBatch(items, 3, (done, okN) => {
@@ -523,7 +555,7 @@ async function runCollectionBatch(jobKey: string, items: { id: number; name: str
   } finally {
     _batchJobs.delete(jobKey); _notifyDl();
   }
-  toaster.toast({ title: 'Sync complete', body: `${ok} of ${items.length} downloaded` });
+  toaster.toast({ title: 'Sync complete', body: `${ok} of ${items.length} downloaded`, onClick: onOpen });
   // Any mounted grid refetches its list so downloaded dots reflect the batch
   // even if the page that started it was unmounted meanwhile.
   _broadcastLibRefresh();
@@ -1124,7 +1156,18 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
       const start = await downloadGame(game.rom_id);
       if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
       const res = await awaitDownload(game.rom_id);
-      if (res.ok) { setDl(true); libCacheSetDownloaded(game.rom_id, true); toaster.toast({ title: 'Downloaded', body: game.name }); }
+      if (res.ok) {
+        setDl(true); libCacheSetDownloaded(game.rom_id, true);
+        toaster.toast({
+          title: 'Downloaded', body: game.name,
+          logo: <ToastCover romId={game.rom_id} hasCover={game.has_cover} />,
+          // Clicking the toast opens the game it names. Origin is the library
+          // root because the toast can outlive whatever page started the
+          // download — backing out to a page that's no longer there would strand
+          // the user.
+          onClick: () => openGameById(game.rom_id, game.name, "/romm-sync-library"),
+        });
+      }
       else toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
     } catch (e) { toaster.toast({ title: 'Download failed', body: String(e) }); }
     finally { _setDlActive(game.rom_id, false); setBusy(null); }
@@ -1167,7 +1210,15 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
         if (res.ok) {
           setDownloadedRegionIds(prev => new Set([...prev, selectedRomId]));
           if (isMainRom) { setDl(true); libCacheSetDownloaded(game.rom_id, true); }
-          toaster.toast({ title: 'Downloaded', body: game.name });
+          // The main rom's art even when a regional sibling was the download —
+          // it's the same game, and only `game` carries a known has_cover.
+          toaster.toast({
+            title: 'Downloaded', body: game.name,
+            logo: <ToastCover romId={game.rom_id} hasCover={game.has_cover} />,
+            // The main rom again, not selectedRomId: the detail page is the
+            // game's, and regional siblings don't have one of their own.
+            onClick: () => openGameById(game.rom_id, game.name, "/romm-sync-library"),
+          });
         } else {
           toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
           return;
@@ -1656,11 +1707,19 @@ function staleCopy(stale: EmuStalePath[]): { title: string; body: string } {
 }
 
 // ── RetroArch install ───────────────────────────────────────────────────────
-// The install runs in a backend thread (a ~300 MB flatpak); the UI polls its
+// The install runs in a backend thread (a few hundred MB of flatpak, plus the
+// KDE runtime if it isn't already there); the UI polls its
 // progress. Module-level so the Home banner and the Emulator page show the same
 // run, and so navigating away mid-install doesn't orphan it.
-type EmuInstall = { active: boolean; phase: string; pct: number | null; detail: string; error: string | null };
-let _emuInstall: EmuInstall = { active: false, phase: '', pct: null, detail: '', error: null };
+type EmuInstall = {
+  active: boolean; phase: string; pct: number | null; detail: string; error: string | null;
+  // Real byte counts from flatpak's own ref table, or null when it couldn't be
+  // read — the size varies hugely with whether the KDE runtime tags along, so
+  // there is no sane fallback number to invent.
+  bytesDone: number | null; bytesTotal: number | null;
+};
+let _emuInstall: EmuInstall = { active: false, phase: '', pct: null, detail: '', error: null,
+                                bytesDone: null, bytesTotal: null };
 const _emuInstallSubs = new Set<() => void>();
 let _emuInstallPoll: any = null;
 
@@ -1677,6 +1736,7 @@ function _pollInstall() {
       _publishInstall({
         active: !!r?.active, phase: r?.phase || '',
         pct: r?.pct ?? null, detail: r?.detail || '', error: r?.error || null,
+        bytesDone: r?.bytes_done ?? null, bytesTotal: r?.bytes_total ?? null,
       });
       if (!r?.active) {
         clearInterval(_emuInstallPoll); _emuInstallPoll = null;
@@ -1692,8 +1752,8 @@ function _pollInstall() {
           toaster.toast({
             title: 'RetroArch',
             body: fixed.length
-              ? `Installed, and pointed ${fixed.join(' and ').toLowerCase()} at it. Now pick cores for your platforms.`
-              : 'Installed — pick cores for your platforms',
+              ? `Installed, and pointed ${fixed.join(' and ').toLowerCase()} at it.`
+              : 'Installed',
           });
         }
       }
@@ -1702,18 +1762,29 @@ function _pollInstall() {
 }
 
 async function startEmulatorInstall() {
-  _publishInstall({ active: true, phase: 'Starting…', pct: null, detail: '', error: null });
+  _publishInstall({ active: true, phase: 'Starting…', pct: null, detail: '', error: null, bytesDone: null, bytesTotal: null });
   try {
     const r = await installEmulator();
     if (!r?.success) {
-      _publishInstall({ active: false, phase: '', pct: null, detail: '', error: r?.message || 'Could not start the install' });
+      _publishInstall({ active: false, phase: '', pct: null, detail: '', error: r?.message || 'Could not start the install', bytesDone: null, bytesTotal: null });
       toaster.toast({ title: 'RetroArch', body: r?.message || 'Could not start the install' });
       return;
     }
     _pollInstall();
   } catch (e) {
-    _publishInstall({ active: false, phase: '', pct: null, detail: '', error: String(e) });
+    _publishInstall({ active: false, phase: '', pct: null, detail: '', error: String(e), bytesDone: null, bytesTotal: null });
   }
+}
+
+// "142 MB of 409 MB" while the sizes are known, '' when flatpak's ref table
+// couldn't be read — better to say nothing than to quote a made-up total.
+// flatpak reports SI sizes, so divide by 1000, not 1024, to match what it and
+// Flathub show for the same app.
+function installSize(s: EmuInstall): string {
+  if (!s.bytesTotal) return '';
+  const mb = (n: number) => `${Math.round(n / 1e6)} MB`;
+  return s.bytesDone == null ? mb(s.bytesTotal)
+    : `${mb(s.bytesDone)} of ${mb(s.bytesTotal)}`;
 }
 
 function useEmulatorInstall(): EmuInstall {
@@ -1782,7 +1853,9 @@ function CollectionTile({ group, onOpen, focusRef, focusable }: { group: LibGrou
           if (!missing.length) { toaster.toast({ title: 'Nothing to sync', body: 'All games are already downloaded' }); return; }
           // Shared module-level batch: same job key as the collection page, so
           // opening the collection mid-batch shows the running header progress.
-          runCollectionBatch(`collection:${group.key}`, missing);
+          // Toast click reuses the tile's own open handler, so it lands on the
+          // collection with the same sibling list the tile would have given it.
+          runCollectionBatch(`collection:${group.key}`, missing, () => onOpen(group));
         }}>{isVirtual ? 'Download missing' : 'Sync missing'}</MenuItem>
         {!isVirtual && (
           <MenuItem tone="destructive" onSelected={() => {
@@ -3712,6 +3785,51 @@ function libCacheSetDownloaded(romId: number, downloaded: boolean) {
   // runCollectionBatch); mirror that here for the single-game path.
   _broadcastLibRefresh();
 }
+// Find a cached LibGame by rom id, across every group it might sit in. Used to
+// open a game from somewhere that only knows an id (the Downloads page's
+// completed list). Returns null when nothing is cached — see openGameById for
+// what happens then.
+function libCacheFindGame(romId: number): LibGame | null {
+  for (const [, list] of _libGamesCache) {
+    const g = list.find((x) => x.rom_id === romId);
+    if (g) return g;
+  }
+  // Home's rows aren't in _libGamesCache, and a just-downloaded game is very
+  // likely sitting in one of them.
+  for (const list of [_homeCache?.downloaded, _homeCache?.recent, _homeCache?.continuePlaying]) {
+    const g = list?.find((x) => x.rom_id === romId);
+    if (g) return g;
+  }
+  return null;
+}
+
+// Open the game detail page knowing only a rom id (and, at best, a name).
+// GameDetailPage fetches its own detail from the backend, so a stub is enough
+// to render — the cached LibGame is preferred only because it paints the name,
+// platform and downloaded state on the first frame instead of after the fetch.
+function openGameById(romId: number, name: string, origin: string) {
+  const cached = libCacheFindGame(romId);
+  _libGameHolder = cached || {
+    rom_id: romId, name, platform: null,
+    is_downloaded: true, has_cover: true,
+  };
+  _libGameOrigin = origin;
+  if (_libPushView) _libPushView('game');
+  else Navigation.Navigate(`/romm-sync-game/${romId}`);
+}
+
+// Open a platform/collection grid from outside the library (a toast click).
+// Siblings are optional but strongly preferred: the grid header's carousel pages
+// through them with L1/R1, and leaving a stale list from a different mode behind
+// means the selected group isn't in its own carousel.
+function openGroupPage(mode: string, group: LibGroup, siblings?: LibGroup[]) {
+  _libGroupHolder = { mode, group };
+  if (siblings?.length) _libGroupsHolder = { mode, groups: siblings };
+  else if (_libGroupsHolder?.mode !== mode) _libGroupsHolder = { mode, groups: [group] };
+  if (_libPushView) _libPushView('grid');
+  else Navigation.Navigate(`/romm-sync-library/${encodeURIComponent(group.key)}`);
+}
+
 function persistHomeCache() {
   if (!_lsAvail || !_homeCache) return;
   try { localStorage.setItem(_LS_HOME_KEY, JSON.stringify({ t: Date.now(), v: _homeCache })); } catch { }
@@ -4194,6 +4312,13 @@ function slotLabel(e: HistoryEntry): string {
 // so our focus glows survive.
 const V2_FOCUS_STYLE = `
   .romm-ui *:focus, .romm-ui *:focus-visible { outline: none !important; }
+  /* Nothing here is a document to be read and copied — drag-selecting a game
+     title just leaves stray highlight behind. Scoped to .romm-ui so Steam's own
+     UI is untouched; inputs keep selection so the caret still works. */
+  .romm-ui { user-select: none; -webkit-user-select: none; }
+  .romm-ui input, .romm-ui textarea, .romm-ui [contenteditable="true"] {
+    user-select: text; -webkit-user-select: text;
+  }
 `;
 
 // Shared list-row / tile hover+focus treatment — the canonical RomM interaction
@@ -4871,7 +4996,7 @@ function InstallProgressBar({ pct }: { pct: number | null }) {
           borderRadius: V2.radiusPill,
           background: `linear-gradient(90deg, ${V2.brand}, ${V2.brandHover})`,
           transition: known ? 'width 0.4s ease-out' : 'none',
-          animation: known ? undefined : 'rommIndet 1.4s ease-in-out infinite',
+          animation: known ? undefined : 'rommIndet 1.4s linear infinite',
         }} />
       </div>
       <span style={{
@@ -4879,10 +5004,13 @@ function InstallProgressBar({ pct }: { pct: number | null }) {
         minWidth: '34px', textAlign: 'right', fontVariantNumeric: 'tabular-nums',
       }}>{known ? `${pct}%` : '…'}</span>
       {/* Per-component keyframes, the convention everywhere else in this file.
-          `spin` is here too because the banner's own Fix button asks for it. */}
+          `spin` is here too because the banner's own Fix button asks for it.
+          The offsets are in units of the SWEEPER's width (35% of the track), so
+          -115% is what actually parks it off the left edge and 300% clears the
+          right — a smaller start left it half-visible at 0%, popping in. */}
       <style>{`
         @keyframes rommIndet {
-          0%   { transform: translateX(-40%); }
+          0%   { transform: translateX(-115%); }
           100% { transform: translateX(300%); }
         }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
@@ -4929,8 +5057,9 @@ function EmulatorBanner() {
 
   const body = install.active
     ? [install.phase || 'Installing RetroArch',
+       installSize(install),
        install.detail,
-       'This is a ~300 MB download — you can keep browsing while it runs.']
+       'You can keep browsing while it runs.']
       .filter(Boolean).join(' · ')
     : status.installed
       ? copy.body
@@ -6052,7 +6181,10 @@ function LibraryGamesPage() {
     if (!group || syncJob) return; // already running for this group
     const missing = games.filter((g) => !g.is_downloaded).map((g) => ({ id: g.rom_id, name: g.name }));
     if (missing.length === 0) { toaster.toast({ title: 'Nothing to sync', body: 'All games are already downloaded' }); return; }
-    runCollectionBatch(cacheKey(group.key), missing);
+    // Started from this page, but the toast can land long after the user has
+    // navigated away — so it still needs a way back to this collection.
+    const g = group, sibs = siblings;
+    runCollectionBatch(cacheKey(group.key), missing, () => openGroupPage(mode, g, sibs));
   };
 
   // Re-pull the list when a batch completes anywhere (runCollectionBatch fires
@@ -6334,7 +6466,11 @@ function LibraryGamesPage() {
             onMouseEnter={() => setActHot(true)} onMouseLeave={() => setActHot(false)}
             style={{
               flexShrink: 0, width: `${railW}px`, boxSizing: 'border-box',
-              padding: '0 12px 0 4px', overflow: 'hidden',
+              // Vertical padding exists purely so the pill's focus ring has room:
+              // `overflow: hidden` is here to clip the width slide, and with a
+              // content-height box it cropped the ring off entirely, leaving only
+              // the border to show focus.
+              padding: '6px 12px 6px 4px', overflow: 'hidden',
               fontSize: '11px',
               cursor: 'pointer', transition: 'width 0.32s cubic-bezier(0.22, 1, 0.36, 1)',
               color: V2.fgMuted,
@@ -6346,10 +6482,16 @@ function LibraryGamesPage() {
             <div ref={railRef} style={{
               display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
               gap: '6px', whiteSpace: 'nowrap', flexShrink: 0, textAlign: 'right',
-              padding: '4px 8px', borderRadius: V2.radiusPill, boxSizing: 'border-box',
-              border: `1px solid ${actHot ? V2.brand : V2.border}`,
+              // Roomier than the text needs: the tint is the hover affordance, so
+              // it has to have some body to it. UserPill gets its height from a
+              // 30px avatar rather than padding, so matching it means padding here.
+              padding: '7px 14px', borderRadius: V2.radiusPill, boxSizing: 'border-box',
+              // Same treatment as UserPill in the top bar — the other pill-shaped
+              // menu trigger in the chrome. Kept literal rather than via V2Focus
+              // so the two stay visibly identical; if one moves, move both.
+              border: `1px solid ${actHot ? V2.brand : V2.borderStrong}`,
               boxShadow: actHot ? `0 0 0 1px ${V2.brand}` : 'none',
-              background: actHot ? V2.surfaceHover : V2.surface,
+              background: actHot ? 'rgba(255,255,255,0.10)' : V2.surface,
               color: actHot ? V2.fg : V2.fgMuted,
               transition: 'background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease',
             }}>
@@ -7514,7 +7656,13 @@ function GameDetailPage() {
       }
       const res = await awaitDownload(game.rom_id);
       if (res.ok) {
-        toaster.toast({ title: 'Downloaded', body: detail?.name || game.name });
+        toaster.toast({
+          title: 'Downloaded', body: detail?.name || game.name,
+          logo: <ToastCover romId={game.rom_id} hasCover={game.has_cover} />,
+          // Started from this page, but the toast outlives it — a click has to
+          // bring the user back rather than do nothing.
+          onClick: () => openGameById(game.rom_id, detail?.name || game.name, "/romm-sync-library"),
+        });
         setIsDownloaded(true);
         libCacheSetDownloaded(game.rom_id, true);
       } else {
@@ -8383,6 +8531,56 @@ function StatsPage() {
 // Downloads page: every in-flight download (per-game registry + backend
 // collection auto-sync passes) with live progress, plus recently completed
 // downloads from the backend activity log. Opened from the account menu.
+// One "Recently completed" row. Focusable and openable when the activity entry
+// carries a rom_id — A jumps to that game's detail page. Entries without one
+// (failures, and anything logged before rom_id was recorded) render as inert
+// text rather than as a focus target that does nothing when pressed.
+function CompletedDownloadRow({ event, first }: {
+  event: { kind: string; title: string; detail: string; timestamp: number; rom_id?: number };
+  first: boolean;
+}) {
+  const { active, highlightHandlers } = useRowHighlight();
+  const name = event.detail || event.title;
+  const romId = event.rom_id;
+  const open = romId != null
+    ? () => openGameById(romId, name, "/romm-sync-downloads")
+    : undefined;
+  return (
+    <Focusable noFocusRing
+      // `focusable` isn't in @decky/ui's prop types but is honoured at runtime —
+      // same cast the tiles use to drop out of gamepad nav.
+      {...({ focusable: !!open } as any)}
+      onActivate={open}
+      onClick={open}
+      {...highlightHandlers}
+      style={{
+        display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 14px',
+        borderTop: first ? 'none' : `1px solid ${V2.border}`,
+        background: active && open ? V2.surfaceHover : 'transparent',
+        // Inset ring rather than a border: these rows share one card, and a
+        // real border would break its outline (same reasoning as V2CardRow).
+        boxShadow: active && open ? `inset 0 0 0 2px ${V2.brand}` : 'none',
+        cursor: open ? 'pointer' : 'default',
+        transition: 'background 0.15s, box-shadow 0.15s',
+      }}>
+      <div style={{ flexShrink: 0, color: V2.success, display: 'flex' }}><FaCheckCircle size={13} /></div>
+      <div style={{
+        flex: '1 1 auto', minWidth: 0, fontSize: '12.5px', fontWeight: 600, color: V2.fg,
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+      }}>{name}</div>
+      <div style={{ flexShrink: 0, fontSize: '10.5px', color: V2.fgMuted, whiteSpace: 'nowrap' }}>
+        {fmtAgo(event.timestamp)}
+      </div>
+      {open && (
+        <div style={{
+          flexShrink: 0, display: 'flex', color: active ? V2.fg2 : V2.fgMuted,
+          opacity: active ? 1 : 0.5, transition: 'opacity 0.15s, color 0.15s',
+        }}><FaChevronRight size={11} /></div>
+      )}
+    </Focusable>
+  );
+}
+
 function DownloadsPage() {
   const activeDls = useActiveDownloads();
   const queued = useQueuedDownloads();
@@ -8530,19 +8728,7 @@ function DownloadsPage() {
               Nothing yet — finished downloads will show up here.
             </div>
           ) : recent.map((e, i) => (
-            <div key={`${e.timestamp}-${i}`} style={{
-              display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 14px',
-              borderTop: i > 0 ? `1px solid ${V2.border}` : 'none',
-            }}>
-              <div style={{ flexShrink: 0, color: V2.success, display: 'flex' }}><FaCheckCircle size={13} /></div>
-              <div style={{
-                flex: '1 1 auto', minWidth: 0, fontSize: '12.5px', fontWeight: 600, color: V2.fg,
-                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-              }}>{e.detail || e.title}</div>
-              <div style={{ flexShrink: 0, fontSize: '10.5px', color: V2.fgMuted, whiteSpace: 'nowrap' }}>
-                {fmtAgo(e.timestamp)}
-              </div>
-            </div>
+            <CompletedDownloadRow key={`${e.timestamp}-${i}`} event={e} first={i === 0} />
           ))}
         </V2StatsSectionBox>
       </div>
@@ -8698,11 +8884,13 @@ function NoEmulatorSection({ status }: { status: EmuStatus }) {
       <V2SettingsRow icon={<FaGamepad size={16} />}
         title={install.active ? 'Installing RetroArch…' : 'No emulator installed'}
         subtitle={install.active
-          ? (install.pct != null ? `${install.phase || 'Installing'} · ${install.pct}%` : (install.phase || 'This takes a few minutes.'))
+          ? [install.phase || 'Installing', install.pct != null ? `${install.pct}%` : '',
+             installSize(install)].filter(Boolean).join(' · ')
+            || 'This takes a few minutes.'
           : install.error
             ? install.error
             : canInstall
-              ? 'Ludo can download and sync your library, but it needs RetroArch or RetroDECK to launch anything. A installs RetroArch from Flathub (~300 MB).'
+              ? 'Ludo can download and sync your library, but it needs RetroArch or RetroDECK to launch anything. A installs RetroArch from Flathub — Ludo checks the download size first.'
               : `Ludo can download and sync your library, but it needs RetroArch or RetroDECK to launch anything. ${status.install.reason || 'Install one, then re-check.'}`}
         onClick={install.active || !canInstall ? undefined : startEmulatorInstall}
         right={install.active
@@ -8954,8 +9142,13 @@ function UpdateActionBtn({ label, icon, onClick, disabled, primary, progress, bu
         ...V2Focus.flat(focused && !disabled, { glow: primary || filling }),
       }}>
       {/* Keyframes for the busy shimmer — scoped, defined inline so this works
-          regardless of which other components happen to be mounted. */}
-      <style>{`@keyframes uabShimmer { 0% { transform: translateX(-60%); } 100% { transform: translateX(160%); } }`}</style>
+          regardless of which other components happen to be mounted.
+          translateX percentages are relative to the SWEEPER's width (55% of the
+          button), not the button's, so the loop has to overshoot to clear both
+          edges: -100% parks it fully off the left, and 200% (= 110% of the
+          button) carries it fully off the right. Anything less leaves a bright
+          edge on screen when the iteration restarts, which reads as a stutter. */}
+      <style>{`@keyframes uabShimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(200%); } }`}</style>
       {filling && (
         <div style={{
           position: 'absolute', inset: 0, width: `${Math.max(2, progress ?? 0)}%`,
@@ -8966,7 +9159,7 @@ function UpdateActionBtn({ label, icon, onClick, disabled, primary, progress, bu
         <div style={{
           position: 'absolute', top: 0, bottom: 0, left: 0, width: '55%', zIndex: 2,
           background: `linear-gradient(90deg, transparent 0%, ${filling || primary ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.14)'} 50%, transparent 100%)`,
-          animation: 'uabShimmer 1.15s ease-in-out infinite', pointerEvents: 'none',
+          animation: 'uabShimmer 1.15s linear infinite', pointerEvents: 'none',
         }} />
       )}
       <div style={{
@@ -9226,8 +9419,8 @@ function SettingsPage() {
   // __rommDesktop object so this section never renders there.
   const isDesktop = !!(window as any).__rommDesktop;
   const [toastPos, setToastPos] = useState<string>(() => {
-    try { return localStorage.getItem('romm:toastPos') || 'top-right'; }
-    catch { return 'top-right'; }
+    try { return localStorage.getItem('romm:toastPos') || 'bottom-right'; }
+    catch { return 'bottom-right'; }
   });
   const handleToastPos = (pos: string) => {
     setToastPos(pos);
@@ -9235,29 +9428,47 @@ function SettingsPage() {
     try { window.dispatchEvent(new Event('romm:toastpos')); } catch { /* ignore */ }
   };
 
+  // Whether the answers that decide the page's *shape* have landed. The
+  // RetroDECK and Steam sections sit above everything else and only exist on
+  // some machines, so painting before we know pushes the rest of the page down
+  // a step at a time as each reply arrives. Hold the body for one round-trip
+  // instead and it arrives whole. See `shapeTimer` below for the escape hatch.
+  const [shapeReady, setShapeReady] = useState<boolean>(false);
+
   useEffect(() => {
-    (async () => {
-      // The "RomM" tile is mandatory and auto-created at plugin load. Reconcile
-      // here too (the shortcut store is reliably ready by the time Settings opens)
-      // to sweep duplicates and repair the survivor's exe/name/art after updates.
-      try { await reconcileRommTile(); } catch { /* ignore */ }
-      try {
-        const cfg = await getConfig();
-        const url = cfg?.url || '';
-        // Prefer the live RomM account name; never show the stored credential/token.
-        let name = '';
-        try { name = (await getAccountUsername())?.username || ''; } catch { /* ignore */ }
-        setServerInfo(name && url ? `${name} · ${url}` : (name || url || ''));
-        setRdDetected(!!cfg?.retrodeck_detected);
-      } catch { /* ignore */ }
-      try { setRdButton(await getRetrodeckButtonEnabled()); } catch { /* ignore */ }
-      if ((window as any).__rommDesktop) {
-        try {
-          const st = await getSteamTileStatus();
-          setTileState({ available: !!st?.available, installed: !!st?.installed });
-        } catch { /* ignore */ }
-      }
+    // The "RomM" tile is mandatory and auto-created at plugin load. Reconcile
+    // here too (the shortcut store is reliably ready by the time Settings opens)
+    // to sweep duplicates and repair the survivor's exe/name/art after updates.
+    // Deliberately not awaited: nothing on this page renders from it, and
+    // chaining it in front of the reads it doesn't feed just delays the paint.
+    try { reconcileRommTile()?.catch?.(() => { /* ignore */ }); } catch { /* ignore */ }
+
+    // Never let a wedged IPC hide the whole page — show what we have and let
+    // the stragglers fill in, which is the old behaviour but only as a fallback.
+    const shapeTimer = setTimeout(() => setShapeReady(true), 1500);
+
+    // These reads are independent of each other, so run them together rather
+    // than awaiting in a chain; the page's first paint costs one round-trip,
+    // not five.
+    const config = (async () => {
+      const cfg = await getConfig();
+      const url = cfg?.url || '';
+      // Prefer the live RomM account name; never show the stored credential/token.
+      let name = '';
+      try { name = (await getAccountUsername())?.username || ''; } catch { /* ignore */ }
+      setServerInfo(name && url ? `${name} · ${url}` : (name || url || ''));
+      setRdDetected(!!cfg?.retrodeck_detected);
     })();
+    const rdBtn = (async () => { setRdButton(await getRetrodeckButtonEnabled()); })();
+    const tile = (async () => {
+      if (!(window as any).__rommDesktop) return;
+      const st = await getSteamTileStatus();
+      setTileState({ available: !!st?.available, installed: !!st?.installed });
+    })();
+
+    Promise.all([config, rdBtn, tile].map((p) => p.catch(() => { /* ignore */ })))
+      .then(() => { clearTimeout(shapeTimer); setShapeReady(true); });
+    return () => clearTimeout(shapeTimer);
   }, []);
 
   const handleRdButtonToggle = async (enabled: boolean) => {
@@ -9322,13 +9533,16 @@ function SettingsPage() {
       }
     };
     loadSettings();
-    // Load version + update channel
+    // Load version + update channel. Three unrelated reads, so fetch them at
+    // once — serialised, they made the Updates section fill in field by field.
     (async () => {
       try {
-        setVersion(await getPluginVersion());
-        const ch = await getUpdateChannel();
+        const [ver, ch, onStartup] = await Promise.all([
+          getPluginVersion(), getUpdateChannel(), getCheckOnStartup(),
+        ]);
+        setVersion(ver);
         setChannel(ch);
-        setCheckOnStartupState(await getCheckOnStartup());
+        setCheckOnStartupState(onStartup);
         // Auto-check when the section opens so the state is visible without a
         // button press (cached — see _updCheckCache).
         runUpdateCheck(ch, false);
@@ -9630,6 +9844,15 @@ function SettingsPage() {
         <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Settings</div>
       </div>
 
+      {/* Held at opacity 0 for the one round-trip it takes to learn whether the
+          RetroDECK and Steam sections apply, then faded in as a finished page.
+          Opacity rather than a `shapeReady && ...` gate on purpose: this keeps
+          the subtree mounted, so nothing remounts and gamepad focus never has
+          to be re-seeded. `shapeTimer` guarantees this always resolves. */}
+      <div style={{
+        opacity: shapeReady ? 1 : 0,
+        transition: 'opacity 140ms ease-out',
+      }}>
       {rdDetected && (
         <V2SettingsSection title="RetroDECK">
           <V2SettingsRow
@@ -9812,7 +10035,7 @@ function SettingsPage() {
         <V2SettingsRow
           icon={<FaBug size={16} />}
           title="Enable debug logging"
-          subtitle="Write logs to ~/.config/ludo/decky_debug.log"
+          subtitle="Write logs to ~/.config/ludo/debug.log"
           onClick={loading ? undefined : () => handleLoggingToggle(!loggingEnabled)}
           right={<V2Switch checked={loggingEnabled} />}
           disabled={loading}
@@ -9842,6 +10065,7 @@ function SettingsPage() {
           </div>
         </div>
       </V2SettingsSection>
+      </div>
     </Focusable>
   );
 }
@@ -10073,7 +10297,9 @@ function RomSwitch({ checked, onChange, disabled, label, description }:
     >
       <div className={`r-switch${checked ? ' r-switch--on' : ''}${disabled ? ' r-switch--disabled' : ''}`} style={{ display: 'inline-flex', alignItems: 'center', background: 'transparent', border: 'none', padding: 0 }}>
         <span className="r-switch__track" style={{ position: 'relative', flexShrink: 0, borderRadius: '999px', background: checked ? V2.brand : V2.borderStrong, overflow: 'hidden', width: '36px', height: '20px', transition: 'background 260ms cubic-bezier(0.45,0.05,0.55,0.95), box-shadow 260ms cubic-bezier(0.45,0.05,0.55,0.95)' }}>
-          <span className="r-switch__knob" style={{ position: 'absolute', top: '3px', left: '3px', borderRadius: '50%', background: checked ? '#111117' : V2.fg, width: '14px', height: '14px', transform: checked ? 'translateX(16px) scaleX(1)' : 'translateX(0) scaleX(1)', transformOrigin: checked ? 'right center' : 'left center', transition: 'transform 340ms cubic-bezier(0.34,1.56,0.64,1), background 200ms cubic-bezier(0.22,1,0.36,1)', boxShadow: '0 1px 2px rgba(0,0,0,0.22)' }} />
+          <span className="r-switch__knob" style={{ position: 'absolute', top: '3px', left: '3px', // White in both states: on the brand-purple track a dark knob reads as
+// unlit/disabled, which is the opposite of what "on" should look like.
+borderRadius: '50%', background: V2.fg, width: '14px', height: '14px', transform: checked ? 'translateX(16px) scaleX(1)' : 'translateX(0) scaleX(1)', transformOrigin: checked ? 'right center' : 'left center', transition: 'transform 340ms cubic-bezier(0.34,1.56,0.64,1), background 200ms cubic-bezier(0.22,1,0.36,1)', boxShadow: '0 1px 2px rgba(0,0,0,0.22)' }} />
         </span>
       </div>
       {(label || description) && (
@@ -11008,7 +11234,7 @@ export default definePlugin(() => {
 
   // Passive update check on load: if enabled, look for a newer release on the
   // selected channel and toast the user (no auto-install — they install from
-  // Settings ▸ Updates). The backend logs the outcome to decky_debug.log.
+  // Settings ▸ Updates). The backend logs the outcome to debug.log.
   (async () => {
     try {
       if (!(await getCheckOnStartup())) return;

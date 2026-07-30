@@ -83,10 +83,20 @@ except Exception:
     activity_log = None
 
 
-def _record_activity(kind, title, detail=''):
-    """Append to the Settings ▸ Recent Activity feed (no-op if unavailable)."""
+def _record_activity(kind, title, detail='', rom_id=None):
+    """Append to the Settings ▸ Recent Activity feed (no-op if unavailable).
+
+    rom_id is optional and only passed on when set — the engine is shared with
+    romm-retroarch-sync, which may be running an activity_log whose record()
+    predates the argument.
+    """
     if activity_log:
         try:
+            if rom_id is None:
+                activity_log.record(kind, title, detail)
+            else:
+                activity_log.record(kind, title, detail, rom_id=rom_id)
+        except TypeError:
             activity_log.record(kind, title, detail)
         except Exception:
             pass
@@ -94,8 +104,18 @@ def _record_activity(kind, title, detail=''):
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
-log_file = CONFIG_DIR / 'decky_debug.log'
+log_file = CONFIG_DIR / 'debug.log'
 log_file.parent.mkdir(parents=True, exist_ok=True)
+
+# Was 'decky_debug.log' back when this only ran as a Decky plugin. Carry an
+# existing log over rather than orphaning it beside the new one, so a user who
+# hits a bug right after updating still has the history that led up to it.
+try:
+    _old_log = CONFIG_DIR / 'decky_debug.log'
+    if _old_log.exists() and not log_file.exists():
+        _old_log.rename(log_file)
+except Exception:
+    pass
 settings_file = CONFIG_DIR / 'decky_settings.json'
 
 # Persisted library snapshot — the last successful fetch of games + collections +
@@ -2275,9 +2295,10 @@ class Plugin:
 
             self._emu_install = {'active': True, 'phase': 'Starting…',
                                  'pct': None, 'detail': '', 'error': None,
-                                 'installed': False, 'repaired': []}
+                                 'installed': False, 'repaired': [],
+                                 'bytes_done': None, 'bytes_total': None}
 
-            def progress(phase, pct, detail=''):
+            def progress(phase, pct, detail='', done=None, total=None):
                 # Never let the reported percentage go backwards: flatpak
                 # restarts its own counter per component, and a bar that jumps
                 # back reads as a failed retry.
@@ -2292,6 +2313,14 @@ class Plugin:
                 self._emu_install['phase'] = phase
                 self._emu_install['pct'] = pct
                 self._emu_install['detail'] = detail or ''
+                # Same one-way rule for the byte counter, and for the same
+                # reason: it sits next to the bar, so the two must agree.
+                if total:
+                    self._emu_install['bytes_total'] = total
+                if done is not None:
+                    prev_done = self._emu_install.get('bytes_done')
+                    self._emu_install['bytes_done'] = (
+                        done if prev_done is None else max(prev_done, done))
 
             def run():
                 try:
@@ -4246,7 +4275,8 @@ class Plugin:
                     }
                     _record_activity('download' if ok else 'error',
                                      'Downloaded' if ok else 'Download failed',
-                                     name or file_name or f'ROM {rom_id}')
+                                     name or file_name or f'ROM {rom_id}',
+                                     rom_id=rom_id)
                 except Exception as e:
                     logging.error(f"download_game worker error: {e}", exc_info=True)
                     self._download_progress[rom_id] = {
