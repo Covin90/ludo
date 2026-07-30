@@ -12,7 +12,7 @@ import time
 import logging
 from pathlib import Path
 
-from .paths import app_id, cache_dir, client_name, config_dir
+from .paths import app_id, cache_dir, client_name, config_dir, library_dir
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -933,8 +933,8 @@ class SettingsManager:
                 'auto_refresh': 'false'
             }
             self.config['Download'] = {
-                'rom_directory': str(Path.home() / 'RomMSync' / 'roms'),
-                'save_directory': str(Path.home() / 'RomMSync' / 'saves'),
+                'rom_directory': str(library_dir() / 'roms'),
+                'save_directory': str(library_dir() / 'saves'),
             }
             self.config['BIOS'] = {
                 'verify_on_launch': 'false',
@@ -1123,7 +1123,7 @@ class CoverArtManager:
     def __init__(self, settings_manager, romm_client):
         self.settings = settings_manager
         self.romm_client = romm_client
-        self.cache_dir = Path.home() / 'RomMSync' / 'covers'
+        self.cache_dir = library_dir() / 'covers'
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def get_cover_cache_path(self, rom_id, platform_slug):
@@ -5223,7 +5223,7 @@ class RetroArchInterface:
         tree = self._install_tree()
         if tree is not None and tree.name == 'retrodeck':
             return str(tree / 'roms')
-        return str(Path.home() / 'RomMSync' / 'roms')
+        return str(library_dir() / 'roms')
 
     def expected_save_dir(self):
         """Where the DETECTED emulator will keep saves, existing or not.
@@ -5231,7 +5231,7 @@ class RetroArchInterface:
         find_retroarch_dirs() only reports directories that are already there,
         which is right for discovery and wrong for a suggestion: an emulator we
         just installed has never run, so its tree does not exist yet. Falling
-        back to Ludo's own ~/RomMSync/saves then produced the silent failure this
+        back to our own library folder then produced the silent failure this
         whole feature exists to prevent — sync watching a folder the emulator
         will never read, reporting success forever.
 
@@ -5275,12 +5275,12 @@ class RetroArchInterface:
         retrodeck = detect_retrodeck()
         if retrodeck:
             return retrodeck['rom_directory' if kind == 'roms' else 'save_directory']
-        return str(Path.home() / 'RomMSync' / ('roms' if kind == 'roms' else 'saves'))
+        return str(library_dir() / ('roms' if kind == 'roms' else 'saves'))
 
     def align_saves_with_emulator(self):
         """Move the save folder off Ludo's own fallback once an emulator exists.
 
-        ~/RomMSync/saves is what gets chosen when there is no emulator to ask —
+        The app's own <library>/saves is what gets chosen with no emulator to ask —
         a reasonable answer then, and wrong the moment one is installed, because
         the emulator writes its saves somewhere else entirely. It is not "stale"
         by any rule (it belongs to no removed emulator), so nothing else will
@@ -5294,7 +5294,7 @@ class RetroArchInterface:
         if not expected:
             return None
         current = (self.settings.get('Download', 'save_directory', '') or '').strip()
-        fallback = str(Path.home() / 'RomMSync' / 'saves')
+        fallback = str(library_dir() / 'saves')
         if current and current != fallback:
             return None
         if current == expected:
@@ -9831,7 +9831,7 @@ class AutoSyncManager:
             if _rom_file_name and _platform_slug:
                 try:
                     _rom_dir = Path(self.settings.get('Download', 'rom_directory',
-                                                       '~/RomMSync/roms')).expanduser()
+                                                       str(library_dir() / 'roms'))).expanduser()
                     _platform_dir = _rom_dir / _platform_slug
                     if _platform_dir.exists():
                         # Case 1: file_name is itself a folder (container ROM like "Pokémon HeartGold Version")
@@ -11669,7 +11669,7 @@ class SteamShortcutManager:
                             logging.debug(f"Grid generation failed for {rom_name}: {grid_msg}")
 
                         # Generate square icon for Steam
-                        icon_dir = Path.home() / 'RomMSync' / 'icons'
+                        icon_dir = library_dir() / 'icons'
                         icon_dir.mkdir(parents=True, exist_ok=True)
                         icon_file = icon_dir / f"{rom_id}.png"
 

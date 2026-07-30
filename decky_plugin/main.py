@@ -24,6 +24,17 @@ sys.path.insert(0, str(Path(__file__).parent / "py_modules"))
 from romm_sync_engine import paths as _paths  # noqa: E402
 _paths.set_app_id("ludo")
 _paths.set_client_name("Ludo")
+# Downloads, covers and generated icons go under ~/Ludo rather than the GTK
+# app's ~/RomMSync — but only for someone who has no ~/RomMSync already, so
+# renaming the app never strands a library that is on disk (see paths.library_dir).
+_paths.set_library_dir_name("Ludo")
+
+
+def _default_roms_dir() -> str:
+    """Fallback ROM folder for the many settings reads below."""
+    return str(_paths.library_dir() / 'roms')
+
+
 CONFIG_DIR = _paths.config_dir()
 
 # Preload Pillow shared libraries for bundled wheel
@@ -855,7 +866,7 @@ class Plugin:
                 raw_games, _ = roms_result
                 self._available_games.clear()
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                        '~/RomMSync/roms')).expanduser()
+                                                        _default_roms_dir())).expanduser()
                 for rom in raw_games:
                     platform_slug = rom.get('platform_slug', 'Unknown')
                     file_name     = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
@@ -1369,7 +1380,7 @@ class Plugin:
                     if new_roms:
                         # Update existing games list
                         download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                                '~/RomMSync/roms')).expanduser()
+                                                                _default_roms_dir())).expanduser()
 
                         # Create a map for fast lookup by rom_id
                         existing_games_map = {g['rom_id']: g for g in self._available_games if 'rom_id' in g}
@@ -1426,7 +1437,7 @@ class Plugin:
                     raw_games, _ = roms_result
                     self._available_games.clear()
                     download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                            '~/RomMSync/roms')).expanduser()
+                                                            _default_roms_dir())).expanduser()
 
                     for rom in raw_games:
                         platform_slug = rom.get('platform_slug', 'Unknown')
@@ -1607,7 +1618,7 @@ class Plugin:
             logging.info(f"Starting ROM deletion for {mode}: {collection_name}")
 
             download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                    '~/RomMSync/roms')).expanduser()
+                                                    _default_roms_dir())).expanduser()
             if not download_dir.exists():
                 logging.info(f"Download directory not found, nothing to delete: {download_dir}")
                 return True
@@ -1727,8 +1738,8 @@ class Plugin:
             save_directory = settings.get('Download', 'save_directory')
             bios_directory = settings.get('BIOS', 'custom_path', '')
 
-            _default_rom  = str(Path.home() / 'RomMSync' / 'roms')
-            _default_save = str(Path.home() / 'RomMSync' / 'saves')
+            _default_rom  = _default_roms_dir()
+            _default_save = str(_paths.library_dir() / 'saves')
             retrodeck  = detect_retrodeck()
             needs_save = False
             if retrodeck:
@@ -2629,7 +2640,7 @@ class Plugin:
             config.read(ini_path)
 
             download_dir = Path(config.get('Download', 'rom_directory',
-                                           fallback='~/RomMSync/roms')).expanduser()
+                                           fallback=_default_roms_dir())).expanduser()
 
             # Delete ROMs from ALL collections (not just actively syncing)
             deleted_roms = 0
@@ -3339,7 +3350,7 @@ class Plugin:
                     roms = self._romm_client.get_virtual_collection_roms(key) or []
                 idx = self._games_index()
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                       '~/RomMSync/roms')).expanduser()
+                                                       _default_roms_dir())).expanduser()
                 games = []
                 for r in roms:
                     rid = r.get('id')
@@ -4109,7 +4120,7 @@ class Plugin:
             logging.info(f"download_game RPC (user action): rom_id={rom_id} "
                          f"name={(g or {}).get('name', '?')}")
             download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                   '~/RomMSync/roms')).expanduser()
+                                                   _default_roms_dir())).expanduser()
             if g:
                 platform_slug = g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug')
                 file_name = g.get('file_name') or (g.get('romm_data') or {}).get('fs_name')
@@ -4253,7 +4264,7 @@ class Plugin:
             idx = self._games_index()
             g = idx.get(rom_id)
             download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                   '~/RomMSync/roms')).expanduser()
+                                                   _default_roms_dir())).expanduser()
             target = None
             if g and g.get('local_path'):
                 target = Path(g['local_path'])
@@ -4415,7 +4426,7 @@ class Plugin:
                 # Fallback: sibling ROM may be on disk but not in the index (e.g.,
                 # downloaded in a previous session). Try resolving from the API.
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                        '~/RomMSync/roms')).expanduser()
+                                                        _default_roms_dir())).expanduser()
                 try:
                     r = self._romm_client.session.get(
                         urljoin(self._romm_client.base_url, f'/api/roms/{effective_rom_id}'),
@@ -4700,7 +4711,7 @@ class Plugin:
 
                     collection_roms = client.get_collection_roms(collection_id)
                     download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                            '~/RomMSync/roms')).expanduser()
+                                                            _default_roms_dir())).expanduser()
 
                     added, msg = self._steam_manager.add_collection_shortcuts(
                         collection_name, collection_roms, str(download_dir))
@@ -4765,7 +4776,7 @@ class Plugin:
                                 if collection_id:
                                     collection_roms = self._romm_client.get_collection_roms(collection_id)
                                     download_dir = Path(self._settings.get('Download', 'rom_directory',
-                                                                            '~/RomMSync/roms')).expanduser()
+                                                                            _default_roms_dir())).expanduser()
                                     added, msg = self._steam_manager.add_collection_shortcuts(
                                         collection_name, collection_roms, str(download_dir))
                                     total_added += added
