@@ -20,6 +20,20 @@ const fs = require("fs");
 const { listNativePads } = require("./native-pads.cjs");
 const { startNativeInput } = require("./native-input.cjs");
 
+// The name Electron reports for itself — window titles it derives, the shell's
+// window list, notifications. It comes from the packaged package.json, and
+// electron-builder writes only `name` there ("ludo-desktop"); `productName`,
+// which is what we'd want, stays behind in the source manifest as build config.
+// So without this the app introduces itself as "ludo-desktop".
+//
+// setName also moves userData (~/.config/<name>), which is where Chromium keeps
+// this app's cookies and localStorage — renaming it would silently strand every
+// existing install's stored UI state. Pin the path to what it resolved to before
+// the rename so only the display name changes.
+const userDataPath = app.getPath("userData");
+app.setName("Ludo");
+app.setPath("userData", userDataPath);
+
 // ── GPU / compositing (Linux) ────────────────────────────────────────────────
 //
 // Chromium (and so Steam Big Picture, which is CEF) performs badly on Linux when
@@ -36,6 +50,21 @@ if (process.platform === "linux") {
     app.commandLine.appendSwitch("ozone-platform-hint", ozone);
     app.commandLine.appendSwitch("enable-features", "WaylandWindowDecorations");
   }
+
+  // A desktop's shell doesn't take the window's icon from BrowserWindow's `icon`
+  // on Wayland — it identifies the window by its app_id (WM_CLASS on X11), looks
+  // up the .desktop entry that claims that id, and draws *that* entry's Icon.
+  // Chromium derives the id from the executable name, which electron-builder
+  // takes from package.json's `name` ("ludo-desktop"), while the entry it
+  // generates advertises StartupWMClass from `productName` ("Ludo"). Nothing
+  // claims "ludo-desktop", so GNOME finds no entry and falls back to a generic
+  // icon in the dock and Alt-Tab — even though the entry in the app grid, which
+  // is read straight off the file, looks correct.
+  //
+  // Pin the id to the name the entry already advertises rather than the other
+  // way round: exported entries are copies sitting in users' home directories
+  // that we can't retroactively edit, so the shipped binary has to match them.
+  app.commandLine.appendSwitch("class", "Ludo");
 }
 
 // Chromium blocks audio until the document has been "activated" by a real
