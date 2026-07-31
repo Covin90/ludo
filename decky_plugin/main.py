@@ -443,6 +443,14 @@ class Plugin:
     # used by get_service_status() to distinguish "still starting" from "failed".
     _connection_attempted: bool = False
 
+    # True when the last pass through _connect_to_romm() returned WITHOUT talking
+    # to the server — auto-connect off, or credentials/pairing not in place yet.
+    # That is not an outage, and get_service_status must not describe it as one:
+    # the sync restart that follows an emulator install re-enters this path
+    # mid-wizard, which reported 'server_unreachable' and toasted "Can't reach
+    # RomM server" about a server nothing had contacted.
+    _connect_blocked: bool = False
+
     # Snapshot of ROM counts for collections that have been disabled.
     # Keyed by collection name; value is the total count from the cache at disable time.
     # Cleared when deletion completes or the collection is re-enabled.
@@ -832,8 +840,10 @@ class Plugin:
         # companion-app auth); otherwise fall back to stored username/password.
         if not (url and auto_connect and (client_token or (username and password and remember))):
             logging.info("Auto-connect disabled or credentials missing")
+            self._connect_blocked = True
             return False
 
+        self._connect_blocked = False
         try:
             logging.info(f"Connecting to RomM at {url}...")
             self._romm_client = RomMClient(url, username, password, client_token=client_token or None)
@@ -1191,7 +1201,11 @@ class Plugin:
                 else:
                     reason = 'server_unreachable'
                 has_library = bool(self._available_games)
-                if not self._connection_attempted:
+                if not self._connection_attempted or self._connect_blocked:
+                    # Either the first attempt hasn't finished, or we deliberately
+                    # made none (auto-connect off / not paired yet). Both are
+                    # "not connected yet", never "the server is down" — the
+                    # frontend suppresses lost-connection toasts on 'connecting'.
                     conn_state = 'connecting'
                     msg = "Connecting to RomM..."
                     reason = None
@@ -1795,6 +1809,19 @@ class Plugin:
                     and getattr(self._retroarch, 'bios_manager', None) \
                     and self._retroarch.bios_manager.system_dir:
                 bios_directory = str(self._retroarch.bios_manager.system_dir)
+
+            # Last resort: where the detected emulator WILL look, existing yet or
+            # not. bios_manager only reports directories already on disk, so a
+            # freshly installed RetroArch (nothing has run, no system/ dir) answers
+            # "nowhere" — and the setup wizard then showed an empty BIOS field and
+            # saved '' for it, while Settings showed the right path because it reads
+            # expected_paths from emulator_status. Same source, same answer.
+            if not bios_directory and self._retroarch \
+                    and hasattr(self._retroarch, 'expected_bios_dir'):
+                try:
+                    bios_directory = self._retroarch.expected_bios_dir() or ''
+                except Exception as e:
+                    logging.debug(f"expected_bios_dir: {e}")
 
             import socket
             try:

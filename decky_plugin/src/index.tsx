@@ -1722,6 +1722,11 @@ let _emuInstall: EmuInstall = { active: false, phase: '', pct: null, detail: '',
                                 bytesDone: null, bytesTotal: null };
 const _emuInstallSubs = new Set<() => void>();
 let _emuInstallPoll: any = null;
+// True while the setup wizard is on screen. Its Emulator step reports the
+// install's every state inline — progress, failure, and a "Emulator ready"
+// panel — so the module-level toasts would just repeat it back over a screen
+// that already says so.
+let _wizardOpen = false;
 
 function _publishInstall(next: EmuInstall) {
   _emuInstall = next;
@@ -1744,6 +1749,7 @@ function _pollInstall() {
         // cached status is stale, and a fresh install ships zero cores, so the
         // Cores page needs to re-read too.
         await loadEmulatorStatus(true);
+        if (_wizardOpen) return;
         if (r?.error) toaster.toast({ title: 'RetroArch', body: r.error });
         else if (r?.installed) {
           // Folders the install moved off the emulator that was removed. Worth
@@ -1767,7 +1773,8 @@ async function startEmulatorInstall() {
     const r = await installEmulator();
     if (!r?.success) {
       _publishInstall({ active: false, phase: '', pct: null, detail: '', error: r?.message || 'Could not start the install', bytesDone: null, bytesTotal: null });
-      toaster.toast({ title: 'RetroArch', body: r?.message || 'Could not start the install' });
+      // The wizard's Emulator step renders install.error itself.
+      if (!_wizardOpen) toaster.toast({ title: 'RetroArch', body: r?.message || 'Could not start the install' });
       return;
     }
     _pollInstall();
@@ -3914,6 +3921,14 @@ let backgroundInterval: any = null;
 // an online→offline (or offline→online) TRANSITION toasts — a cold start that's
 // already offline must not fire a spurious "connection lost".
 let _prevConn: string | null = null;
+// Consecutive offline samples seen since the last online one. The toast needs
+// two (~4s at this interval), because a SINGLE bad sample is routinely not an
+// outage: the reachability probe times out under load, and every deliberate sync
+// restart (a path repair, an emulator install) tears the client down and rebuilds
+// it. Both produced a "Can't reach RomM server" toast on a server that was never
+// down — reported from inside the setup wizard, where installing RetroArch
+// saturates the connection AND restarts sync at the same moment.
+let _offSamples = 0;
 
 const checkForNotifications = async () => {
   try {
@@ -3924,21 +3939,30 @@ const checkForNotifications = async () => {
       const conn = st?.connection ?? null;
       if (conn && conn !== 'connecting') {
         const isOff = conn === 'offline_cached' || conn === 'disconnected';
-        if (_prevConn === 'online' && isOff) {
-          const r = st?.unreachable_reason;
-          const noNet = r === 'no_network' || r === 'airplane_mode';
-          toaster.toast({
-            title: r === 'airplane_mode' ? 'Airplane mode is on'
-              : noNet ? 'No internet connection' : "Can't reach RomM server",
-            body: noNet
-              ? 'Showing your downloaded games — saves sync when you’re back online.'
-              : 'The server isn’t responding — showing your downloaded games.',
-            duration: 5000,
-          });
-        } else if ((_prevConn === 'offline_cached' || _prevConn === 'disconnected') && conn === 'online') {
-          toaster.toast({ title: 'Back online', body: 'Reconnected to RomM — syncing.', duration: 4000 });
+        _offSamples = isOff ? _offSamples + 1 : 0;
+        // Going offline has to be CONFIRMED before it counts as the current
+        // state — and while an emulator install runs it never counts, since that
+        // restarts sync itself and already narrates its own progress. Leaving
+        // _prevConn untouched (rather than just skipping the toast) is what stops
+        // an unreported blip from being followed by a baffling "Back online".
+        const confirmed = !isOff || (_offSamples >= 2 && !_emuInstall.active);
+        if (confirmed) {
+          if (_prevConn === 'online' && isOff) {
+            const r = st?.unreachable_reason;
+            const noNet = r === 'no_network' || r === 'airplane_mode';
+            toaster.toast({
+              title: r === 'airplane_mode' ? 'Airplane mode is on'
+                : noNet ? 'No internet connection' : "Can't reach RomM server",
+              body: noNet
+                ? 'Showing your downloaded games — saves sync when you’re back online.'
+                : 'The server isn’t responding — showing your downloaded games.',
+              duration: 5000,
+            });
+          } else if ((_prevConn === 'offline_cached' || _prevConn === 'disconnected') && conn === 'online') {
+            toaster.toast({ title: 'Back online', body: 'Reconnected to RomM — syncing.', duration: 4000 });
+          }
+          _prevConn = conn;
         }
-        _prevConn = conn;
       }
     } catch { /* transient */ }
 
@@ -10355,6 +10379,26 @@ function SetupWizard() {
   const [tileAvailable, setTileAvailable] = useState(false);
   const [wantTile, setWantTile] = useState(true);
   const [busy, setBusy] = useState(false);
+  // Emulator step — offered BEFORE Folders, because with nothing installed the
+  // folder defaults are Ludo's own fallbacks: the save dir would be one
+  // RetroArch never reads, and the BIOS field comes back blank (there is no
+  // system/ dir to detect). Installing first means the folders step is seeded
+  // from a real emulator instead.
+  const emu = useEmulatorStatus();
+  const emuInstall = useEmulatorInstall();
+  // Whether the wizard has an Emulator step at all, decided ONCE from the first
+  // status we see and then frozen. It must not depend on the live `installed`
+  // flag: installing from inside the step would drop the step out from under
+  // the user mid-install, shifting every index after it.
+  const [hasEmuStep, setHasEmuStep] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (emu && hasEmuStep === null) setHasEmuStep(!emu.installed);
+  }, [emu, hasEmuStep]);
+  // Silences the install's own toasts for as long as this screen owns them.
+  useEffect(() => {
+    _wizardOpen = true;
+    return () => { _wizardOpen = false; };
+  }, []);
   // Extra bottom scroll room, added ONLY while a field is focused (keyboard up),
   // so the resting layout stays vertically centered with normal top spacing and
   // a focused field can still scroll clear of the keyboard overlay. Turning it
@@ -10363,10 +10407,17 @@ function SetupWizard() {
   // would yank the scroll position around.
   // Landing focus per step: Connect highlights the RomM URL field (mode already
   // defaults to pair-code); the final step highlights Finish & open library.
-  const startFocusRef = useAutoFocus(step === 0, step);
-  const urlFocusRef = useAutoFocus(step === 1, step);
-  const foldersNextRef = useAutoFocus(step === 2, step);
-  const finishFocusRef = useAutoFocus(step === 3, step);
+  // Steps are addressed by name, not by index: the Emulator step is conditional,
+  // so every `step === 2` in here would otherwise mean a different page
+  // depending on what is installed.
+  const STEPS = ['welcome', 'connect', ...(hasEmuStep ? ['emulator'] : []), 'folders', 'ready'];
+  const TOTAL = STEPS.length;
+  const cur = STEPS[Math.min(step, TOTAL - 1)];
+  const startFocusRef = useAutoFocus(cur === 'welcome', step);
+  const urlFocusRef = useAutoFocus(cur === 'connect', step);
+  const emuNextRef = useAutoFocus(cur === 'emulator', step);
+  const foldersNextRef = useAutoFocus(cur === 'folders', step);
+  const finishFocusRef = useAutoFocus(cur === 'ready', step);
   const [kbRoom, _setKbRoomRaw] = useState(false);
   const kbOffTimer = useRef<any>(null);
   const scrollHostRef = useRef<HTMLDivElement | null>(null);
@@ -10456,6 +10507,34 @@ function SetupWizard() {
     })();
   }, []);
 
+  // Folder fields the user has edited by hand — never overwritten by the
+  // re-seed below, which only fills in values they haven't expressed an opinion
+  // about.
+  const touchedDirs = useRef<Set<string>>(new Set());
+  const markDir = (key: string, set: (v: string) => void) => (v: string) => {
+    touchedDirs.current.add(key); set(v);
+  };
+  // An emulator appearing mid-wizard re-seeds the folder fields. The wizard read
+  // get_config() on mount, when there was no emulator: ROMs/saves came back as
+  // Ludo's own library fallbacks and BIOS came back empty. The backend has since
+  // repaired those settings (repair_emulator_paths + align_saves_with_emulator,
+  // run by install_emulator before it clears `active`), so without this the
+  // stale mount-time values would be written straight back over the repair by
+  // doFinish's saveConfig.
+  const reseeded = useRef(false);
+  useEffect(() => {
+    if (hasEmuStep !== true || !emu?.installed || reseeded.current) return;
+    reseeded.current = true;
+    (async () => {
+      try {
+        const c = await getConfig();
+        if (!touchedDirs.current.has('roms') && c.rom_directory) setRomDir(c.rom_directory);
+        if (!touchedDirs.current.has('saves') && c.save_directory) setSaveDir(c.save_directory);
+        if (!touchedDirs.current.has('bios') && c.bios_directory) setBiosDir(c.bios_directory);
+      } catch { /* keep what we have; the folders step is still editable */ }
+    })();
+  }, [hasEmuStep, emu?.installed]);
+
   const finish = () => {
     // Pop the full-screen wizard route off the history stack first, otherwise
     // pressing Back from the library lands the user right back in the wizard.
@@ -10509,7 +10588,6 @@ function SetupWizard() {
     finally { setBusy(false); }
   };
 
-  const TOTAL = 4;
   const next = () => setStep((s) => Math.min(s + 1, TOTAL - 1));
   const back = () => setStep((s) => Math.max(s - 1, 0));
   const canConnect = mode === 'pair'
@@ -10599,7 +10677,7 @@ function SetupWizard() {
         // L1/R1 flip the login ↔ pair mode on the Connect step (mirrors the
         // home page's bumper tab paging; the keycaps flank the segment pill).
         onButtonDown={(evt: any) => {
-          if (step !== 1) return;
+          if (cur !== 'connect') return;
           const b = evt?.detail?.button;
           if (b === GamepadButton.BUMPER_LEFT || b === GamepadButton.BUMPER_RIGHT) {
             playSteamSound('deck_ui_tab_transition_01');
@@ -10622,7 +10700,7 @@ function SetupWizard() {
         </div>
 
         <div key={step} className="wiz-step" style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '22px' }}>
-          {step === 0 && (
+          {cur === 'welcome' && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', textAlign: 'center' }}>
               {logo && <img className="wiz-logo" src={logo} style={{ width: '96px', height: '96px', objectFit: 'contain' }} />}
               <div style={{ fontSize: '28px', fontWeight: 800, letterSpacing: '-0.01em' }}>Welcome to Ludo</div>
@@ -10635,7 +10713,7 @@ function SetupWizard() {
             </div>
           )}
 
-          {step === 1 && (
+          {cur === 'connect' && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px', width: '100%' }}>
               <div style={{ fontSize: '20px', fontWeight: 700 }}>Connect to RomM</div>
               {/* Login / Pair toggle — same segmented pill as the update channel,
@@ -10677,21 +10755,80 @@ function SetupWizard() {
             </div>
           )}
 
-          {step === 2 && (
+          {cur === 'emulator' && (() => {
+            const done = !!emu?.installed;
+            const active = emuInstall.active;
+            const canInstall = !!emu?.install?.available;
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px', width: '100%', textAlign: 'center' }}>
+                <div style={{ color: done ? V2.success : V2.brandHover }}>
+                  {done ? <FaCheckCircle size={44} /> : <FaGamepad size={44} />}
+                </div>
+                <div style={{ fontSize: '20px', fontWeight: 700 }}>
+                  {done ? 'Emulator ready' : active ? 'Installing RetroArch' : 'No emulator installed'}
+                </div>
+                <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.6, maxWidth: '420px' }}>
+                  {done
+                    ? 'RetroArch is installed. The next step is set up to use its folders.'
+                    : active
+                      // Leaving mid-install is safe: it runs in a backend thread,
+                      // and the folder fields re-seed when it lands.
+                      ? 'This takes a few minutes. You can carry on with setup while it runs.'
+                      : canInstall
+                        ? 'Ludo can download and sync your library without one, but playing needs RetroArch or RetroDECK.'
+                        // No button we could offer would work here (Windows, no
+                        // flatpak, running as root) — say why instead.
+                        : `Ludo can download and sync your library without one, but playing needs RetroArch or RetroDECK — ${emu?.install?.reason || 'install one to play'}.`}
+                </div>
+                {active && (
+                  <div style={{ width: '100%' }}>
+                    <InstallProgressBar pct={emuInstall.pct} />
+                    <div style={{ fontSize: '12px', color: V2.fgMuted, marginTop: '6px' }}>
+                      {[emuInstall.phase, installSize(emuInstall), emuInstall.detail].filter(Boolean).join(' · ')}
+                    </div>
+                  </div>
+                )}
+                {emuInstall.error && !active && (
+                  <div style={{ fontSize: '13px', color: V2.danger }}>❌ {emuInstall.error}</div>
+                )}
+                {!done && !active && canInstall && (
+                  <GameActionButton variant="emphasized" label={emuInstall.error ? 'Try again' : 'Install RetroArch'}
+                    icon={<FaDownload size={14} />} onClick={startEmulatorInstall} />
+                )}
+                {footer(
+                  <GameActionButton variant={done ? 'emphasized' : 'surface'} focusRef={emuNextRef}
+                    // Skipping is a first-class choice: collecting ROMs before
+                    // owning an emulator is legitimate, and the Home banner keeps
+                    // offering the install afterwards.
+                    label={done || active ? 'Next' : 'Skip for now'}
+                    icon={<FaChevronRight size={13} />} onClick={next} />
+                )}
+              </div>
+            );
+          })()}
+
+          {cur === 'folders' && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px', width: '100%' }}>
               <div style={{ fontSize: '20px', fontWeight: 700 }}>Folders</div>
               <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.5, maxWidth: '420px' }}>
                 Where ROMs, saves and BIOS files live on this device.
+                {/* Without an emulator these are Ludo's own folders, not one an
+                    emulator reads — worth saying, since the saves one is the
+                    path that silently breaks sync later. */}
+                {hasEmuStep && !emu?.installed && !emuInstall.active
+                  && ' With no emulator installed these are Ludo\'s own folders — installing one later will point saves and BIOS at it.'}
               </div>
               {/* Field + Browse share a row: the stacked layout was taller than
                   the viewport, which clipped the footer buttons and killed the
                   centered spacing. flex-end aligns the button with the input box
                   (the field's label sits above it). */}
               {([
-                ['ROM directory', romDir, setRomDir],
-                ['Save directory', saveDir, setSaveDir],
-                ['BIOS directory', biosDir, setBiosDir],
-              ] as [string, string, (v: string) => void][]).map(([lbl, val, set]) => (
+                ['ROM directory', 'roms', romDir, setRomDir],
+                ['Save directory', 'saves', saveDir, setSaveDir],
+                ['BIOS directory', 'bios', biosDir, setBiosDir],
+              ] as [string, string, string, (v: string) => void][]).map(([lbl, key, val, raw]) => {
+                const set = markDir(key, raw);
+                return (
                 <Focusable key={lbl} noFocusRing flow-children="horizontal"
                   style={{ display: 'flex', alignItems: 'flex-end', gap: '10px', width: '100%' }}>
                   <div style={{ flex: '1 1 auto', minWidth: 0 }}>
@@ -10699,7 +10836,8 @@ function SetupWizard() {
                   </div>
                   <GameActionButton variant="surface" label="Browse…" icon={null} onClick={browse(val, set)} />
                 </Focusable>
-              ))}
+                );
+              })}
               <V2TextField label="Device name" value={deviceName} onChange={setDeviceName} placeholder={deviceNameDefault} onKb={setKbRoom} />
               {footer(
                 <GameActionButton variant="emphasized" label="Next" focusRef={foldersNextRef} icon={<FaChevronRight size={13} />} onClick={next} />
@@ -10707,7 +10845,7 @@ function SetupWizard() {
             </div>
           )}
 
-          {step === 3 && (
+          {cur === 'ready' && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', textAlign: 'center', width: '100%' }}>
               <div className="wiz-check"><FaCheckCircle size={56} color={V2.success} /></div>
               <div style={{ fontSize: '24px', fontWeight: 800 }}>Ready to go</div>
@@ -10715,6 +10853,10 @@ function SetupWizard() {
                 {mode === 'pair'
                   ? 'We\'ll pair this device with your RomM server and open your library.'
                   : 'We\'ll save your connection and open your library.'}
+                {/* Finishing mid-install is fine — the backend thread carries on
+                    and repoints the folders when it lands — but the user should
+                    know why Play is still unavailable when they arrive. */}
+                {emuInstall.active && ' RetroArch is still installing; it will be ready shortly.'}
               </div>
               {(window as any).__rommDesktop && tileAvailable && (
                 <div style={{ width: '100%', textAlign: 'left' }}>
