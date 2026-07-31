@@ -320,7 +320,81 @@ function sendPadEvent(target, kind, payload) {
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 
+// ── Launcher entry upkeep ────────────────────────────────────────────────────
+
+/** Refresh the exported .desktop entry this AppImage was launched from.
+ *
+ * AppImage managers (Gear Lever, AppImageLauncher, `--install` style scripts)
+ * copy the image's internal .desktop into ~/.local/share/applications and
+ * extract its icon alongside, both at install time. They never look at the file
+ * again — but the in-app updater swaps the image underneath them, so the entry
+ * keeps advertising the version and icon of whatever was installed originally.
+ * Gear Lever's own config stores only the file path, so the .desktop is the one
+ * place its version display comes from.
+ *
+ * Doing this at startup rather than in apply_appimage_update is deliberate: the
+ * process applying an update is the OLD build, and would have to dig the new
+ * version and icon out of a file it has not run yet. Here they are simply ours.
+ *
+ * Conservative by construction — it only rewrites entries that already point at
+ * our own $APPIMAGE and were exported by a manager (they carry X-AppImage-*
+ * keys), and only ever touches those keys. Every failure is silent: a launcher
+ * showing a stale version is a blemish, not a reason to disturb a working start.
+ */
+function syncLauncherEntry() {
+  try {
+    const appImage = process.env.APPIMAGE;
+    if (!appImage) return; // running from source, or an unpacked build
+
+    const appsDir = path.join(app.getPath("home"), ".local", "share", "applications");
+    if (!fs.existsSync(appsDir)) return;
+
+    // Managers record the path they installed from, which can spell the same
+    // file differently than the runtime reports it — /home vs /var/home on an
+    // ostree system like this one. Compare resolved paths, not strings.
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+    const target = real(appImage);
+    const version = app.getVersion();
+
+    for (const name of fs.readdirSync(appsDir)) {
+      if (!name.endsWith(".desktop")) continue;
+      const entryPath = path.join(appsDir, name);
+      let text;
+      try { text = fs.readFileSync(entryPath, "utf8"); } catch { continue; }
+
+      // Must be a manager's export of *this* image. The X-AppImage-Version key
+      // is what marks it as managed; without it this is somebody else's
+      // launcher that merely mentions the path, and not ours to rewrite.
+      if (!/^X-AppImage-Version=/m.test(text)) continue;
+      const exec = text.match(/^(?:Exec|TryExec)=.*$/gm) || [];
+      if (!exec.some((line) => line.includes(appImage) || line.includes(target))) continue;
+
+      let out = text.replace(/^X-AppImage-Version=.*$/m, `X-AppImage-Version=${version}`);
+
+      // The icon is a copy taken at install time, so a changed icon needs the
+      // bytes replaced, not the path rewritten. Only overwrite a plain file the
+      // entry points at absolutely: a bare name is a themed icon we don't own.
+      const icon = (text.match(/^Icon=(.*)$/m) || [])[1];
+      if (icon && path.isAbsolute(icon) && fs.existsSync(ICON)) {
+        try {
+          if (fs.statSync(icon).isFile()) fs.copyFileSync(ICON, icon);
+        } catch { /* icon left as-is */ }
+      }
+
+      if (out !== text) {
+        fs.writeFileSync(entryPath, out);
+        console.log(`[launcher] refreshed ${name} to v${version}`);
+      }
+    }
+  } catch (e) {
+    console.log(`[launcher] entry refresh skipped: ${e.message}`);
+  }
+}
+
 async function boot() {
+  // Cheap, best-effort, and independent of everything below.
+  syncLauncherEntry();
+
   const host = process.env.ROMM_HOST || "127.0.0.1";
   const port = process.env.ROMM_PORT
     ? parseInt(process.env.ROMM_PORT, 10)
