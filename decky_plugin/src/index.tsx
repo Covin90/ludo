@@ -2200,7 +2200,12 @@ function writeIdentity(id: NavIdentity) {
   const avatar = id.avatar && id.avatar.length < 512 * 1024 ? id.avatar : null;
   try { localStorage.setItem(_LS_IDENTITY, JSON.stringify({ ...id, avatar })); } catch { }
 }
-export function clearIdentityCache() {
+// Not exported: this is the plugin's rollup ENTRY, and decky's config declares
+// output.exports "default". A second named export off the entry fails the whole
+// bundle ("default" was specified … has the following exports: clearIdentityCache
+// and default), which is why the Decky zip stopped building. Both callers are in
+// this file, so the keyword bought nothing.
+function clearIdentityCache() {
   if (!_lsAvail) return;
   try { localStorage.removeItem(_LS_IDENTITY); } catch { }
 }
