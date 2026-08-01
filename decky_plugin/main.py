@@ -2918,11 +2918,34 @@ class Plugin:
             connected = self._connect_to_romm()
             if connected:
                 _record_activity('account', 'Signed in', url)
+            # 'paired' is reported separately from 'success' because the two mean
+            # different things to a caller deciding whether to retry: the code is
+            # single-use and is spent by the time we get here, so a retry after a
+            # merely-failed CONNECTION would come back "invalid or expired" and
+            # strand a device that is, in fact, paired.
             return {'success': bool(connected),
+                    'paired': True,
                     'message': 'Paired and connected' if connected
                     else 'Paired, but connection failed'}
         except Exception as e:
             logging.error(f"pair_device error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def set_device_name(self, name: str = ''):
+        """Rename this device for save syncing, without touching anything else.
+
+        The counterpart to set_library_paths, and needed for the same reason:
+        save_config is the wizard's password-auth method and rewrites
+        credentials, so a paired device (which has no password to rewrite) has no
+        way to persist the name the wizard collected.
+        """
+        try:
+            if not SYNC_CORE_AVAILABLE:
+                return {'success': False, 'message': 'sync_core not available'}
+            SettingsManager().set('Device', 'device_name', (name or '').strip())
+            return {'success': True}
+        except Exception as e:
+            logging.error(f"set_device_name error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def delete_device(self):

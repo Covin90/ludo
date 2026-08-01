@@ -56,6 +56,7 @@ const getPluginStats = callable<[], any>("get_plugin_stats");
 const saveConfig = callable<[string, string, string, string, string, string, string], any>("save_config");
 const testRommConnection = callable<[string, string, string], any>("test_connection");
 const pairDevice = callable<[string, string], any>("pair_device");
+const setDeviceName = callable<[string], any>("set_device_name");
 const getSaveHistory = callable<[number], any>("get_save_history");
 const getPendingUploads = callable<[], any>("get_pending_uploads");
 const getSaveScreenshot = callable<[number, number, string], any>("get_save_screenshot");
@@ -9516,7 +9517,11 @@ function SettingsPage() {
       const r = await setSteamTile(enabled, spec?.exe || '', spec?.startDir || '', spec?.args || '');
       if (r?.success) {
         setTileState((s) => ({ ...s, installed: enabled }));
-        setTileNote(r.message || '');
+        // "Restart Steam to see the RomM tile" is exactly what the row's own
+        // subtitle already says, so echoing it back reads as a warning about
+        // something new. Keep the note for the case the subtitle does NOT
+        // cover: Steam wasn't running, so the tile is simply there.
+        setTileNote(r.steam_running ? '' : (r.message || ''));
       } else {
         setTileNote(r?.message || 'Could not update the Steam library tile.');
       }
@@ -10370,6 +10375,14 @@ function SetupWizard() {
   const [hasPassword, setHasPassword] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  // Pairing happens when LEAVING the Connect step, not at Finish. A pairing code
+  // is short-lived, and anyone who stopped to install RetroArch or pick folders
+  // was spending that life on the rest of the wizard — arriving at Finish to
+  // "Invalid or expired pairing code" with the code long gone from the server's
+  // screen. Redeeming it while the user is still looking at it also means the
+  // error lands on the field that caused it.
+  const [paired, setPaired] = useState(false);
+  const [pairing, setPairing] = useState(false);
   // Desktop-only opt-in on the final step: write a "RomM" tile into Steam's
   // shortcuts.vdf. Offered here rather than as its own step because it's
   // optional system integration, not something sync needs — and it mirrors what
@@ -10536,8 +10549,25 @@ function SetupWizard() {
   }, [hasEmuStep, emu?.installed]);
 
   const finish = () => {
-    // Pop the full-screen wizard route off the history stack first, otherwise
-    // pressing Back from the library lands the user right back in the wizard.
+    // The wizard must not survive under the library in history — B at the
+    // library root would walk straight back into completed setup.
+    //
+    // On desktop the wizard IS the history floor (boot replace-navs "/" → setup,
+    // depth 1), and the shim's NavigateBack is a deliberate no-op there — so the
+    // pop below did nothing and the library was pushed on top of the wizard.
+    // Replacing the entry is what actually retires it, and it leaves the library
+    // as the floor, where root-B is correctly inert.
+    if ((window as any).__rommDesktop) {
+      try {
+        // Cast: NavigateReplace is the desktop shim's, not in Steam's Navigation
+        // type — which is exactly why this is behind the __rommDesktop guard.
+        (Navigation as any).NavigateReplace("/romm-sync-library");
+        Navigation.CloseSideMenus();
+        return;
+      } catch { /* fall through to the pop-and-push below */ }
+    }
+    // Deck: Steam owns the stack and the wizard was pushed onto it, so popping
+    // first is right — there is a real page underneath to pop to.
     try { Navigation.NavigateBack(); } catch { /* ignore */ }
     setTimeout(() => { Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus(); }, 60);
   };
@@ -10547,6 +10577,27 @@ function SetupWizard() {
     try { setTestResult(await testRommConnection(url.trim(), username.trim(), password)); }
     catch { setTestResult({ success: false, message: 'Test failed unexpectedly.' }); }
     finally { setTesting(false); }
+  };
+
+  // Connect step's primary action in pair mode: redeem the code, then advance.
+  // A code that paired but failed to connect still counts as paired — it is
+  // single-use and already spent, so retrying it can only report "expired".
+  const doPair = async () => {
+    setPairing(true); setTestResult(null);
+    try {
+      const r = await pairDevice(url.trim(), pairCode.trim());
+      if (r?.paired) {
+        setPaired(true);
+        if (!r?.success) {
+          setTestResult({ success: true, message: 'Paired — the server isn\'t answering yet, but that can settle on its own.' });
+        }
+        next();
+      } else {
+        setTestResult({ success: false, message: r?.message || 'Pairing failed.' });
+      }
+    } catch {
+      setTestResult({ success: false, message: 'Pairing failed.' });
+    } finally { setPairing(false); }
   };
 
   const doFinish = async () => {
@@ -10566,18 +10617,37 @@ function SetupWizard() {
         try {
           const spec = (window as any).__rommDesktop?.launchSpec?.();
           if (spec?.exe) {
-            const r = await setSteamTile(true, spec.exe, spec.startDir || '', spec.args || '');
-            if (r?.success && r?.steam_running) {
-              toaster.toast({ title: 'RomM', body: 'Restart Steam to see the RomM tile' });
-            }
+            // No toast on success: the row the user just ticked says Steam has
+            // to be restarted, so repeating it is noise on a screen they are
+            // already leaving.
+            await setSteamTile(true, spec.exe, spec.startDir || '', spec.args || '');
           }
         } catch (e) { console.error('[RomM] wizard desktop tile', e); }
       }
 
       if (mode === 'pair') {
-        const r = await pairDevice(url.trim(), pairCode.trim());
-        if (r?.success) { toaster.toast({ title: 'Ludo', body: 'Paired — connecting…' }); finish(); }
-        else toaster.toast({ title: 'Ludo', body: r?.message || 'Pairing failed.' });
+        // Belt and braces: the Connect step does not advance unless pairing
+        // succeeded, so this only fires if that invariant ever breaks.
+        if (!paired) {
+          const r = await pairDevice(url.trim(), pairCode.trim());
+          if (!r?.paired) {
+            toaster.toast({ title: 'Ludo', body: r?.message || 'Pairing failed.' });
+            return;
+          }
+        }
+        // Already paired on the Connect step — all that is left is the folders
+        // and the device name, which pair_device does not write. (Before pairing
+        // moved earlier, these were silently discarded in pair mode: doFinish
+        // called pair_device and nothing else.) Neither is worth blocking the
+        // library on, so a failure is reported and setup still completes.
+        try {
+          await setLibraryPaths(romDir.trim(), saveDir.trim(), biosDir.trim(), undefined);
+          await setDeviceName(deviceName.trim() || deviceNameDefault);
+        } catch (e) {
+          console.error('[RomM] wizard paired-finish', e);
+          toaster.toast({ title: 'Ludo', body: 'Saved, but your folders may need checking in Settings.' });
+        }
+        finish();
       } else {
         const dev = deviceName.trim() || deviceNameDefault;
         const r = await saveConfig(url.trim(), username.trim(), password, romDir.trim(), saveDir.trim(), dev, biosDir.trim());
@@ -10745,12 +10815,22 @@ function SetupWizard() {
               ) : (
                 <>
                   <PairCodeField label="Pairing code" value={pairCode}
-                    onChange={(v) => setPairCode(formatPairCode(v))} onKb={setKbRoom}
-                    onEnter={() => { if (canConnect) next(); }} />
+                    onChange={(v) => { setPairCode(formatPairCode(v)); setTestResult(null); }} onKb={setKbRoom}
+                    onEnter={() => { if (canConnect && !paired) doPair(); }} />
+                  {testResult && (
+                    <div style={{ fontSize: '13px', color: testResult.success ? V2.success : V2.danger }}>
+                      {testResult.success ? '✅' : '❌'} {testResult.message}
+                    </div>
+                  )}
                 </>
               )}
               {footer(
-                <GameActionButton variant="emphasized" label="Next" icon={<FaChevronRight size={13} />} disabled={!canConnect} onClick={next} />
+                mode === 'pair' && !paired
+                  ? <GameActionButton variant="emphasized" disabled={!canConnect || pairing}
+                    label={pairing ? 'Pairing…' : 'Pair & continue'}
+                    icon={pairing ? <FaSync size={14} style={{ animation: 'spin 1s linear infinite' }} /> : <FaChevronRight size={13} />}
+                    onClick={doPair} />
+                  : <GameActionButton variant="emphasized" label="Next" icon={<FaChevronRight size={13} />} disabled={!canConnect} onClick={next} />
               )}
             </div>
           )}
@@ -10851,7 +10931,9 @@ function SetupWizard() {
               <div style={{ fontSize: '24px', fontWeight: 800 }}>Ready to go</div>
               <div style={{ fontSize: '14px', color: V2.fg2, lineHeight: 1.6, maxWidth: '420px' }}>
                 {mode === 'pair'
-                  ? 'We\'ll pair this device with your RomM server and open your library.'
+                  ? paired
+                    ? 'This device is paired with your RomM server. We\'ll save your folders and open your library.'
+                    : 'We\'ll pair this device with your RomM server and open your library.'
                   : 'We\'ll save your connection and open your library.'}
                 {/* Finishing mid-install is fine — the backend thread carries on
                     and repoints the folders when it lands — but the user should
