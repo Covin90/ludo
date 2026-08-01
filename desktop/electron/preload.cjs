@@ -101,6 +101,9 @@ function startPolling() {
   // poll wins and the main process's kernel reader is ignored, so a pad the
   // browser can see is never driven by both paths at once.
   let chromiumHasPad = false;
+  // Set while the window is in the background, so the first frame after focus
+  // returns can re-sync silently instead of replaying held buttons as presses.
+  let wasUnfocused = false;
 
   function emitButton(id, isDown) {
     if (btnState[id] === isDown) return;
@@ -132,6 +135,7 @@ function startPolling() {
     // again (alt-tab back, or the emulator exits).
     if (!document.hasFocus()) {
       releaseAll();
+      wasUnfocused = true;
       requestAnimationFrame(poll);
       return;
     }
@@ -146,6 +150,24 @@ function startPolling() {
       // reader may be driving a hot-plugged pad that Chromium never surfaces
       // (see native-input.cjs), and clearing state every frame would cancel its
       // presses. Focus loss and real disconnects still release, below.
+      requestAnimationFrame(poll);
+      return;
+    }
+
+    // First focused frame after a spell in the background: ADOPT whatever is
+    // held without announcing it, so only genuinely new presses reach the UI.
+    //
+    // This is the mirror of releaseAll() above, and it is not symmetry for its
+    // own sake. Quitting RetroArch from its menu is an A press; RetroArch exits
+    // on the press, focus lands back on us while A is still physically down, and
+    // the poll below would report it as a brand-new press. The UI activates on
+    // the RELEASE that follows (see gamepad.ts) — which clicked the game tile
+    // that still had focus and relaunched the game the user had just quit.
+    if (wasUnfocused) {
+      wasUnfocused = false;
+      for (const [idx, id] of Object.entries(BUTTON_MAP)) {
+        btnState[id] = pressed(gp.buttons[idx]);
+      }
       requestAnimationFrame(poll);
       return;
     }

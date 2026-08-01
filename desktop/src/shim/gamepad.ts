@@ -1028,6 +1028,12 @@ export function startGamepad() {
   let repeatTimer: any = null;
   // Timestamp of the last horizontal press, to coalesce fast dpad mashing.
   let lastHMove = 0;
+  // Whether the OK press matching the next OK release was seen here — see the
+  // release branch of button().
+  let okPressSeen = false;
+  // The focused element at the moment the window went to the background, so it
+  // can be restored when we come back (see the focus listener below).
+  let focusBeforeBlur: HTMLElement | null = null;
 
   // `src` defaults to "gamepad" because the pad drives this through the public
   // window.__rommGamepad API; the keyboard path passes "keyboard".
@@ -1071,15 +1077,21 @@ export function startGamepad() {
       // to be immediate, and sound.ts's dedupe absorbs the synthetic .click()
       // that follows. B is the app-wide back gesture whether or not anything
       // handles it — a silent B reads as a dropped press.
-      if (id === GamepadButtonId.OK) playSound("activate");
+      if (id === GamepadButtonId.OK) { playSound("activate"); okPressSeen = true; }
       else if (id === GamepadButtonId.CANCEL) playSound("back");
       routeButton("down", id, false,
         id === GamepadButtonId.OK ? undefined : dedicatedFor(id));
     } else {
       routeButton("up", id, false);
       if (id === GamepadButtonId.OK) {
-        // Tap-activate on release (tile onActivate; native button click).
-        (document.activeElement as HTMLElement | null)?.click();
+        // Tap-activate on release (tile onActivate; native button click) — but
+        // only for a press this layer actually saw. A release on its own is not
+        // a tap: it can be the tail of a press that belonged to something else
+        // (a game we just quit, an alt-tabbed window), and activating on it
+        // fires whatever happens to hold focus here.
+        const tap = okPressSeen;
+        okPressSeen = false;
+        if (tap) (document.activeElement as HTMLElement | null)?.click();
       }
     }
   }
@@ -1143,7 +1155,37 @@ export function startGamepad() {
 
   // A key held while the window loses focus never delivers its keyup, which
   // would leave the repeat timer running forever. Drop everything on blur.
-  window.addEventListener("blur", () => releaseArrow(null));
+  // Losing focus also disowns any OK press in flight: preload releases held
+  // buttons when the window goes to the background, and that synthetic release
+  // must not activate the control under the cursor — at launch time that is the
+  // tile the user just pressed, i.e. the game they are already starting.
+  window.addEventListener("blur", () => {
+    releaseArrow(null);
+    okPressSeen = false;
+    // Remember where the highlight was, so coming back from a game restores it.
+    const a = document.activeElement as HTMLElement | null;
+    focusBeforeBlur = a && a !== document.body ? a : null;
+  });
+
+  // Coming back from a game (or an alt-tab), put the highlight back on the tile
+  // the user launched from. Chromium keeps activeElement across a window blur,
+  // but nothing re-asserts it, and the app's focus ring follows :focus — so the
+  // library came back looking like nothing was selected.
+  //
+  // This used to happen by accident: the held A that quit RetroArch was replayed
+  // as a fresh press, and the press branch of button() calls enterGamepadMode()
+  // + ensureFocusInOverlay(). That same replay also relaunched the game, so the
+  // replay is gone — and the focus restore it was quietly providing has to be
+  // done deliberately.
+  window.addEventListener("focus", () => {
+    if (mouseMode) return;
+    const el = focusBeforeBlur;
+    focusBeforeBlur = null;
+    // A re-render while we were away can replace the node; fall back to the
+    // normal stranded-focus recovery rather than focusing a detached element.
+    if (el && document.contains(el) && isVisible(el)) focusAndReveal(el, false, false);
+    else if (!focusIsUseful()) reseedIfStranded();
+  });
 
   window.__rommGamepad = { direction, button };
 }
