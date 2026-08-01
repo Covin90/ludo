@@ -1624,6 +1624,9 @@ class RomMClient:
         self.session = requests.Session()
         self.authenticated = False
         self.client_token = None  # RomM Client API Token (rmm_...) if used
+        # Save types whose /downloaded endpoint this server answered 404 for —
+        # see confirm_save_downloaded.
+        self._confirm_unsupported = set()
 
         # OAuth2 token storage
         self.access_token = None
@@ -3038,6 +3041,16 @@ class RomMClient:
         if not self.authenticated or not save_id or not device_id:
             return False
 
+        # A server that answered 404 for this type does not implement the
+        # endpoint, and asking again every single download cannot change that.
+        # RomM currently ships it for /api/saves but not /api/states, which is
+        # why covin's log carried 133 confirmation warnings for states against
+        # 18 successes for saves — a wall of WARNINGs for a server behaving
+        # exactly as built. Per client instance, so a server upgrade is picked
+        # up on the next connect rather than being latched forever.
+        if save_type in self._confirm_unsupported:
+            return False
+
         try:
             confirm_url = urljoin(self.base_url, f'/api/{save_type}/{save_id}/downloaded')
 
@@ -3055,6 +3068,12 @@ class RomMClient:
             if response.status_code in [200, 201, 204]:
                 logging.debug(f"Download confirmation successful for {save_type[:-1]} {save_id}")
                 return True
+            elif response.status_code == 404:
+                # Not this server's feature. Say so once, then stop asking.
+                self._confirm_unsupported.add(save_type)
+                logging.info(f"Server does not support download confirmation for "
+                             f"{save_type} — not asking again this session")
+                return False
             else:
                 logging.warning(f"Download confirmation failed for {save_type[:-1]} {save_id}: HTTP {response.status_code}")
                 return False
