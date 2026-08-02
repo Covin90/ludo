@@ -144,6 +144,22 @@ RESUME_SCHEMA = 1
 RESUME_TTL_SECONDS = 24 * 3600
 
 
+def _platform_label(rom):
+    """Human platform name off a RomM ROM row, or 'Unknown'.
+
+    RomM 5.1.0 has no `platform_name` field — it is platform_display_name
+    (already resolved to the custom name when the user set one) with
+    platform_custom_name alongside it. So the old rom.get('platform_name',
+    'Unknown') returned the default for every ROM, and because 'Unknown' is
+    truthy it also dead-ended the `or r.get('platform_name')` fallbacks downstream. Most
+    surfaces hid this behind _platform_name_for's slug->name map; the game
+    detail header did not, and showed "Unknown" whenever the detail fetch hadn't
+    landed. platform_name is kept last for older servers that do send it.
+    """
+    return (rom.get('platform_custom_name') or rom.get('platform_display_name')
+            or rom.get('platform_name') or 'Unknown')
+
+
 def load_decky_settings():
     try:
         if settings_file.exists():
@@ -1162,7 +1178,7 @@ class Plugin:
                         # save-sync/local matching keys on it.
                         'display_name':    rom.get('name'),
                         'rom_id':          rom.get('id'),
-                        'platform':        rom.get('platform_name', 'Unknown'),
+                        'platform':        _platform_label(rom),
                         'platform_slug':   platform_slug,
                         'file_name':       file_name,
                         'is_downloaded':   is_downloaded,
@@ -1703,7 +1719,7 @@ class Plugin:
                                 'name': Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
                                 'display_name': rom.get('name'),
                                 'rom_id': rom_id,
-                                'platform': rom.get('platform_name', 'Unknown'),
+                                'platform': _platform_label(rom),
                                 'platform_slug': platform_slug,
                                 'file_name': file_name,
                                 'is_downloaded': is_downloaded,
@@ -1766,7 +1782,7 @@ class Plugin:
                             'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
                             'display_name':    rom.get('name'),
                             'rom_id':          rom.get('id'),
-                            'platform':        rom.get('platform_name', 'Unknown'),
+                            'platform':        _platform_label(rom),
                             'platform_slug':   platform_slug,
                             'file_name':       file_name,
                             'is_downloaded':   is_downloaded,
@@ -4788,7 +4804,7 @@ class Plugin:
                 item = {
                     'rom_id': rid,
                     'name': rom.get('name') or rom.get('fs_name') or 'Unknown',
-                    'platform': rom.get('platform_name'),
+                    'platform': _platform_label(rom),
                     'is_downloaded': False,
                     'has_cover': bool(rom.get('path_cover_small')),
                     'platform_slug': rom.get('platform_slug'),
