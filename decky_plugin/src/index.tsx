@@ -9419,6 +9419,11 @@ function BiosPage() {
   const [biosDir, setBiosDir] = useState('');
   const [connected, setConnected] = useState(true);
   const [loading, setLoading] = useState(true);
+  // The server couldn't be asked (typically busy serving a library fetch) —
+  // NOT the same as it holding no firmware, which is what this page used to
+  // claim in that case.
+  const [unavailable, setUnavailable] = useState(false);
+  const [libraryLoading, setLibraryLoading] = useState(false);
 
   const load = async (refresh = false) => {
     try {
@@ -9427,11 +9432,21 @@ function BiosPage() {
         setRows(r.platforms || []);
         setBiosDir(r.bios_dir || '');
         setConnected(!!r.connected);
+        setUnavailable(!!r.unavailable);
+        setLibraryLoading(!!r.library_loading);
       }
     } catch { /* ignore */ }
     finally { setLoading(false); }
   };
   useEffect(() => { load(); }, []);
+
+  // Come back on our own while the server is busy, so the page fills in when
+  // the fetch eases off instead of parking on an error the user has to poke.
+  useEffect(() => {
+    if (!unavailable) return;
+    const t = setTimeout(() => load(true), 5000);
+    return () => clearTimeout(t);
+  }, [unavailable, rows]);
 
   const openDetail = (row: any) =>
     showModal(<BiosDetailModal slug={row.slug} platformName={row.platform_name || row.name}
@@ -9453,6 +9468,13 @@ function BiosPage() {
           <V2SettingsRow icon={<FaMicrochip size={16} />}
             title="Not connected to RomM"
             subtitle="BIOS files come from your own RomM server — connect to see what it holds." />
+        ) : unavailable ? (
+          <V2SettingsRow icon={<FaMicrochip size={16} />}
+            title={libraryLoading ? 'Waiting for your library to finish loading…'
+              : 'Couldn’t read firmware from RomM'}
+            subtitle={libraryLoading
+              ? 'Your RomM server is busy sending the library. This list appears as soon as it can answer — no need to leave the page.'
+              : 'The server didn’t answer in time. Retrying…'} />
         ) : rows.length === 0 ? (
           <V2SettingsRow icon={<FaMicrochip size={16} />}
             title="No firmware on the server"

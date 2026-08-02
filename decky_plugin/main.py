@@ -5860,6 +5860,10 @@ class Plugin:
     _core_firmware_cache: dict = None
     # {slug: {name, platform_id, files}} from one /api/platforms call.
     _server_firmware_cache: dict = None
+    # True when the last _server_firmware call couldn't reach the server at all,
+    # as opposed to being told there is no firmware. The BIOS page says very
+    # different things about those two.
+    _server_firmware_failed: bool = False
 
     @staticmethod
     def _parse_required_firmware(text: str):
@@ -6020,18 +6024,43 @@ class Plugin:
         "Firmware" tab renders. Asking per platform (as bios_manager does) turns
         this into N+1 requests against a server we already know is the slow part.
         Cached for the session unless refreshed; returns {} when offline.
+
+        Blocking — call it off the event loop.
+
+        Retried, because the moment the BIOS page is most likely to be opened
+        (right after connecting) is also when a library fetch has four workers
+        on the same server, and /api/platforms builds every platform's firmware
+        list. A single 15s attempt lost that race and the page then claimed the
+        server holds no firmware at all. Sets _server_firmware_failed so the
+        caller can tell "asked, got nothing" from "couldn't ask".
         """
         if not force and self._server_firmware_cache is not None:
+            self._server_firmware_failed = False
             return self._server_firmware_cache
+        self._server_firmware_failed = True
         out = {}
         try:
             c = self._romm_client
             if not (c and c.authenticated):
                 return self._server_firmware_cache or {}
             from urllib.parse import urljoin
-            r = c.session.get(urljoin(c.base_url, '/api/platforms'), timeout=15)
-            if r.status_code != 200:
-                logging.debug(f"[BIOS] /api/platforms -> {r.status_code}")
+            url = urljoin(c.base_url, '/api/platforms')
+            r = None
+            for attempt, timeout in enumerate((20, 45)):
+                try:
+                    r = c.session.get(url, timeout=timeout)
+                except Exception as e:
+                    logging.debug(f"[BIOS] /api/platforms attempt {attempt + 1}: {e}")
+                    r = None
+                if r is not None and r.status_code == 200:
+                    break
+                if r is not None:
+                    logging.debug(f"[BIOS] /api/platforms -> {r.status_code}")
+                    # A real HTTP answer (401/404/500) won't change on a retry.
+                    if r.status_code != 429 and r.status_code < 500:
+                        return self._server_firmware_cache or {}
+                time.sleep(1.0)
+            if r is None or r.status_code != 200:
                 return self._server_firmware_cache or {}
             for pl in (r.json() or []):
                 if not isinstance(pl, dict):
@@ -6055,6 +6084,7 @@ class Plugin:
             logging.warning(f"[BIOS] could not read server firmware: {e}")
             return self._server_firmware_cache or {}
         self._server_firmware_cache = out
+        self._server_firmware_failed = False
         return out
 
     def _bios_gap(self, game: dict, platform_name: str) -> dict:
@@ -6125,9 +6155,18 @@ class Plugin:
         BiosTrackingManager's background downloads. This one reports what the
         server holds versus what is on disk.
 
-        {success, bios_dir, connected, platforms: [{slug, name, core, severity,
-         missing_count, files: [{name, size, present, local_size, verified}]}]}
+        {success, bios_dir, connected, unavailable, library_loading,
+         platforms: [{slug, name, core, severity, missing_count,
+         files: [{name, size, present, local_size, verified}]}]}
+
+        Run off the event loop: it makes a network call and walks the BIOS dir,
+        and doing that inline stalled every other RPC (cover loads, status
+        polling) for as long as the busy server took to answer.
         """
+        return await asyncio.to_thread(self._get_bios_inventory_blocking,
+                                       bool(refresh))
+
+    def _get_bios_inventory_blocking(self, refresh: bool = False):
         try:
             sysdir = self._bios_dir()
             server = self._server_firmware(force=bool(refresh))
@@ -6168,6 +6207,12 @@ class Plugin:
             return {'success': True, 'bios_dir': str(sysdir) if sysdir else '',
                     'connected': bool(self._romm_client
                                       and self._romm_client.authenticated),
+                    # Distinguishes an empty list we believe from one we never
+                    # got: with the server busy behind a library fetch, the old
+                    # code returned [] and the page read "No firmware on the
+                    # server", which is a false statement the user can't act on.
+                    'unavailable': bool(self._server_firmware_failed and not out),
+                    'library_loading': bool(self._library_progress),
                     'platforms': out}
         except Exception as e:
             logging.error(f"get_bios_status error: {e}", exc_info=True)
