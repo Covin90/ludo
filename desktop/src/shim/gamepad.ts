@@ -252,8 +252,9 @@ function routeButton(
   button: number,
   isRepeat: boolean,
   dedicated?: keyof FocusHandlers,
+  from?: HTMLElement | null,
 ) {
-  const start = (document.activeElement as HTMLElement) ?? document.body;
+  const start = from ?? (document.activeElement as HTMLElement) ?? document.body;
   const e = synthEvent(button, isRepeat);
   let dedicatedFired = false;
   let node: HTMLElement | null = start;
@@ -1131,10 +1132,45 @@ export function startGamepad() {
     direction(heldArrows.length ? heldArrows[heldArrows.length - 1] : null, "keyboard");
   }
 
+  // Where a keyboard cancel should start walking. Escape is advertised in the
+  // footer legend whenever the LEGEND's target has a cancel handler, and that
+  // target is not always the focused element: in mouse mode enterMouseMode()
+  // blurs everything, so activeElement is <body> and a walk from there finds no
+  // handler at all — the legend said "Esc → Back" and the key did nothing.
+  // Fall back the same way the legend picks its target, then to the open modal
+  // (a modal with bHideCloseIcon has no other way out), then to the page's
+  // outermost cancel handler, which is the "go back" one.
+  function cancelStart(): HTMLElement {
+    const a = document.activeElement as HTMLElement | null;
+    if (a && a !== document.body && document.contains(a)) return a;
+    if (hovered && document.contains(hovered)) return hovered;
+    const modals = document.querySelectorAll<HTMLElement>(".shim-modal");
+    const modal = modals[modals.length - 1];
+    if (modal) return modal;
+    for (const [el, h] of registry) {
+      if (h.onCancelButton && document.contains(el) && isVisible(el)) return el;
+    }
+    return document.body;
+  }
+
   window.addEventListener("keydown", (e) => {
     // Any keypress at all (not just the arrows) retires the remembered-pad
     // guess — someone typing in a search box is on the keyboard.
     noteKbmInput();
+    // Escape is the keyboard's B: route it through the SAME dispatch the pad
+    // uses, so anything that answers B answers Escape. Claiming the event (only
+    // when a handler actually ran) also stops it reaching ui.tsx's per-Focusable
+    // Escape handling, which would otherwise fire the same cancel twice.
+    if (e.key === "Escape" && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
+      const claimed = routeButton(
+        "down", GamepadButtonId.CANCEL, false, "onCancelButton", cancelStart());
+      if (claimed) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!consumeRootBackNoop()) playSound("back");
+      }
+      return;
+    }
     const dir = ARROWS[e.key];
     if (!dir) return;
     // Leave browser/OS shortcuts (and text selection) alone.
