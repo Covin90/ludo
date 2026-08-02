@@ -2202,6 +2202,10 @@ class RomMClient:
                     'search_term': term,
                     'limit': limit,
                     'with_files': 'true',
+                    'with_total': 'false',
+                    'with_rom_id_index': 'false',
+                    'with_char_index': 'false',
+                    'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
                     'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
                 },
                 timeout=30
@@ -2311,6 +2315,10 @@ class RomMClient:
                     'collection_id': collection_id,
                     # RomM 4.9.0: file expansion is opt-in (with_files default False).
                     'with_files': 'true',
+                    'with_total': 'false',
+                    'with_rom_id_index': 'false',
+                    'with_char_index': 'false',
+                    'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
                     'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
                 },
                 timeout=30
@@ -2342,6 +2350,10 @@ class RomMClient:
                 params={
                     'virtual_collection_id': virtual_collection_id,
                     'with_files': 'true',
+                    'with_total': 'false',
+                    'with_rom_id_index': 'false',
+                    'with_char_index': 'false',
+                    'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
                     'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
                 },
                 timeout=30
@@ -2600,6 +2612,26 @@ class RomMClient:
                             'offset': offset,
                             # RomM 4.9.0: file expansion is opt-in (with_files default False).
                             'with_files': 'true',
+                            # /api/roms computes four things per request — the
+                            # page, the count, char_index, rom_id_index — plus
+                            # filter_values, and all four extras default on. We
+                            # read only `items` (the total comes from the probe
+                            # in _fetch_all_games_chunked), so every page was
+                            # paying for three whole-library scans it discarded.
+                            # Measured on a 3,083-ROM instance: 5.26s -> 4.92s
+                            # per 1000-row page, 60KB less payload. Small there,
+                            # but the extras scale with LIBRARY size while the
+                            # page doesn't, and they are recomputed per page —
+                            # rom_id_index alone is 18KB of ids at 3k, so ~290KB
+                            # on every one of the ~50 pages of a 50k library.
+                            # Note with_total alone is not enough: rom_id_index
+                            # carries the count, so `total` comes back anyway
+                            # unless it is disabled too. Older servers ignore
+                            # unknown params, so this stays safe pre-5.1.1.
+                            'with_total': 'false',
+                            'with_rom_id_index': 'false',
+                            'with_char_index': 'false',
+                            'with_filter_values': 'false',
                             'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
                         },
                         timeout=timeout

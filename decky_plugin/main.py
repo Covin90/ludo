@@ -5050,6 +5050,14 @@ class Plugin:
                     'order_by': 'last_played', 'order_dir': 'desc',
                     'last_played': 'true',  # server-side filter to played roms only
                     'limit': limit, 'offset': 0,
+                    # Only `items` is read, and /api/roms otherwise computes a
+                    # count, a char_index, a rom_id_index and filter_values over
+                    # the whole library for every request. Older servers ignore
+                    # these params. See _fetch_pages_parallel in sync_core.
+                    'with_total': 'false',
+                    'with_rom_id_index': 'false',
+                    'with_char_index': 'false',
+                    'with_filter_values': 'false',
                     'fields': 'id,name,fs_name,platform_name,platform_slug,path_cover_small,merged_screenshots,rom_user',
                 },
                 timeout=30,
