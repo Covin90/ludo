@@ -4008,7 +4008,11 @@ const checkForNotifications = async () => {
         if (ann.kind === 'ready') {
           toaster.toast({
             title: 'Your library is ready',
-            body: `${(ann.games ?? 0).toLocaleString()} games from RomM`,
+            // Say where the difference comes from when there is one, or the
+            // number looks like Ludo dropped games off RomM's own count.
+            body: (ann.files && ann.files > (ann.games ?? 0))
+              ? `${(ann.games ?? 0).toLocaleString()} games from ${ann.files.toLocaleString()} ROM files — regional versions of a game are grouped.`
+              : `${(ann.games ?? 0).toLocaleString()} games from RomM`,
             duration: 6000,
             onClick: () => { try { Navigation.Navigate('/romm-sync-library'); } catch { /* ignore */ } },
           });
@@ -5640,7 +5644,11 @@ function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
 // get_service_status (see main.py get_service_status).
 function OfflineBanner({ status }: { status: any }) {
   const conn = status?.connection;
-  if (!conn || conn === 'online') return null;
+  // A library fetch in flight is worth a banner even when the connection is
+  // healthy — that IS the normal case, since auth completes long before the
+  // fetch does. Without this the loading state was unreachable in practice.
+  const loading = status?.library_progress;
+  if (!conn || (conn === 'online' && !loading)) return null;
 
   // Distinguish "the Deck has no internet" from "the Deck is online but the
   // RomM server isn't responding" — same offline browse experience, but the
@@ -5660,7 +5668,7 @@ function OfflineBanner({ status }: { status: any }) {
     : 'Connect to a network to browse your library and sync saves.';
 
   let dot = V2.warning, title = '', detail = '';
-  if (conn === 'connecting') {
+  if (conn === 'connecting' || (conn === 'online' && loading)) {
     dot = V2.fgMuted;
     // Connecting is over in well under a second; the rest of the wait is the
     // library, so say so and put a number on it. A count that moves is what
@@ -5670,7 +5678,11 @@ function OfflineBanner({ status }: { status: any }) {
     const prog = status?.library_progress;
     if (prog?.total > 0) {
       title = 'Loading your library…';
-      detail = `${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} games — you can play your downloaded games meanwhile.`;
+      // "ROM files", not "games": the total comes from the server's row count,
+      // and the library ends up smaller once regional variants are grouped.
+      // Counting up to a number the finished library never reaches reads as a
+      // failure — same reason the ready toast reports both numbers.
+      detail = `${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} ROM files — you can play your downloaded games meanwhile.`;
     } else {
       title = prog ? 'Loading your library…' : 'Connecting to RomM…';
       detail = 'Your downloaded games are ready to play in the meantime.';
@@ -9911,6 +9923,10 @@ function SettingsPage() {
         // The browse lists are cached to localStorage for instant repaint, so
         // they'd otherwise survive the logout and greet the next user.
         clearBrowseCaches();
+        // The backend re-arms its one-shot announcement on logout; this latch
+        // has to drop too or the next sign-in's "library is ready" is swallowed
+        // by a session that already toasted once.
+        _annShown = false;
         toaster.toast({
           title: 'Logged out',
           body: wipeData

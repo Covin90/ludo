@@ -948,6 +948,14 @@ class Plugin:
         self._last_full_fetch_time = None
         self._library_progress = None
         self._announce_library = None
+        # Signing in again means a first fetch again — a ~12s (or minutes) wait
+        # the user will likely wander off during, which is exactly what the
+        # one-shot announcement exists for. Re-arm it.
+        try:
+            if self._settings:
+                self._settings.set('UI', 'library_announced', 'false')
+        except Exception as e:
+            logging.warning(f"Couldn't re-arm the library announcement: {e}")
         logging.info("Cleared cached library state")
 
     def _persist_snapshot(self):
@@ -1241,8 +1249,13 @@ class Plugin:
                         and not incomplete):
                     # Never announce a short library as ready — the count in the
                     # toast would be wrong and the user has no way to know.
+                    # Both numbers: RomM's own UI counts ROM files (3,083 here)
+                    # while we group regional variants of the same game into one
+                    # entry (2,440). Reporting only ours reads as "Ludo lost 643
+                    # games". See _group_sibling_roms.
                     self._announce_library = {'kind': 'ready',
-                                              'games': len(self._available_games)}
+                                              'games': len(self._available_games),
+                                              'files': server_total}
 
                 self._last_full_fetch_time = datetime.now(timezone.utc).isoformat()
                 self._snapshot_fetched_at = self._last_full_fetch_time
@@ -1589,6 +1602,13 @@ class Plugin:
                 # frontend gates the post-update "reopen Home" on this so covers
                 # don't fetch against a still-initializing backend.
                 'library_ready':           self._last_full_fetch_time is not None,
+                # Present only while a full fetch is in flight. It belongs in THIS
+                # branch, not just the not-connected one: RomMClient authenticates
+                # in its constructor, so we report 'online' from the first second
+                # of a connect while the library fetch still has ~12s (much more on
+                # a big library) to run. That window is exactly when the user needs
+                # a number, and it used to have none.
+                'library_progress':        self._library_progress,
                 # One-shot; see _announce_library. Cleared via ack_library_announcement.
                 'library_announcement':    self._announce_library,
                 'game_count':              game_count,
