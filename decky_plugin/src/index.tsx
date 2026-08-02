@@ -99,23 +99,82 @@ const getRommLogo = callable<[], any>("get_romm_logo");
 // concurrency-limited queue so tiles fill in progressively, FIFO (≈ left to
 // right / top to bottom) — the same one-at-a-time backbone the Save Data page
 // uses for its state screenshots.
+// Generous: a cold cache means a real RomM download + downscale per cover, and
+// a slot released too eagerly would double-fetch rather than wait.
+const IMAGE_RPC_TIMEOUT_MS = 30_000;
+
+// Newer batches are served BEFORE older ones (see currentBatch): a focus jump
+// down a long grid used to queue its 30 on-screen tiles behind every cover
+// still pending from where the user came from, so the screen they're looking
+// at filled last. Within a batch it stays FIFO — the ≈left-to-right fill.
 function makeImageQueue(concurrency: number) {
   let active = 0;
-  const pending: Array<() => void> = [];
+  let seq = 0;
+  const pending: Array<{ batch: number; seq: number; run: () => void }> = [];
+  const takeNext = () => {
+    let best = 0;
+    for (let i = 1; i < pending.length; i++) {
+      const p = pending[i], b = pending[best];
+      if (p.batch > b.batch || (p.batch === b.batch && p.seq < b.seq)) best = i;
+    }
+    return pending.splice(best, 1)[0];
+  };
   const pump = () => {
     while (active < concurrency && pending.length) {
       active++;
-      pending.shift()!();
+      try {
+        takeNext().run();
+      } catch {
+        // A job that throws synchronously must not take its slot to the grave —
+        // three of those and the queue is wedged for the rest of the session
+        // with every remaining tile stuck on its placeholder forever.
+        active--;
+      }
     }
   };
-  return function enqueue<T>(job: () => Promise<T>): Promise<T> {
+  return function enqueue<T>(job: () => Promise<T>, batch = currentBatch()): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      pending.push(() => {
-        job().then(resolve, reject).finally(() => { active--; pump(); });
+      pending.push({
+        batch, seq: seq++,
+        run: () => {
+          // Watchdog. A slot is only ever freed by the job settling, so an RPC
+          // whose reply never arrives — the backend restarting mid-flight drops
+          // in-flight replies, and the plugin backend does restart under us —
+          // would hold its slot permanently. Observed as: a handful of images
+          // paint, then nothing loads until the page is remounted. Releasing
+          // the slot lets the queue drain; the rejection reaches awaitCover,
+          // which leaves the result uncached so the tile's own retry refetches.
+          let settled = false;
+          const release = () => {
+            if (settled) return;
+            settled = true;
+            active--;
+            pump();
+          };
+          const timer = setTimeout(() => {
+            if (settled) return;
+            reject(new Error('image rpc timeout'));
+            release();
+          }, IMAGE_RPC_TIMEOUT_MS);
+          job().then(resolve, reject).finally(() => { clearTimeout(timer); release(); });
+        },
       });
       pump();
     });
   };
+}
+// Everything enqueued in one tick shares a batch number. Tiles mounted by the
+// same render land together (so they keep their DOM order) while a later
+// render — a scroll, a focus jump, a new page — outranks whatever is still
+// waiting from before it.
+let _batch = 0;
+let _batchScheduled = false;
+function currentBatch(): number {
+  if (!_batchScheduled) {
+    _batchScheduled = true;
+    setTimeout(() => { _batch++; _batchScheduled = false; }, 0);
+  }
+  return _batch;
 }
 const imageQueue = makeImageQueue(3);
 const qGetImage = (path: string) => imageQueue(() => getImage(path));
@@ -143,9 +202,53 @@ function _platIconCacheSet(key: string, uri: string | null) {
 // Keys: `cover:${romId}:${large}` for ROM covers, `img:${path}` for screenshots.
 const _coverCache = new Map<string, string | null>();   // resolved results only
 const _coverInflight = new Map<string, Promise<string | null>>(); // dedup in-flight
+
+// LRU bound. This map used to grow without limit, and it is the one structure
+// that outlives the tiles: leaving a group unmounts its grid, but every cover
+// it painted stayed pinned here for the rest of the session. base64 in a JS
+// string is UTF-16, so a ~24KB thumbnail costs ~64KB of heap — a few thousand
+// covers browsed across a session is already hundreds of MB, which the
+// gamescope web view does not have to spare.
+//
+// Budgeted in characters (≈2 bytes each), not entries, because screenshots and
+// alpha-preserved art are far bigger than a grid thumbnail. Nulls — "this rom
+// genuinely has no art" — are exempt: they cost nothing and evicting one would
+// send the tile back to the backend to be told the same thing again.
+const _COVER_CACHE_MAX_CHARS = 48_000_000;   // ≈96MB heap
+let _coverCacheChars = 0;
+function _coverCacheEvict() {
+  // Map iterates in insertion order and every hit re-inserts (see peekCover),
+  // so the front of the map is the least recently used entry.
+  for (const [k, v] of _coverCache) {
+    if (_coverCacheChars <= _COVER_CACHE_MAX_CHARS * 0.8) return;
+    if (v === null) continue;
+    _coverCache.delete(k);
+    _coverCacheChars -= v.length;
+  }
+}
+function _coverCacheSet(key: string, uri: string | null) {
+  const prev = _coverCache.get(key);
+  if (typeof prev === 'string') _coverCacheChars -= prev.length;
+  _coverCache.delete(key);
+  _coverCache.set(key, uri);
+  if (uri !== null) _coverCacheChars += uri.length;
+  if (_coverCacheChars > _COVER_CACHE_MAX_CHARS) _coverCacheEvict();
+}
+function _coverCacheReset() {
+  _coverCache.clear();
+  _coverCacheChars = 0;
+}
 // Sync peek: resolved URI (string | null) or undefined if not yet loaded.
-const peekCover = (key: string): string | null | undefined =>
-  _coverCache.has(key) ? _coverCache.get(key) : undefined;
+// A hit re-inserts, which is what makes insertion order an LRU order. Note the
+// eviction only reclaims what the cache itself pins: a cover whose tile is
+// still mounted stays alive through that tile's own state, by design — it's
+// on screen.
+const peekCover = (key: string): string | null | undefined => {
+  if (!_coverCache.has(key)) return undefined;
+  const v = _coverCache.get(key)!;
+  if (v !== null) { _coverCache.delete(key); _coverCache.set(key, v); }
+  return v;
+};
 // Deduped fetch into the cache; safe to call from many tiles / prefetch at once.
 // Only CONFIRMED results are cached: the backend returns success:false while it
 // is still connecting/authenticating (e.g. the window right after a self-update
@@ -159,7 +262,7 @@ function awaitCover(key: string, fetcher: () => Promise<{ success?: boolean; dat
     p = fetcher()
       .then((r) => {
         const u = r?.data_uri || null;
-        if (r && r.success !== false) _coverCache.set(key, u);
+        if (r && r.success !== false) _coverCacheSet(key, u);
         _coverInflight.delete(key);
         return u;
       })
@@ -2248,7 +2351,56 @@ function useNavChrome(): NavChrome {
   const [rdIcon, setRdIcon] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
-    (async () => {
+    // The fetched values are authoritative over the cached seed above, and
+    // whatever they resolve to becomes next launch's seed. `fresh` starts from
+    // the cache so a failed leg keeps the remembered value rather than
+    // persisting a blank over a good one.
+    const fresh: NavIdentity = {
+      username: cached?.username || '', role: cached?.role || '', avatar: cached?.avatar || null,
+    };
+    // Identity runs as its own chain, started in the same tick as the brand /
+    // RetroDECK art rather than after it. These were one serial await chain, so
+    // the account pill sat on its placeholder for five round-trips (two SVGs +
+    // the RetroDECK flag + its logo) before the username fetch even began.
+    const identity = (async () => {
+      // `connected` distinguishes "signed out" from "the backend hasn't
+      // finished connecting yet" — see get_account_username. Only the former
+      // may paint 'Guest' or invalidate the cache.
+      // Retried because "not connected yet" is transient: auto-connect's login
+      // round-trip routinely finishes after first paint, and without this the
+      // pill would hold the cached seed (or the placeholder) until something
+      // remounted it. ~30s of patience, then we stop asking.
+      let known = false;
+      for (let attempt = 0; alive && !known && attempt < 20; attempt++) {
+        if (attempt) await new Promise((r) => setTimeout(r, 1500));
+        try {
+          const acc = await getAccountUsername();
+          if (!acc?.connected) continue;
+          known = true;
+          fresh.username = acc?.username || 'Guest';
+          fresh.role = acc?.role || '';
+          if (alive) { setUsername(fresh.username); setRole(fresh.role); }
+        } catch { if (alive && !fresh.username) setUsername('Guest'); }
+      }
+      if (!alive) return;
+      // Avatar fetched raw by the backend (get_avatar) — keeps transparency and
+      // logs a wrong path/404 instead of silently showing the initial fallback.
+      // Skipped when we never reached the account: a null here would blank a
+      // perfectly good cached avatar on a slow connect.
+      if (known) {
+        try {
+          const av = await getAvatar();
+          fresh.avatar = av?.data_uri || null;
+          if (alive) setAvatar(fresh.avatar);
+        } catch { }
+      }
+      // Only remember a real identity: 'Guest' means signed out, and caching it
+      // would paint "Guest" on the next launch before the fetch corrects it —
+      // exactly the flash this cache exists to remove.
+      if (known && fresh.username && fresh.username !== 'Guest') writeIdentity(fresh);
+      else if (known) clearIdentityCache();
+    })();
+    const chrome = (async () => {
       try { const a = await getImage('/assets/isotipo.svg'); if (alive) setIso(a?.data_uri || null); } catch { }
       try { const b = await getImage('/assets/logotipo.svg'); if (alive) setWord(b?.data_uri || null); } catch { }
       try {
@@ -2256,34 +2408,8 @@ function useNavChrome(): NavChrome {
         if (alive) setRdEnabled(!!on);
         if (on) { const r = await getRetrodeckLogo(); if (alive) setRdIcon(r?.data_uri || null); }
       } catch { }
-      // The fetched values are authoritative over the cached seed above, and
-      // whatever they resolve to becomes next launch's seed. `fresh` starts from
-      // the cache so a failed leg keeps the remembered value rather than
-      // persisting a blank over a good one.
-      const fresh: NavIdentity = {
-        username: cached?.username || '', role: cached?.role || '', avatar: cached?.avatar || null,
-      };
-      let known = false;
-      try {
-        const acc = await getAccountUsername();
-        fresh.username = acc?.username || 'Guest';
-        fresh.role = acc?.role || '';
-        known = true;
-        if (alive) { setUsername(fresh.username); setRole(fresh.role); }
-      } catch { if (alive && !fresh.username) setUsername('Guest'); }
-      // Avatar fetched raw by the backend (get_avatar) — keeps transparency and
-      // logs a wrong path/404 instead of silently showing the initial fallback.
-      try {
-        const av = await getAvatar();
-        fresh.avatar = av?.data_uri || null;
-        if (alive) setAvatar(fresh.avatar);
-      } catch { }
-      // Only remember a real identity: 'Guest' means signed out, and caching it
-      // would paint "Guest" on the next launch before the fetch corrects it —
-      // exactly the flash this cache exists to remove.
-      if (known && fresh.username && fresh.username !== 'Guest') writeIdentity(fresh);
-      else if (known) clearIdentityCache();
     })();
+    void Promise.all([identity, chrome]);
     return () => { alive = false; };
   }, []);
   return { iso, word, username, role, avatar, rdEnabled, rdIcon };
@@ -4349,7 +4475,7 @@ function ConfigPage() {
           <ButtonItem layout="below" onClick={async () => {
             try {
               const r = await clearCoverCache();
-              _coverCache.clear(); _coverInflight.clear(); // drop the frontend hot layer too
+              _coverCacheReset(); _coverInflight.clear(); // drop the frontend hot layer too
               toaster.toast({ title: 'Cover cache cleared', body: r?.success ? `${r.removed ?? 0} files removed` : (r?.message || 'Error') });
             } catch (e) { toaster.toast({ title: 'Clear failed', body: String(e) }); }
           }}>

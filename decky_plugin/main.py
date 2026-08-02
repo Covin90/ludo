@@ -1031,6 +1031,55 @@ class Plugin:
             logging.warning(f"Couldn't re-arm the library announcement: {e}")
         logging.info("Cleared cached library state")
 
+    # Subfields any consumer actually reads off a rom's `files` entries and its
+    # `_sibling_files` entries. Everything else RomM returns for them —
+    # archive_members (31% of the files payload on its own), md5/sha1/crc
+    # hashes, created_at/updated_at/last_modified, track_meta, full_path, plus
+    # each sibling's own nested files/sibling_roms/rom_user/cover paths — is
+    # never read and only inflates the snapshot, which is parsed in one gulp on
+    # every cold start.
+    #
+    # These are PROJECTED, not dropped: both lists are searched library-wide by
+    # the save-matching code in sync_core (which attributes a save to a rom by
+    # matching disc/member filenames, and falls back destructively when it finds
+    # nothing), so they must stay present and complete for every game.
+    _SNAPSHOT_FILE_KEYS = ('file_name', 'fs_name', 'file_size_bytes', 'size_bytes')
+    _SNAPSHOT_SIBLING_KEYS = ('id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension')
+
+    @staticmethod
+    def _project(entries, keys):
+        """Copy `entries`, keeping only `keys`. Non-dict entries pass through."""
+        out = []
+        for e in entries or []:
+            if isinstance(e, dict):
+                out.append({k: e[k] for k in keys if k in e})
+            else:
+                out.append(e)
+        return out
+
+    def _slim_for_snapshot(self, games):
+        """Shallow-copy each game with its two fat lists projected down.
+
+        Copies rather than mutating: `self._available_games` is the live
+        library every RPC reads, and trimming it in place would strip fields
+        out from under a session that is working perfectly well."""
+        slim = []
+        for g in games or []:
+            if not isinstance(g, dict):
+                slim.append(g)
+                continue
+            g2 = dict(g)
+            rd = g2.get('romm_data')
+            if isinstance(rd, dict) and rd.get('files'):
+                rd = dict(rd)
+                rd['files'] = self._project(rd['files'], self._SNAPSHOT_FILE_KEYS)
+                g2['romm_data'] = rd
+            if g2.get('_sibling_files'):
+                g2['_sibling_files'] = self._project(
+                    g2['_sibling_files'], self._SNAPSHOT_SIBLING_KEYS)
+            slim.append(g2)
+        return slim
+
     def _persist_snapshot(self):
         """Write-through the live library to disk so a cold start can hydrate it
         offline. Called after every successful fetch. Best-effort: never raises
@@ -1041,7 +1090,7 @@ class Plugin:
                 'schema': SNAPSHOT_SCHEMA,
                 'fetched_at': datetime.now(timezone.utc).isoformat(),
                 'server_url': url,
-                'games': self._available_games or [],
+                'games': self._slim_for_snapshot(self._available_games),
                 # Ungrouped server count for the next connect's count probe.
                 # Absent in snapshots written before this existed; hydrate reads
                 # it as None and that connect simply fetches.
@@ -1197,8 +1246,26 @@ class Plugin:
         # Returns immediately — it runs the scan on its own thread.
         self._bios_tracking.scan_library_bios()
 
+    # Serializes connect attempts. The retry thread and the "device reports
+    # online" probe both call _connect_to_romm(), and at startup both see an
+    # unauthenticated client and go at once: two full logins, two library /
+    # platform / collection fetches, two BIOS scans, and — worst — the second
+    # REPLACES self._romm_client out from under the first. Observed cost was a
+    # 4.6s connect where a single pass takes 0.15s.
+    _connect_lock = threading.Lock()
+
     def _connect_to_romm(self):
-        """Connect to RomM, load game list, and start AutoSyncManager."""
+        """Connect to RomM, load game list, and start AutoSyncManager.
+
+        Serialized: a caller arriving while a connect is in flight waits for it
+        and then reports that result instead of starting a second one."""
+        with self._connect_lock:
+            # The wait may itself have been the connect this caller wanted.
+            if self._romm_client and self._romm_client.authenticated:
+                return True
+            return self._connect_to_romm_locked()
+
+    def _connect_to_romm_locked(self):
         url      = self._settings.get('RomM', 'url')
         username = self._settings.get('RomM', 'username')
         password = self._settings.get('RomM', 'password')
@@ -2501,11 +2568,21 @@ class Plugin:
     async def get_account_username(self):
         """Return the human-readable RomM account name for the connected user,
         fetched live from /api/users/me. Used by the in-app Settings page so it
-        never displays a stored credential/token. Empty string when offline."""
+        never displays a stored credential/token. Empty string when offline.
+
+        'connected' separates "there is no account to show" from "we can't
+        answer yet". On a cold launch this RPC can land before
+        _connect_to_romm() has finished its login round-trip, and the old
+        unconditional {'username': ''} made the caller read that as signed out
+        — it painted "Guest"/"G" and threw away the cached identity, which is
+        what made the *next* launch slow too. Only connected:True licenses the
+        caller to treat an empty username as a real signed-out state."""
         try:
             client = self._romm_client
             if client is None or not getattr(client, 'authenticated', False):
-                return {'username': ''}
+                # _connect_blocked means auto-connect is off or credentials are
+                # missing: nobody is coming, so this genuinely is signed out.
+                return {'username': '', 'connected': bool(self._connect_blocked)}
             user = client.get_current_user() or {}
             name = user.get('username') or user.get('display_name') or ''
             return {
@@ -2513,10 +2590,11 @@ class Plugin:
                 'role': user.get('role') or '',
                 'avatar_path': user.get('avatar_path') or '',
                 'updated_at': user.get('updated_at') or '',
+                'connected': True,
             }
         except Exception as e:
             logging.error(f"get_account_username error: {e}")
-            return {'username': ''}
+            return {'username': '', 'connected': False}
 
     async def get_avatar(self):
         """Return the connected user's RomM avatar as a base64 data URI, or
@@ -2548,8 +2626,9 @@ class Plugin:
                 return {'data_uri': None}
             ts = user.get('updated_at') or ''
             ck = ('avatar', uid, ap, ts)
-            if ck in self._cover_cache:
-                return {'data_uri': self._cover_cache[ck]}
+            hit = self._cover_cache_get(ck)
+            if hit is not None:
+                return {'data_uri': hit}
             url = urljoin(client.base_url, f"/api/users/{uid}/avatar")
             params = {'ts': ts} if ts else None
             resp = client.session.get(url, params=params, timeout=15)
@@ -4230,13 +4309,31 @@ class Plugin:
     _THUMB_W = 360
     _THUMB_W_LARGE = 640  # detail-page hero uses a bigger cover
 
+    _COVER_CACHE_MAX = 2000   # ~50MB of thumbnails; one Home page alone hit 600
+
     def _cover_cache_put(self, ck, uri):
         """Insert into the in-memory cache, enforcing a bound on EVERY insert
         (the old code only capped on the network path, so disk hits grew it
-        unbounded — 800+ thumbnails ≈ hundreds of MB resident)."""
-        if len(self._cover_cache) > 600:
-            self._cover_cache.clear()
+        unbounded — 800+ thumbnails ≈ hundreds of MB resident).
+
+        Evicts the least-recently-used entry rather than clearing the whole
+        dict: a flush at the bound sent every visible tile back to a disk read
+        mid-scroll, so a big library got slower the longer you browsed. dicts
+        preserve insertion order, so re-inserting on hit (see _cover_cache_get)
+        makes the first key the LRU one."""
+        self._cover_cache.pop(ck, None)
         self._cover_cache[ck] = uri
+        while len(self._cover_cache) > self._COVER_CACHE_MAX:
+            self._cover_cache.pop(next(iter(self._cover_cache)), None)
+
+    def _cover_cache_get(self, ck):
+        """Return a cached data URI (marking it most-recently-used), or None."""
+        uri = self._cover_cache.get(ck)
+        if uri is not None:
+            # Re-insert at the end so this key is no longer the eviction target.
+            self._cover_cache.pop(ck, None)
+            self._cover_cache[ck] = uri
+        return uri
 
     def _store_thumb(self, ck, thumb_key, raw, mime, large):
         """Downscale raw bytes → thumbnail, persist under thumb_key, mem-cache
@@ -4283,13 +4380,65 @@ class Plugin:
             logging.debug(f"_make_thumb failed: {e}")
             return content, None
 
+    # Bumped when a key scheme changes and makes existing files unreachable.
+    # v3: cover-art keys dropped the ?ts= query and rom covers moved under
+    # covt2:<rom_id>, orphaning every imgt2 file written before this.
+    _COVER_CACHE_FORMAT = 3
+
     def _cover_dir(self):
         d = CONFIG_DIR / 'cover_cache'
         try:
             d.mkdir(parents=True, exist_ok=True)
+            self._migrate_cover_dir(d)
         except Exception:
             pass
         return d
+
+    _cover_fmt_checked = False
+    # Held for the whole wipe. Cover fetches run on several worker threads at
+    # once, so without this the first thread in would set the "done" flag, let
+    # the others straight through, and then delete the covers they had just
+    # written — silently, and only on the one launch after an upgrade.
+    _cover_fmt_lock = threading.Lock()
+
+    def _migrate_cover_dir(self, d):
+        """Drop cache files stranded by a key-scheme change, once per upgrade.
+
+        Safe by construction: this directory is a pure cache, so the worst case
+        is refetching art. Without it the orphans would sit there occupying the
+        prune budget and never be read again."""
+        if self._cover_fmt_checked:
+            return
+        with self._cover_fmt_lock:
+            if self._cover_fmt_checked:
+                return
+            self._migrate_cover_dir_locked(d)
+            self.__class__._cover_fmt_checked = True
+
+    def _migrate_cover_dir_locked(self, d):
+        marker = d / '.format'
+        try:
+            have = int(marker.read_text().strip())
+        except Exception:
+            have = 0
+        if have >= self._COVER_CACHE_FORMAT:
+            return
+        removed = 0
+        for p in d.iterdir():
+            if p.name == '.format':
+                continue
+            try:
+                p.unlink()
+                removed += 1
+            except Exception:
+                pass
+        try:
+            marker.write_text(str(self._COVER_CACHE_FORMAT))
+        except Exception:
+            pass
+        if removed:
+            logging.info(f"cover cache format v{have} -> v{self._COVER_CACHE_FORMAT}: "
+                         f"cleared {removed} stranded files")
 
     def _disk_cover_get(self, key: str):
         """Return a data URI from disk for `key`, or None if not cached."""
@@ -4335,22 +4484,55 @@ class Plugin:
         except Exception:
             pass
 
-    def _prune_cover_dir(self, cap: int = 4000):
-        """Keep the cache bounded: when over `cap` files, drop the oldest 20%.
+    # Budget by bytes, not file count: thumbnails run ~10-30KB but screenshots
+    # and alpha-preserved art don't, so a file cap bounded the wrong quantity.
+    # 512MB holds ~20k thumbnails — a large library browsed end to end — and is
+    # a rounding error against a ROM collection's own footprint.
+    _COVER_DIR_MAX_BYTES = 512 * 1024 * 1024
+    _COVER_DIR_MAX_FILES = 40000
+
+    def _prune_cover_dir(self, cap: int = None):
+        """Keep the cache bounded: when over budget, drop the least recently
+        READ files (mtime is bumped on every disk hit) until 20% under it.
         Runs ~1 call in 40 (writes) to keep the stat cost negligible."""
         try:
             import random
             if random.randint(0, 39) != 0:
                 return
-            files = list(self._cover_dir().iterdir())
-            if len(files) <= cap:
+            cap = cap or self._COVER_DIR_MAX_FILES
+            entries = []
+            total = 0
+            for p in self._cover_dir().iterdir():
+                if p.name == '.format':  # deleting it would re-trigger the wipe
+                    continue
+                try:
+                    st = p.stat()
+                except Exception:
+                    continue
+                entries.append((st.st_mtime, st.st_size, p))
+                total += st.st_size
+            if total <= self._COVER_DIR_MAX_BYTES and len(entries) <= cap:
                 return
-            files.sort(key=lambda p: p.stat().st_mtime)
-            for p in files[: max(1, len(files) // 5)]:
+            # Evict oldest-first down to 80% of both budgets, so a prune buys a
+            # long quiet stretch instead of re-running on the very next write.
+            entries.sort(key=lambda e: e[0])
+            want_bytes = int(self._COVER_DIR_MAX_BYTES * 0.8)
+            want_files = int(cap * 0.8)
+            nfiles = len(entries)
+            removed = 0
+            for _, size, p in entries:
+                if total <= want_bytes and nfiles <= want_files:
+                    break
                 try:
                     p.unlink()
+                    total -= size
+                    nfiles -= 1
+                    removed += 1
                 except Exception:
                     pass
+            if removed:
+                logging.info(f"cover cache pruned {removed} files "
+                             f"({total / 1048576:.0f}MB / {nfiles} left)")
         except Exception:
             pass
 
@@ -4380,16 +4562,18 @@ class Plugin:
         event loop (which would stall every other plugin RPC and the whole UI).
         """
         ck = (rom_id, large)
-        if ck in self._cover_cache:
-            return {'success': True, 'data_uri': self._cover_cache[ck]}
+        hit = self._cover_cache_get(ck)
+        if hit is not None:
+            return {'success': True, 'data_uri': hit}
         return await asyncio.to_thread(self._get_game_cover_blocking, rom_id, large)
 
     def _get_game_cover_blocking(self, rom_id: int, large: bool = False):
         t0 = time.monotonic()
         try:
             ck = (rom_id, large)
-            if ck in self._cover_cache:
-                return {'success': True, 'data_uri': self._cover_cache[ck]}
+            hit = self._cover_cache_get(ck)
+            if hit is not None:
+                return {'success': True, 'data_uri': hit}
             # Thumbnail disk cache (v2). The compact downscaled art.
             tkey = f"covt2:{rom_id}:{large}"
             disk = self._disk_cover_get(tkey)
@@ -4418,12 +4602,29 @@ class Plugin:
                     d = r.json()
                     path = (d.get('path_cover_large') if large else d.get('path_cover_small')) \
                         or d.get('path_cover_small') or d.get('path_cover_large')
+                elif not path:
+                    # Couldn't even ask where the art is — transient, so don't
+                    # let it be cached as a permanent "no cover".
+                    logging.warning(f"cover {rom_id}: detail lookup -> {r.status_code}")
+                    return {'success': False, 'data_uri': None}
+            # A genuine "this rom has no art" — safe (and desirable) to cache.
             if not path:
                 return {'success': True, 'data_uri': None}
             resp = self._romm_client.session.get(
                 urljoin(self._romm_client.base_url, path), timeout=20)
             if resp.status_code != 200 or not resp.content:
-                return {'success': True, 'data_uri': None}
+                # success=False, NOT a cached "no art". The frontend caches any
+                # CONFIRMED result forever, so reporting a server hiccup as
+                # "this game has no cover" left the tile permanently blank —
+                # immune to leaving and re-entering the page, for the rest of
+                # the session. Bursty loads (one Home page fired 719 image
+                # requests in 70s) are exactly when a server starts refusing.
+                logging.warning(f"cover {rom_id}: {path} -> {resp.status_code} "
+                                f"({len(resp.content or b'')} bytes)")
+                # 404 is the server answering definitively: the art isn't there.
+                # Cache that. Anything else (5xx, a truncated body) is the
+                # server struggling, and must stay refetchable.
+                return {'success': resp.status_code == 404, 'data_uri': None}
             mime = resp.headers.get('content-type') or mimetypes.guess_type(path)[0] or 'image/jpeg'
             uri = self._store_thumb(ck, tkey, resp.content, mime, large)
             self._trace_cover('cover', rom_id, 'net', t0, len(uri))
@@ -4442,25 +4643,54 @@ class Plugin:
         """
         if not path:
             return {'success': True, 'data_uri': None}
-        ck = ('img', path)
-        if ck in self._cover_cache:
-            return {'success': True, 'data_uri': self._cover_cache[ck]}
+        # A rom cover asked for by path is the same bytes get_game_cover already
+        # caches by id — serve it from there instead of storing a second copy
+        # under an unrelated key.
+        rom = self._rom_cover_path(path)
+        if rom:
+            return await self.get_game_cover(rom[0], rom[1])
+        ck = ('img', self._img_key(path))
+        hit = self._cover_cache_get(ck)
+        if hit is not None:
+            return {'success': True, 'data_uri': hit}
         return await asyncio.to_thread(self._get_image_blocking, path)
+
+    # RomM cache-busts resource URLs with ?ts=<updated_at>. That query belongs in
+    # the HTTP request but NOT in the cache key: keyed with it, every touch of a
+    # rom's updated_at orphaned its cached art forever and the next view was a
+    # fresh download. (Measured on a 2.4k-game library: 3432 of 3598 cached files
+    # were unreachable orphans.) The ts still reaches the server via the fetch
+    # URL, so a genuinely changed image is still refetched — the disk entry is
+    # simply overwritten in place rather than abandoned.
+    @staticmethod
+    def _img_key(path: str) -> str:
+        return (path or '').split('?', 1)[0]
+
+    # /assets/romm/resources/roms/<platform>/<rom_id>/cover/{small,big}.png
+    _ROM_COVER_RE = re.compile(r'/roms/\d+/(\d+)/cover/(small|big)\b')
+
+    @classmethod
+    def _rom_cover_path(cls, path: str):
+        """(rom_id, large) if `path` is a rom's own cover art, else None."""
+        m = cls._ROM_COVER_RE.search(cls._img_key(path))
+        return (int(m.group(1)), m.group(2) == 'big') if m else None
 
     def _get_image_blocking(self, path: str):
         t0 = time.monotonic()
         try:
-            ck = ('img', path)
-            if ck in self._cover_cache:
-                return {'success': True, 'data_uri': self._cover_cache[ck]}
-            tkey = f"imgt2:{path}"
+            key = self._img_key(path)
+            ck = ('img', key)
+            hit = self._cover_cache_get(ck)
+            if hit is not None:
+                return {'success': True, 'data_uri': hit}
+            tkey = f"imgt2:{key}"
             disk = self._disk_cover_get(tkey)
             if disk:
                 self._cover_cache_put(ck, disk)
                 self._trace_cover('img', path, 'disk', t0, len(disk))
                 return {'success': True, 'data_uri': disk}
             # Downscale a full-size image already on disk (legacy v1) in place.
-            raw, mime = self._disk_cover_get_bytes(f"img:{path}")
+            raw, mime = self._disk_cover_get_bytes(f"img:{key}")
             if raw:
                 uri = self._store_thumb(ck, tkey, raw, mime, False)
                 self._trace_cover('img', path, 'disk-orig', t0, len(uri))
@@ -4470,7 +4700,10 @@ class Plugin:
             resp = self._romm_client.session.get(
                 urljoin(self._romm_client.base_url, path), timeout=20)
             if resp.status_code != 200 or not resp.content:
-                return {'success': True, 'data_uri': None}
+                # Transient, not "no screenshot" — see get_game_cover above.
+                logging.warning(f"image {path} -> {resp.status_code} "
+                                f"({len(resp.content or b'')} bytes)")
+                return {'success': resp.status_code == 404, 'data_uri': None}
             mime = resp.headers.get('content-type') or mimetypes.guess_type(path)[0] or 'image/png'
             uri = self._store_thumb(ck, tkey, resp.content, mime, False)
             self._trace_cover('img', path, 'net', t0, len(uri))
