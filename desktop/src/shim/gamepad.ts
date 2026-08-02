@@ -20,6 +20,7 @@
 
 import { GamepadButtonId } from "./gamepad-buttons";
 import { playSound } from "./sound";
+import { consumeRootBackNoop } from "./router";
 
 // ── Focusable registry (button-event routing) ───────────────────────────────
 
@@ -244,6 +245,8 @@ function synthEvent(button: number, isRepeat: boolean) {
 // onButtonDown (Steam lets a parent Focusable observe every press in its tree).
 // The dedicated callback (onCancelButton/…) fires on the nearest ancestor that
 // defines it. Stops if a handler calls stopPropagation().
+// Returns whether anything claimed the press (a dedicated callback ran, or a
+// handler stopped propagation) — the back sound depends on it.
 function routeButton(
   kind: "down" | "up",
   button: number,
@@ -263,10 +266,11 @@ function routeButton(
         (h[dedicated] as (e: any) => void)(e);
         dedicatedFired = true;
       }
-      if ((e as any)._stopped) break;
+      if ((e as any)._stopped) return true;
     }
     node = node.parentElement;
   }
+  return dedicatedFired;
 }
 
 // ── Focus targets (spatial navigation) ──────────────────────────────────────
@@ -1075,12 +1079,17 @@ export function startGamepad() {
       // Sound the face buttons Steam sounds on the Deck. OK is played here on
       // PRESS even though activation happens on release: the click feedback has
       // to be immediate, and sound.ts's dedupe absorbs the synthetic .click()
-      // that follows. B is the app-wide back gesture whether or not anything
-      // handles it — a silent B reads as a dropped press.
+      // that follows.
       if (id === GamepadButtonId.OK) { playSound("activate"); okPressSeen = true; }
-      else if (id === GamepadButtonId.CANCEL) playSound("back");
-      routeButton("down", id, false,
+      const claimed = routeButton("down", id, false,
         id === GamepadButtonId.OK ? undefined : dedicatedFor(id));
+      // B only sounds when it actually took the user somewhere. It can't be
+      // played on press like OK: the root Focusable claims B everywhere (it
+      // exits the plugin on the Deck), so the only way to tell a real back from
+      // a press with nothing behind it is to look at what the handler did —
+      // and a back click on a page that stays put reads as a phantom.
+      if (id === GamepadButtonId.CANCEL &&
+          claimed && !consumeRootBackNoop()) playSound("back");
     } else {
       routeButton("up", id, false);
       if (id === GamepadButtonId.OK) {

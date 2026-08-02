@@ -67,6 +67,15 @@ export function ModalHost() {
     return () => void modalSubs.delete(bump);
   }, []);
 
+  // Tell the page a modal is up, so chrome outside the scrim can respond to it
+  // — the footer legend swaps its translucent resting look for an opaque one so
+  // it stays legible against the blurred backdrop. Body class rather than a
+  // context: the legend is a sibling of ModalHost, not a descendant.
+  useEffect(() => {
+    document.body.classList.toggle("shim-modal-open", modals.length > 0);
+  });
+  useEffect(() => () => document.body.classList.remove("shim-modal-open"), []);
+
   if (!modals.length) return null;
   return (
     <>

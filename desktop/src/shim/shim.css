@@ -12,6 +12,10 @@
   --shim-accent: #1a9fff;
   --shim-surface: #23282e;
   --shim-border: #3d4450;
+  /* Height of the fixed footer button legend. Modal scrims and bottom-corner
+     toasts both keep clear of it, so read it from here rather than repeating
+     the number. */
+  --shim-legend-h: 40px;
 }
 
 html,
@@ -322,7 +326,9 @@ div[class*="v2pf-"] > div {
 
 .shim-modal-scrim {
   position: fixed;
-  inset: 0;
+  /* Stop above the legend: it is what tells the user which button confirms the
+     modal, so covering it with the modal's own scrim is exactly backwards. */
+  inset: 0 0 var(--shim-legend-h) 0;
   background: rgba(0, 0, 0, 0.7);
   display: flex;
   align-items: center;
@@ -404,10 +410,12 @@ div[class*="v2pf-"] > div {
 .shim-toast-host[data-pos="top-left"] { top: 16px; left: 16px; right: auto; bottom: auto; }
 .shim-toast-host[data-pos="top-right"] { top: 16px; right: 16px; left: auto; bottom: auto; }
 .shim-toast-host[data-pos="bottom-left"] {
-  bottom: 16px; left: 16px; top: auto; right: auto; flex-direction: column-reverse;
+  bottom: calc(var(--shim-legend-h) + 16px); left: 16px; top: auto; right: auto;
+  flex-direction: column-reverse;
 }
 .shim-toast-host[data-pos="bottom-right"] {
-  bottom: 16px; right: 16px; top: auto; left: auto; flex-direction: column-reverse;
+  bottom: calc(var(--shim-legend-h) + 16px); right: 16px; top: auto; left: auto;
+  flex-direction: column-reverse;
 }
 
 /* RomM v2 visual language: dark glass surface, brand-purple accent rail,
@@ -512,8 +520,11 @@ div[class*="v2pf-"] > div {
   left: 0;
   right: 0;
   bottom: 0;
-  height: 40px;
-  z-index: 900;
+  height: var(--shim-legend-h);
+  /* Above the modal scrim (1000), below toasts (1100). The scrim already stops
+     short of this bar, but sitting above it too means no future overlay can
+     bury the one row of chrome that says which button does what. */
+  z-index: 1050;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -526,6 +537,18 @@ div[class*="v2pf-"] > div {
   font-family: "Motiva Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
   pointer-events: none;
   user-select: none;
+}
+
+/* With a modal open the bar has to read as foreground, level with the modal.
+   Its resting look is deliberately translucent so it melts into the page --
+   over a blurred, dimmed backdrop that same treatment made it look like part
+   of the blur. Go opaque and drop the backdrop blur for as long as a modal is
+   up: same bar, unmistakably in front. */
+body.shim-modal-open .shim-legend {
+  background: rgb(14, 14, 24);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border-top-color: rgba(255, 255, 255, 0.14);
 }
 
 .shim-legend-group {

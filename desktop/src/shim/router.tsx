@@ -59,8 +59,23 @@ export function navigate(to: string, opts?: { replace?: boolean }) {
   notifyPath();
 }
 
+// Set when a back request died at the root. gamepad.ts reads it to keep B
+// silent there: the plugin's root Focusable always claims B (on the Deck it
+// exits to Steam), so "a handler ran" isn't enough to tell a real back from a
+// press that moved nothing — and a click sound with no navigation reads as the
+// app dropping the input.
+let rootBackNoop = false;
+export function consumeRootBackNoop() {
+  const was = rootBackNoop;
+  rootBackNoop = false;
+  return was;
+}
+
 function navigateBack() {
-  if (navStack.length <= 1) return; // at the root — nowhere to exit to
+  if (navStack.length <= 1) { // at the root — nowhere to exit to
+    rootBackNoop = true;
+    return;
+  }
   navStack.pop();
   window.history.back();
 }

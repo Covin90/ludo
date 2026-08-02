@@ -17,7 +17,7 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, toaster, routerHook, openFilePicker, FileSelectionType } from "@decky/api";
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, forwardRef, memo, cloneElement, type Ref, type ChangeEvent } from "react";
-import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt } from "react-icons/fa";
+import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip } from "react-icons/fa";
 import { BsGearFill } from "react-icons/bs";
 import { MdVerified } from "react-icons/md";
 
@@ -81,6 +81,10 @@ const launchGame = callable<[number, (string | null)?, (number | null)?], any>("
 // is then RunGame'd so the emulator is a child of a Steam-tracked game (overlay).
 const prepareSteamLaunch = callable<[number, (string | null)?, (number | null)?], any>("prepare_steam_launch");
 const getSessionHostPath = callable<[], any>("get_session_host_path");
+// BIOS inventory: what RomM holds per platform vs. what's in RetroArch's system
+// dir. Distinct from get_bios_status, which reports background download progress.
+const getBiosInventory = callable<[(boolean)?], any>("get_bios_inventory");
+const downloadBios = callable<[string, (string)?], any>("download_bios");
 const getLocalDiscs = callable<[number], any>("get_local_discs");
 const getLocalSiblings = callable<[number], any>("get_local_siblings");
 const getHomeData = callable<[], any>("get_home_data");
@@ -200,6 +204,14 @@ const V2 = {
   elev2: '0 8px 24px rgba(0,0,0,.45)',
   font: '"Motiva Sans","Segoe UI",system-ui,-apple-system,sans-serif',
 };
+
+// Full-screen modal scrims stop short of the button legend at the bottom of the
+// screen, so the hints for the modal's own buttons stay readable while it is
+// open — dimming and blurring the one bar that says which button does what is
+// exactly backwards. The desktop shim publishes its legend height as
+// --shim-legend-h; on the Deck the variable is absent and the fallback is
+// Steam's own fixed legend, measured at 42px on-device.
+const MODAL_SCRIM_INSET = '0 0 var(--shim-legend-h, 42px) 0';
 
 // RomM GameActionBtn round buttons: glassy scrim with blur (default), or the
 // "emphasized" white look used by Play. Circular; size in px.
@@ -2570,7 +2582,7 @@ function UserMenuModal({ username, role, avatar, closeModal }:
         onCancelButton={() => closeModal?.()}
         onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
         style={{
-          position: 'fixed', inset: 0, zIndex: 9999,
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(7,7,15,0.45)',
           WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
@@ -2612,6 +2624,7 @@ function UserMenuModal({ username, role, avatar, closeModal }:
           <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
           <UserMenuRow icon={<FaChartBar size={15} />} label="Stats" onSelect={() => go("/romm-sync-stats")} />
           <UserMenuRow icon={<FaPuzzlePiece size={15} />} label="Emulator Cores" onSelect={() => go("/romm-sync-cores")} />
+          <UserMenuRow icon={<FaMicrochip size={15} />} label="BIOS Files" onSelect={() => go("/romm-sync-bios")} />
           <UserMenuRow icon={<FaCog size={15} />} label="Settings" onSelect={() => go("/romm-sync-settings")} />
           <UserMenuRow
             icon={<FaSync size={15} style={refreshing ? { animation: 'spin 1s linear infinite' } : undefined} />}
@@ -2654,7 +2667,7 @@ function FolderActionsModal({ label, current, def, isDefault, onChoose, onReset,
         onCancelButton={() => closeModal?.()}
         onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
         style={{
-          position: 'fixed', inset: 0, zIndex: 9999,
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(7,7,15,0.45)',
           WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
@@ -2774,7 +2787,7 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
         onCancelButton={() => closeModal?.()}
         onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
         style={{
-          position: 'fixed', inset: 0, zIndex: 9999,
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(7,7,15,0.45)',
           WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
@@ -2912,10 +2925,10 @@ function CoreOption({ core, recommended, busy, disabled, onSelect }:
 // account dropdown (UserMenuModal). Opened from the games-count rail. Holds
 // "Sync/Download missing" and the destructive "Remove downloaded" (arm →
 // confirm, matching the game-tile delete affordance).
-function CollectionActionsModal({ title, isCollection, isVirtual, isSynced, missing, downloaded, syncing, onSyncMissing, onToggleSync, onRemove, closeModal }:
+function CollectionActionsModal({ title, isCollection, isVirtual, isSynced, missing, downloaded, syncing, platformSlug, onSyncMissing, onToggleSync, onRemove, closeModal }:
   {
     title: string; isCollection: boolean; isVirtual: boolean; isSynced: boolean;
-    missing: number; downloaded: number; syncing: boolean;
+    missing: number; downloaded: number; syncing: boolean; platformSlug?: string;
     onSyncMissing: () => void; onToggleSync: () => void; onRemove: () => void; closeModal?: () => void;
   }) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -2932,7 +2945,7 @@ function CollectionActionsModal({ title, isCollection, isVirtual, isSynced, miss
         onCancelButton={() => closeModal?.()}
         onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
         style={{
-          position: 'fixed', inset: 0, zIndex: 9999,
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(7,7,15,0.45)',
           WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
@@ -2969,6 +2982,17 @@ function CollectionActionsModal({ title, isCollection, isVirtual, isSynced, miss
             onSelect={() => { if (syncDisabled) return; closeModal?.(); onSyncMissing(); }} />
           <UserMenuRow icon={<FaRegClock size={14} />} label="View downloads"
             onSelect={() => { closeModal?.(); libNavigate("/romm-sync-downloads"); }} />
+          {/* Platforms only — BIOS is a property of the platform, and a
+              collection spans several. Opens this platform's panel in place
+              rather than navigating: the answer is three lines long, and the
+              user is mid-browse in the grid underneath. */}
+          {platformSlug && (
+            <UserMenuRow icon={<FaMicrochip size={14} />} label="BIOS files"
+              onSelect={() => {
+                closeModal?.();
+                showModal(<BiosDetailModal slug={platformSlug} platformName={title} />);
+              }} />
+          )}
           {/* Auto-sync toggle — collections only (platforms have no continuous
               sync; virtual collections aren't tracked by the sync manager). */}
           {isCollection && !isVirtual && (
@@ -3672,13 +3696,14 @@ function navExitPlugin() {
 // These module hooks are only set while LibraryRootPage is mounted; when they
 // are null (e.g. Settings opened from the QAM as a real route) callers fall
 // back to genuine navigation, preserving the old behavior.
-type LibView = 'grid' | 'game' | 'settings' | 'stats' | 'cores' | 'downloads';
+type LibView = 'grid' | 'game' | 'settings' | 'stats' | 'cores' | 'bios' | 'downloads';
 let _libPushView: ((v: LibView) => void) | null = null;
 let _libPopView: (() => void) | null = null;
 const _libViewForRoute: Record<string, LibView> = {
   '/romm-sync-settings': 'settings',
   '/romm-sync-stats': 'stats',
   '/romm-sync-cores': 'cores',
+  '/romm-sync-bios': 'bios',
   '/romm-sync-downloads': 'downloads',
 };
 // Open a plugin page: as an in-library view when the library route hosts us,
@@ -5852,6 +5877,7 @@ function LibraryRootPage() {
           {top === 'settings' && <SettingsPage />}
           {top === 'stats' && <StatsPage />}
           {top === 'cores' && <CoresPage />}
+          {top === 'bios' && <BiosPage />}
           {top === 'downloads' && <DownloadsPage />}
         </div>
       )}
@@ -6489,6 +6515,7 @@ function LibraryGamesPage() {
     showModal(
       <CollectionActionsModal
         title={group?.label || 'Library'} isCollection={isCollection} isVirtual={isVirtual} isSynced={isSynced}
+        platformSlug={!isCollection ? (group?.slug || '') : ''}
         missing={missing} downloaded={downloaded} syncing={!!syncJob}
         onSyncMissing={syncMissing} onToggleSync={toggleSync} onRemove={doRemove} />,
     );
@@ -7100,7 +7127,7 @@ function RestoreModal({ romId, entry, shotUri, onDone, closeModal }: {
         onCancelButton={() => closeModal?.()}
         onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
         style={{
-          position: 'fixed', inset: 0, zIndex: 9999,
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(7,7,15,0.45)',
           WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
@@ -7569,7 +7596,29 @@ async function runLaunch(romId: number, gameName: string, disc: string | null,
   if (setBusy) setBusy('launch');
   try {
     const r = await launchGameSmart(romId, disc, siblingRomId ?? null);
-    if (r?.success) toaster.toast({ title: 'Launching', body: label || gameName });
+    if (r?.success && r?.bios_warning) {
+      // The launch itself succeeded, so this is deliberately not an error: the
+      // core starts and then sits on a black screen with nothing to explain it.
+      // Fires whenever RomM holds firmware for the platform that isn't on disk —
+      // not only when the resolved core marks it required, because the user can
+      // pick a different core inside RetroArch and a pcsx_rearmed-shaped check
+      // would go quiet exactly when the BIOS is needed. severity says which.
+      const w = r.bios_warning;
+      const miss: string[] = w.missing_bios || [];
+      toaster.toast({
+        title: `${w.platform_name || 'This platform'} BIOS missing`,
+        body: `${w.severity === 'required'
+          ? `${w.core} will not boot without ` : `${label || gameName} may need `}`
+          + `${miss.slice(0, 3).join(', ')}${miss.length > 3 ? '…' : ''}. `
+          + 'Open BIOS Files to download them.',
+        duration: 10000,
+        // The index, not this platform's panel: the toast is clicked at some
+        // remove from the launch, often with RetroArch already up, and a modal
+        // over whatever is on screen by then is the wrong shape of interruption.
+        onClick: () => libNavigate('/romm-sync-bios'),
+      });
+    }
+    else if (r?.success) toaster.toast({ title: 'Launching', body: label || gameName });
     else if (offerCoreInstall(r, () => void runLaunch(
       romId, gameName, disc, label, setBusy, onDone, siblingRomId))) {
       // The picker owns the outcome now — no toast.
@@ -7607,7 +7656,7 @@ function PickerModal({ title, items, closeModal }: {
         onCancelButton={() => closeModal?.()}
         onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
         style={{
-          position: 'fixed', inset: 0, zIndex: 9999,
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(7,7,15,0.45)',
           WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
@@ -8965,7 +9014,7 @@ function CorePickerModal({ row, availableCores, canDownload, onPick, onDownload,
   return (
     <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}>
       <Focusable noFocusRing style={{
-        position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        position: 'fixed', inset: MODAL_SCRIM_INSET, display: 'flex', alignItems: 'center', justifyContent: 'center',
         background: 'rgba(7,7,15,0.45)', WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
       }}>
         <style>{`${V2_FOCUS_STYLE}
@@ -9207,6 +9256,208 @@ function CoresPage() {
       </V2SettingsSection>
       )}
     </Focusable>
+  );
+}
+
+// BiosPage — what RomM holds as firmware per platform, versus what's actually in
+// RetroArch's system dir, with a button to close the gap.
+//
+// The server is the source of truth for *which* files a platform wants, not the
+// core's libretro .info: the core Ludo resolves is not necessarily the core that
+// ends up running the game (the user can switch cores inside RetroArch), so a
+// check keyed on the resolved core stays silent for pcsx_rearmed while every PSX
+// BIOS is missing. The .info only decides how loudly to say it — 'required'
+// means that core won't boot at all, 'optional' means it has an HLE fallback.
+function BiosPage() {
+  const [rows, setRows] = useState<any[]>([]);
+  const [biosDir, setBiosDir] = useState('');
+  const [connected, setConnected] = useState(true);
+  const [loading, setLoading] = useState(true);
+
+  const load = async (refresh = false) => {
+    try {
+      const r = await getBiosInventory(refresh);
+      if (r?.success) {
+        setRows(r.platforms || []);
+        setBiosDir(r.bios_dir || '');
+        setConnected(!!r.connected);
+      }
+    } catch { /* ignore */ }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const openDetail = (row: any) =>
+    showModal(<BiosDetailModal slug={row.slug} platformName={row.platform_name || row.name}
+      seed={row} onChanged={load} />);
+
+  return v2Page(
+    <Focusable noFocusRing
+      onCancelButton={() => libBack("/romm-sync-library")}
+      style={{ maxWidth: '760px', margin: '0 auto', padding: '20px 20px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
+        <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-library")} />
+        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>BIOS Files</div>
+      </div>
+
+      <V2SettingsSection title={biosDir ? `Stored in ${biosDir}` : 'BIOS'}>
+        {loading ? (
+          <V2SettingsRow icon={<FaMicrochip size={16} />} title="Checking BIOS files…" />
+        ) : !connected ? (
+          <V2SettingsRow icon={<FaMicrochip size={16} />}
+            title="Not connected to RomM"
+            subtitle="BIOS files come from your own RomM server — connect to see what it holds." />
+        ) : rows.length === 0 ? (
+          <V2SettingsRow icon={<FaMicrochip size={16} />}
+            title="No firmware on the server"
+            subtitle="Upload BIOS files to a platform in RomM and they will show up here." />
+        ) : rows.map((row) => (
+          <V2SettingsRow key={row.slug}
+            bareIcon
+            icon={<PlatformIcon slug={row.slug} size={28} />}
+            title={row.platform_name || row.name}
+            subtitle={row.missing_count === 0
+              ? `${(row.files || []).length} file${(row.files || []).length === 1 ? '' : 's'} in place`
+              : `${(row.files || []).length} file${(row.files || []).length === 1 ? '' : 's'} — A to review`}
+            onClick={() => openDetail(row)}
+            right={biosChip(row, true)} />
+        ))}
+      </V2SettingsSection>
+    </Focusable>
+  );
+}
+
+// Per-platform status pill: green once every file the server holds is on disk,
+// red when the resolved core cannot boot without what's missing, amber when it
+// has an HLE fallback and will merely run worse. Shared by the index row and
+// the detail panel so the two never disagree.
+function biosChip(row: any, chevron?: boolean) {
+  const ok = row.missing_count === 0;
+  const color = ok ? V2.success : (row.severity === 'required' ? V2.danger : V2.warning);
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+      <span style={{
+        fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
+        color, border: `1px solid ${color}`, borderRadius: V2.radiusChip, padding: '1px 6px',
+      }}>{ok ? 'complete' : `${row.missing_count} missing`}</span>
+      {chevron && <FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
+    </div>
+  );
+}
+
+// One platform's firmware, as a panel rather than a page — the same shape as
+// CorePickerModal, which is the other "settle one platform's emulation detail"
+// surface. Opened from a BiosPage row or straight from a platform's actions
+// menu, where the grid underneath is the context the user wants back.
+//
+// `seed` paints immediately when the caller already has the row; without one
+// (the actions-menu path) the panel fetches the inventory itself.
+function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
+  slug: string; platformName?: string; seed?: any;
+  onChanged?: () => void; closeModal?: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [row, setRow] = useState<any>(seed || null);
+  const [loading, setLoading] = useState(!seed);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
+
+  const load = async () => {
+    try {
+      const r = await getBiosInventory(false);
+      if (r?.success) setRow((r.platforms || []).find((p: any) => p.slug === slug) || null);
+    } catch { /* ignore */ }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { if (!seed) load(); }, []);
+
+  // Stays open through the download: the panel is the only thing confirming it
+  // worked, and closing on activate would take the answer away with it.
+  const fetchAll = async () => {
+    setBusy(true);
+    try {
+      const r = await downloadBios(slug, '');
+      if (!r?.success) toaster.toast({ title: 'BIOS', body: r?.message || 'Download failed' });
+      await load();
+      onChanged?.();
+    } catch {
+      toaster.toast({ title: 'BIOS', body: 'Download failed' });
+    } finally { setBusy(false); }
+  };
+
+  const files = row?.files || [];
+  const missing = row?.missing_count || 0;
+  return (
+    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}>
+      <Focusable noFocusRing style={{
+        position: 'fixed', inset: MODAL_SCRIM_INSET, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: 'rgba(7,7,15,0.45)', WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
+      }}>
+        <style>{`${V2_FOCUS_STYLE}
+          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }`}</style>
+        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
+        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
+          position: 'relative', width: '340px', maxWidth: '92vw', boxSizing: 'border-box',
+          fontFamily: V2.font, color: V2.fg, padding: '8px',
+          display: 'flex', flexDirection: 'column',
+          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
+          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
+          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
+          boxShadow: '0 16px 48px rgba(0,0,0,0.55)', maxHeight: '82vh', overflowY: 'auto',
+          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
+        }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '8px',
+            padding: '6px 8px 10px',
+          }}>
+            <div style={{
+              flex: '1 1 auto', minWidth: 0,
+              fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
+              color: V2.fgMuted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+            }}>BIOS · {row?.platform_name || row?.name || platformName || ''}</div>
+            {row && biosChip(row)}
+          </div>
+          <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
+
+          {loading ? (
+            <UserMenuRow icon={<FaMicrochip size={13} />} label="Checking…" disabled onSelect={() => {}} />
+          ) : !row ? (
+            <div style={{ padding: '10px 10px 14px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
+              RomM holds no firmware for this platform. Upload it under the
+              platform’s Firmware tab and it will show up here.
+            </div>
+          ) : (
+            <>
+              {/* Exact filenames, because RetroArch matches BIOS on the name:
+                  knowing it wants scph5501.bin specifically is the difference
+                  between a fix and a guess. */}
+              {files.map((f: any) => (
+                <UserMenuRow key={f.name}
+                  icon={f.present
+                    ? <FaCheckCircle size={13} style={{ color: V2.success }} />
+                    : <FaTimesCircle size={13} style={{ color: row.severity === 'required' ? V2.danger : V2.warning }} />}
+                  label={`${f.name}  ·  ${fmtBytes(f.size)}`}
+                  disabled onSelect={() => {}} />
+              ))}
+              <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+              {missing > 0 ? (
+                <UserMenuRow
+                  icon={busy
+                    ? <FaSync size={13} style={{ animation: 'spin 1s linear infinite' }} />
+                    : <FaDownload size={13} />}
+                  label={busy ? 'Downloading…' : `Download ${missing} missing file${missing === 1 ? '' : 's'}`}
+                  disabled={busy}
+                  onSelect={() => { if (!busy) fetchAll(); }} />
+              ) : (
+                <div style={{ padding: '8px 10px 12px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
+                  Everything RomM holds for this platform is in place.
+                </div>
+              )}
+            </>
+          )}
+        </Focusable>
+      </Focusable>
+    </ModalRoot>
   );
 }
 
@@ -11534,6 +11785,7 @@ export default definePlugin(() => {
   routerHook.addRoute("/romm-sync-settings", () => <RouteGuard><SettingsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-stats", () => <RouteGuard><StatsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-cores", () => <RouteGuard><CoresPage /></RouteGuard>, { exact: true });
+  routerHook.addRoute("/romm-sync-bios", () => <RouteGuard><BiosPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-downloads", () => <RouteGuard><DownloadsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-config", () => <RouteGuard><ConfigPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-library", () => <RouteGuard><LibraryRootPage /></RouteGuard>, { exact: true });
@@ -11680,6 +11932,7 @@ export default definePlugin(() => {
       routerHook.removeRoute("/romm-sync-settings");
       routerHook.removeRoute("/romm-sync-stats");
       routerHook.removeRoute("/romm-sync-cores");
+      routerHook.removeRoute("/romm-sync-bios");
       routerHook.removeRoute("/romm-sync-downloads");
       routerHook.removeRoute("/romm-sync-config");
       routerHook.removeRoute("/romm-sync-library");

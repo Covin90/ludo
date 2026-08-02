@@ -160,6 +160,29 @@ def _platform_label(rom):
             or rom.get('platform_name') or 'Unknown')
 
 
+def _variant_count(game):
+    """How many of RomM's ROMs a single library entry stands for.
+
+    We collapse regional variants of a game into one browsable entry
+    (_group_sibling_roms), so len(_available_games) is smaller than the ROM
+    count RomM reports — 2,440 vs 3,083 on a 3k library. Stats that claim to
+    describe the library have to use this, or they contradict the server the
+    user is looking at in another tab.
+
+    Counted at ingest into 'variant_count' because grouping prunes the pieces
+    afterwards: for a folder ROM (a multi-disc game or a bundle of regional
+    files) the file-members are removed from BOTH sibling_roms and
+    _sibling_files, and survive only in _region_save_siblings, which the plugin
+    doesn't keep. Recomputing here from what's left would undercount exactly
+    those groups. Snapshots written before this existed have no field, so fall
+    back to the best reconstruction available.
+    """
+    n = game.get('variant_count')
+    if isinstance(n, int) and n > 0:
+        return n
+    return 1 + len(game.get('sibling_roms') or [])
+
+
 def load_decky_settings():
     try:
         if settings_file.exists():
@@ -197,6 +220,10 @@ if logging_enabled:
 # Suppress noisy third-party loggers
 logging.getLogger('watchdog').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
+# PIL logs a line per PNG chunk ("STREAM b'IHDR'…", "STREAM b'IDAT'…") at DEBUG.
+# Every cover thumbnail we decode emits several, which buries the log we actually
+# read in thousands of lines of chunk headers.
+logging.getLogger('PIL').setLevel(logging.WARNING)
 
 # File extensions considered launchable discs — must match Plugin._LAUNCHABLE_DISC_EXTS.
 _LAUNCHABLE_DISC_EXTS = ('.m3u', '.chd', '.cue', '.iso', '.pbp',
@@ -541,6 +568,19 @@ class Plugin:
     # the RomM server isn't responding" (server_unreachable). None = unknown.
     _device_online: bool = None
 
+    # Consecutive failed reachability probes. A single failure is not enough to
+    # go offline: the probe shares the connection with whatever else is running,
+    # and a large download (or a server that is merely busy) makes one 6s GET
+    # time out routinely. Latching on the first miss made the library flip to
+    # downloaded-only mid-session — the platform list would collapse to just the
+    # platforms the user had grabbed something from. See _reachability_loop.
+    _probe_fail_streak: int = 0
+
+    # Coalescing state for _persist_snapshot_throttled.
+    _snapshot_timer_lock = threading.Lock()
+    _snapshot_timer: 'threading.Timer' = None
+    _snapshot_last_write: float = 0.0
+
     _bios_tracking: 'BiosTrackingManager' = None
     _steam_manager: 'SteamShortcutManager' = None
 
@@ -679,6 +719,7 @@ class Plugin:
         (was None) so startup doesn't masquerade as a reconnect."""
         was = self._online
         self._online = True
+        self._probe_fail_streak = 0
         # The server answering proves the device has network too.
         self._device_online = True
         if was is False and self._auto_sync:
@@ -688,6 +729,12 @@ class Plugin:
             except Exception as e:
                 logging.warning(f"Reconnect save flush failed: {e}")
 
+    # Consecutive failed probes needed to declare the server unreachable. At the
+    # loop's 25s cadence this is ~75s of silence — long enough to ride out a
+    # download saturating the link, short enough that a real disconnect is
+    # noticed before the user tries to browse.
+    _PROBE_FAILS_TO_OFFLINE = 3
+
     def _reachability_loop(self):
         """Actively probe the server every ~25s and flip the connection state.
 
@@ -696,6 +743,12 @@ class Plugin:
         doesn't emit them). Only runs the probe once we have an authenticated
         client — the retry loop owns (re)connecting from a cold/disconnected
         state. _note_reachable() handles the offline→online save flush.
+
+        Going offline takes _PROBE_FAILS_TO_OFFLINE consecutive misses, not one.
+        The probe competes with active downloads for the connection, so an
+        isolated timeout says nothing about the server being down — and treating
+        it as authoritative filtered the library to downloaded-only, which reads
+        to the user as platforms vanishing at random.
         """
         while not self._stop_event.wait(25):
             try:
@@ -704,8 +757,17 @@ class Plugin:
                 if self._romm_client.is_reachable():
                     self._note_reachable()
                 elif self._online is not False:
-                    self._online = False
-                    logging.info("Reachability probe failed — server unreachable, going offline")
+                    self._probe_fail_streak += 1
+                    if self._probe_fail_streak >= self._PROBE_FAILS_TO_OFFLINE:
+                        self._online = False
+                        logging.info(
+                            f"Reachability probe failed {self._probe_fail_streak}× "
+                            f"in a row — server unreachable, going offline")
+                    else:
+                        logging.debug(
+                            f"Reachability probe failed "
+                            f"({self._probe_fail_streak}/{self._PROBE_FAILS_TO_OFFLINE}) "
+                            f"— staying online for now")
             except Exception as e:
                 logging.debug(f"reachability loop error: {e}")
 
@@ -725,8 +787,18 @@ class Plugin:
             elif self._connect_to_romm():
                 self._note_reachable()
         except Exception as e:
-            self._online = False
-            logging.info(f"Network probe failed, staying offline: {e}")
+            # Same debounce as _reachability_loop: a spurious navigator 'online'
+            # event mid-session must not be able to knock a working session
+            # offline on one failed request.
+            self._probe_fail_streak += 1
+            if self._probe_fail_streak >= self._PROBE_FAILS_TO_OFFLINE:
+                self._online = False
+                logging.info(f"Network probe failed, staying offline: {e}")
+            else:
+                logging.info(
+                    f"Network probe failed "
+                    f"({self._probe_fail_streak}/{self._PROBE_FAILS_TO_OFFLINE}), "
+                    f"not latching offline yet: {e}")
 
     async def notify_network_state(self, online: bool):
         """Frontend bridge for the device's OS-level connectivity (navigator
@@ -943,6 +1015,7 @@ class Plugin:
         self._romm_collections = None
         self._romm_virtual_collections = None
         self._platform_slug_to_name = {}
+        self._server_firmware_cache = None
         self._snapshot_fetched_at = None
         self._library_server_total = None
         self._last_full_fetch_time = None
@@ -986,6 +1059,37 @@ class Plugin:
         except Exception as e:
             logging.warning(f"Failed to persist library snapshot: {e}")
 
+    # Coalescing window for _persist_snapshot_throttled, seconds.
+    _SNAPSHOT_THROTTLE_S = 20
+
+    def _persist_snapshot_throttled(self):
+        """_persist_snapshot, but at most once per _SNAPSHOT_THROTTLE_S, with a
+        trailing write so the last change is never lost.
+
+        A collection sync finishes hundreds of downloads back to back and the
+        snapshot is the whole library serialised — writing it per ROM would mean
+        multi-megabyte rewrites in a tight loop. Coalescing keeps the disk quiet
+        while still bounding how stale the file can get to one window.
+        """
+        with self._snapshot_timer_lock:
+            now = time.monotonic()
+            due = self._snapshot_last_write + self._SNAPSHOT_THROTTLE_S
+            if now >= due:
+                self._snapshot_last_write = now
+                self._persist_snapshot()
+                return
+            # Inside the window: make sure a trailing write is pending so the
+            # final download in a burst still reaches disk.
+            if self._snapshot_timer is None or not self._snapshot_timer.is_alive():
+                def _flush():
+                    with self._snapshot_timer_lock:
+                        self._snapshot_last_write = time.monotonic()
+                        self._snapshot_timer = None
+                    self._persist_snapshot()
+                self._snapshot_timer = threading.Timer(max(0.0, due - now), _flush)
+                self._snapshot_timer.daemon = True
+                self._snapshot_timer.start()
+
     def _hydrate_from_snapshot(self):
         """Load the persisted snapshot into live state on cold start so the Game
         Browser populates before (or without) a network connection. Discards a
@@ -1004,6 +1108,14 @@ class Plugin:
                 logging.info("Library snapshot is for a different server; ignoring")
                 return None
             self._available_games = data.get('games') or []
+            # The snapshot's is_downloaded/local_path are only as fresh as the
+            # last fetch that wrote it, and downloads land between fetches. A
+            # stale 'false' made every game grabbed since the last fetch come
+            # back un-downloaded after a restart — the user's files were still on
+            # disk, but the app offered to download them again. The filesystem is
+            # the authority here, so re-derive both on the way in. This also
+            # picks up ROMs deleted outside the app.
+            self._reconcile_downloads(self._available_games)
             self._romm_collections = data.get('collections') or None
             self._romm_virtual_collections = data.get('virtual_collections') or None
             self._platform_slug_to_name = data.get('platform_slug_to_name') or {}
@@ -1016,6 +1128,53 @@ class Plugin:
             logging.warning(f"Failed to hydrate library snapshot: {e}")
             return None
 
+    def _reconcile_downloads(self, games):
+        """Re-derive is_downloaded / local_path / local_size / disc info for
+        `games` from what is actually on disk, in place.
+
+        The library's download state is written by whichever fetch last ran, but
+        downloads (and manual deletions) happen between fetches. Anything that
+        restores a game list from a previous session has to re-check the disk or
+        it will contradict it. Best-effort per game: an unreadable path just
+        leaves that entry marked not-downloaded.
+        """
+        try:
+            download_dir = Path(self._settings.get('Download', 'rom_directory',
+                                                   _default_roms_dir())).expanduser()
+        except Exception as e:
+            logging.warning(f"Can't resolve download dir, skipping reconcile: {e}")
+            return
+        found = 0
+        for g in (games or []):
+            try:
+                platform_slug = (g.get('platform_slug')
+                                 or (g.get('romm_data') or {}).get('platform_slug')
+                                 or 'Unknown')
+                file_name = (g.get('file_name')
+                             or (g.get('romm_data') or {}).get('fs_name'))
+                if not file_name:
+                    continue
+                local_path, is_downloaded = _resolve_download_path(
+                    download_dir, platform_slug, file_name)
+                local_size = 0
+                if is_downloaded and local_path.exists():
+                    if local_path.is_dir():
+                        local_size = sum(f.stat().st_size
+                                         for f in local_path.rglob('*') if f.is_file())
+                    else:
+                        local_size = local_path.stat().st_size
+                is_md, dc = _detect_multi_disc(local_path, is_downloaded)
+                g['is_downloaded'] = is_downloaded
+                g['local_path'] = str(local_path) if is_downloaded else None
+                g['local_size'] = local_size
+                g['is_multi_disc'] = is_md
+                g['disc_count'] = dc
+                if is_downloaded:
+                    found += 1
+            except Exception as e:
+                logging.debug(f"reconcile skipped {g.get('name')}: {e}")
+        logging.info(f"Reconciled download state against disk: {found} downloaded")
+
     def _init_bios_tracking(self):
         """Stand up BIOS tracking against the current library.
 
@@ -1023,6 +1182,10 @@ class Plugin:
         probes proved still current — because either way we now hold the real
         library and the BIOS scan is driven off it.
         """
+        # Without this the scan below logs "No RomM client or not authenticated"
+        # once per platform and reports 0/0 ready, because BiosManager is built
+        # before any client exists and nothing hands it one until a download.
+        self._bios_manager()
         self._bios_tracking = BiosTrackingManager(
             retroarch=self._retroarch,
             romm_client=self._romm_client,
@@ -1223,6 +1386,10 @@ class Plugin:
                         'cover_path': rom.get('path_cover_small'),
                         'cover_path_large': rom.get('path_cover_large'),
                         'created_at':      rom.get('created_at'),
+                        # See _variant_count — must be taken here, while the
+                        # grouped-away pieces are still on the row.
+                        'variant_count':   (1 + len(rom.get('sibling_roms') or [])
+                                            + len(rom.get('_region_save_siblings') or [])),
                         '_sibling_files':  rom.get('_sibling_files', []),
                         'sibling_roms':    rom.get('sibling_roms', []),
                         'romm_data': {
@@ -2426,7 +2593,7 @@ class Plugin:
                     'downloaded': 0,
                     'fs_size_bytes': 0,
                 })
-                p['rom_count'] += 1
+                p['rom_count'] += _variant_count(g)
                 if g.get('is_downloaded'):
                     p['downloaded'] += 1
                     p['fs_size_bytes'] += int(g.get('local_size') or 0)
@@ -2458,7 +2625,11 @@ class Plugin:
                 logging.debug(f"get_plugin_stats collections error: {e}")
 
             return {
-                'games_total':         len(games),
+                # ROM count, matching what RomM reports — not our collapsed
+                # entry count. games_downloaded stays an entry count on purpose:
+                # a grouped folder ROM is one thing on disk, and counting its
+                # members would make "downloaded" exceed what was downloaded.
+                'games_total':         sum(_variant_count(g) for g in games),
                 'games_downloaded':    len(downloaded),
                 'size_on_disk':        size_on_disk,
                 'platforms':           len(platforms),
@@ -2913,6 +3084,7 @@ class Plugin:
         notes, url, asset_name}. `available` is only True when a newer version
         AND a downloadable asset both exist.
         """
+        import requests
         try:
             asset_suffix = asset_suffix or globals()['UPDATE_ASSET_SUFFIX']
             channel = channel if channel in VALID_CHANNELS else \
@@ -2944,6 +3116,14 @@ class Plugin:
                 'url': asset.get('browser_download_url') if asset else None,
                 'asset_name': asset.get('name') if asset else None,
             }
+        except (requests.ConnectionError, requests.Timeout):
+            # Offline, captive portal, or GitHub unreachable. Routine on a
+            # handheld that suspends and roams between networks — one line,
+            # no traceback.
+            logging.info("[UPDATE] check skipped: GitHub unreachable")
+            return {'success': False, 'available': False,
+                    'current': PLUGIN_VERSION,
+                    'message': "Couldn't reach GitHub — check your connection"}
         except Exception as e:
             logging.error(f"[UPDATE] check_for_update error: {e}", exc_info=True)
             return {'success': False, 'available': False,
@@ -4745,6 +4925,31 @@ class Plugin:
                                 'platform_slug': platform_slug,
                             },
                         })
+                    if ok:
+                        # Write the new download state through to disk now. The
+                        # snapshot is otherwise only rewritten by a fetch, so a
+                        # user who grabbed games and then quit came back to a
+                        # snapshot that still said not-downloaded — the games
+                        # read as missing and had to be fetched again.
+                        # _reconcile_downloads on hydrate covers the crash case;
+                        # this keeps the common case cheap and correct.
+                        self._persist_snapshot_throttled()
+                        # Pull this platform's BIOS off RomM too. BIOS fetching
+                        # was only ever wired to "enable auto-sync on a
+                        # collection", so a user who downloaded games one at a
+                        # time got the ROM and none of the firmware — the game
+                        # then black-screens on any core without an HLE
+                        # fallback. Cheap and idempotent: the tracker skips
+                        # platforms it has already handled.
+                        try:
+                            if self._bios_tracking and platform_slug:
+                                pname = (self._platform_slug_to_name or {}).get(
+                                    platform_slug) or platform_slug
+                                self._bios_tracking.trigger_downloads_for_games(
+                                    [{'platform_slug': platform_slug,
+                                      'platform_name': pname}])
+                        except Exception as e:
+                            logging.debug(f"BIOS fetch after download: {e}")
                     self._download_progress[rom_id] = {
                         'percent': 100 if ok else 0, 'downloaded': 0, 'total': 0,
                         'speed': 0, 'eta': 0, 'state': 'done' if ok else 'error',
@@ -4895,7 +5100,9 @@ class Plugin:
         """
         try:
             games = self._available_games or []
-            total = len(games)
+            # ROM count rather than collapsed-entry count, so the Home widget
+            # and the Stats page agree with RomM. See _variant_count.
+            total = sum(_variant_count(g) for g in games)
             downloaded = sum(1 for g in games if g.get('is_downloaded'))
             platforms = len({g.get('platform_slug') for g in games if g.get('platform_slug')})
             collections = len(self._romm_collections or [])
@@ -5082,6 +5289,17 @@ class Plugin:
                         'message': f'No core installed for {platform_name}',
                         **gap}
 
+            # Advisory only — resolved before the launch so it can be reported
+            # either way. A core whose .info marks BIOS required (Beetle PSX,
+            # DuckStation, PCSX2, Saturn…) fails with no visible reason when the
+            # files are absent, which is indistinguishable from "the app is
+            # broken". Cores with an HLE fallback (pcsx_rearmed, swanstation)
+            # mark their BIOS optional and are correctly never flagged.
+            bios = self._bios_gap(g, platform_name)
+            if bios:
+                logging.info(f"{platform_name} core '{bios['core']}' is missing "
+                             f"required BIOS: {bios['missing_bios']}")
+
             # Pull down the latest saves/states from RomM before launching so the
             # session starts from the most recent progress (no-op if download is off).
             await self._pre_launch_sync(g)
@@ -5094,6 +5312,11 @@ class Plugin:
                     logging.warning(f"could not persist last disc: {e}")
             out = {'success': bool(ok),
                    'message': msg or ('Launched' if ok else 'Launch failed')}
+            if bios:
+                # Attached on success too: RetroArch "launches" fine and then
+                # sits on a black screen, so the warning is most useful exactly
+                # when ok is True.
+                out['bios_warning'] = bios
             if not ok:
                 # A missing core is the one launch failure the user can fix on
                 # the spot, so hand the UI what it needs to offer that instead of
@@ -5131,6 +5354,374 @@ class Plugin:
         except Exception as e:
             logging.warning(f"could not describe the core gap: {e}")
             return {}
+
+    # Cached {core_name: [(path, desc), ...]} of REQUIRED firmware, parsed from
+    # libretro .info files. Empty list = that core needs no BIOS.
+    _core_firmware_cache: dict = None
+    # {slug: {name, platform_id, files}} from one /api/platforms call.
+    _server_firmware_cache: dict = None
+
+    @staticmethod
+    def _parse_required_firmware(text: str):
+        """Required firmware entries from a libretro .info file body.
+
+        The .info format is the only per-core authority on this, and the
+        distinction matters: 'PSX needs BIOS' is not a platform-level fact. Of
+        the four PSX cores Ludo can pick, pcsx_rearmed and swanstation mark all
+        BIOS optional (they have an HLE fallback and boot without one), while
+        beetle/mednafen_psx and duckstation mark theirs required and will not
+        boot at all. Only firmwareN_opt = "false" means genuinely required.
+        """
+        entries = {}
+        for m in re.finditer(r'^\s*firmware(\d+)_(desc|path|opt)\s*=\s*"([^"]*)"',
+                             text, re.MULTILINE):
+            idx, field, val = m.group(1), m.group(2), m.group(3)
+            entries.setdefault(idx, {})[field] = val
+        out = []
+        for e in entries.values():
+            # Absent opt is treated as optional: the conservative direction,
+            # since this only ever drives a warning.
+            if e.get('opt', 'true').strip().lower() == 'false' and e.get('path'):
+                out.append((e['path'], e.get('desc') or e['path']))
+        return out
+
+    def _info_dirs(self):
+        """Directories that may hold libretro .info files, best first.
+
+        The configured libretro_info_path is usually right but not always
+        usable: the RetroArch flatpak writes its own *sandbox* path there
+        (/app/share/libretro/info), which doesn't exist from outside the
+        sandbox — where Ludo runs. So a literal read finds nothing and the BIOS
+        check would silently never fire. Map any /app/... path onto the flatpak
+        deployment tree the same way _bundled_cfg_setting does, then fall back
+        to the usual system locations.
+        """
+        ra = self._retroarch
+        app_id = getattr(ra, 'RETROARCH_APP_ID', None) or 'org.libretro.RetroArch'
+        roots = [Path('/var/lib/flatpak/app'),
+                 Path.home() / '.local/share/flatpak/app',
+                 Path('/run/host/var/lib/flatpak/app'),
+                 Path('/run/host') / str(Path.home()).lstrip('/') / '.local/share/flatpak/app']
+        cands = []
+        configured = ''
+        try:
+            configured = ra.get_retroarch_config_setting('libretro_info_path', '') or ''
+        except Exception:
+            pass
+        if configured:
+            cands.append(Path(configured).expanduser())
+            # '/app/share/libretro/info' -> '<deploy>/files/share/libretro/info'
+            if configured.startswith('/app/'):
+                rel = configured[len('/app/'):]
+                cands += [r / app_id / 'current/active/files' / rel for r in roots]
+        try:
+            cfg = ra.find_retroarch_config_dir()
+            if cfg:
+                cands.append(Path(cfg) / 'info')
+        except Exception:
+            pass
+        cands += [r / app_id / 'current/active/files/share/libretro/info' for r in roots]
+        cands += [Path('/usr/share/libretro/info'),
+                  Path.home() / '.config/retroarch/info']
+        seen, out = set(), []
+        for c in cands:
+            s = str(c)
+            if s not in seen:
+                seen.add(s)
+                if c.is_dir():
+                    out.append(c)
+        return out
+
+    def _required_firmware_for_core(self, core_name: str):
+        """Required firmware for an installed core, or [] if none/unknown.
+
+        Reads the .info file RetroArch already has on disk (install_core drops
+        one next to the core via _fetch_core_info), falling back to the cached
+        buildbot bundle. Never fetches — a launch must not wait on the network.
+        """
+        if self._core_firmware_cache is None:
+            self._core_firmware_cache = {}
+        if core_name in self._core_firmware_cache:
+            return self._core_firmware_cache[core_name]
+        result = []
+        name = f'{core_name}_libretro.info'
+        try:
+            f = next((d / name for d in self._info_dirs() if (d / name).is_file()), None)
+            if f:
+                result = self._parse_required_firmware(
+                    f.read_text(encoding='utf-8', errors='replace'))
+            else:
+                bundle = _paths.cache_dir() / 'libretro_info.zip'
+                if bundle.exists():
+                    import zipfile
+                    with zipfile.ZipFile(bundle) as z:
+                        member = next((m for m in z.namelist()
+                                       if m.rsplit('/', 1)[-1] == name), None)
+                        if member:
+                            result = self._parse_required_firmware(
+                                z.read(member).decode('utf-8', 'replace'))
+        except Exception as e:
+            logging.debug(f"could not read firmware info for {core_name}: {e}")
+        self._core_firmware_cache[core_name] = result
+        return result
+
+    def _bios_manager(self):
+        """RetroArch's BiosManager with a live RomM client attached, or None.
+
+        RetroArchInterface builds the manager without a client, and the only
+        code that ever sets one is BiosTrackingManager.download_bios_for_platform
+        — so every other caller (this plugin's downloads, the startup library
+        scan) sees "Not connected to RomM" while the plugin is perfectly
+        connected. Attach it here rather than in sync_core, which is shared.
+        """
+        bm = getattr(self._retroarch, 'bios_manager', None) if self._retroarch else None
+        if bm and self._romm_client and self._romm_client.authenticated:
+            bm.romm_client = self._romm_client
+        return bm
+
+    def _bios_dir(self):
+        """RetroArch's system/BIOS directory as a Path, or None."""
+        bm = getattr(self._retroarch, 'bios_manager', None) if self._retroarch else None
+        sysdir = getattr(bm, 'system_dir', None) if bm else None
+        return Path(sysdir) if sysdir else None
+
+    def _installed_bios_index(self):
+        """(relative-paths, basenames) present under the system dir, lowercased.
+
+        Two shapes of firmware path occur and both must match:
+          "scph5501.bin"  — a loose file anywhere under system/
+          "pcsx2/bios"    — a subdirectory (PCSX2 ships a whole tree)
+        So index relative paths AND basenames, counting directories as present.
+        Matching a nested path by basename alone would report PCSX2 as
+        permanently missing BIOS. Comparisons are case-insensitive: RetroArch
+        wants an exact name, but flagging a case mismatch as "missing" is a
+        confusing false alarm on a case-sensitive filesystem.
+        """
+        rel, base = set(), set()
+        sysdir = self._bios_dir()
+        if not sysdir:
+            return rel, base
+        try:
+            for p in sysdir.rglob('*'):
+                try:
+                    rel.add(p.relative_to(sysdir).as_posix().lower())
+                    base.add(p.name.lower())
+                except (OSError, ValueError):
+                    continue
+        except OSError as e:
+            logging.debug(f"could not index the BIOS dir: {e}")
+        return rel, base
+
+    def _server_firmware(self, force: bool = False) -> dict:
+        """{platform_slug: {'name', 'platform_id', 'files': [...]}} from RomM.
+
+        One /api/platforms call covers every platform — the payload already
+        embeds each platform's firmware list, which is exactly what RomM's own
+        "Firmware" tab renders. Asking per platform (as bios_manager does) turns
+        this into N+1 requests against a server we already know is the slow part.
+        Cached for the session unless refreshed; returns {} when offline.
+        """
+        if not force and self._server_firmware_cache is not None:
+            return self._server_firmware_cache
+        out = {}
+        try:
+            c = self._romm_client
+            if not (c and c.authenticated):
+                return self._server_firmware_cache or {}
+            from urllib.parse import urljoin
+            r = c.session.get(urljoin(c.base_url, '/api/platforms'), timeout=15)
+            if r.status_code != 200:
+                logging.debug(f"[BIOS] /api/platforms -> {r.status_code}")
+                return self._server_firmware_cache or {}
+            for pl in (r.json() or []):
+                if not isinstance(pl, dict):
+                    continue
+                fw = pl.get('firmware') or []
+                if not fw:
+                    continue
+                slug = (pl.get('slug') or '').lower()
+                out[slug] = {
+                    'name': pl.get('name') or slug,
+                    'platform_id': pl.get('id'),
+                    'files': [{
+                        'file_name': f.get('file_name') or '',
+                        'size': f.get('file_size_bytes') or 0,
+                        'md5': (f.get('md5_hash') or '').lower(),
+                        'sha1': (f.get('sha1_hash') or '').lower(),
+                        'verified': bool(f.get('is_verified')),
+                    } for f in fw if f.get('file_name')],
+                }
+        except Exception as e:
+            logging.warning(f"[BIOS] could not read server firmware: {e}")
+            return self._server_firmware_cache or {}
+        self._server_firmware_cache = out
+        return out
+
+    def _bios_gap(self, game: dict, platform_name: str) -> dict:
+        """{missing_bios: [name, ...], core, severity} when BIOS files RomM holds
+        for this game's platform aren't on disk, else {}.
+
+        Anchored on the server's firmware list rather than the core's .info,
+        because the core Ludo resolves is not necessarily the core that ends up
+        running the game — the user can switch cores inside RetroArch, and then a
+        check keyed on pcsx_rearmed ("BIOS optional") stays silent while every
+        BIOS the platform needs is absent. What the server holds for the platform
+        is true regardless of that choice.
+
+        The core .info still decides *severity*: 'required' when the resolved
+        core marks the firmware mandatory (it will not boot), 'optional' when it
+        has an HLE fallback (it may run, worse).
+
+        Advisory only — the caller warns and still launches. Detection can be
+        wrong in the user's favour (a BIOS installed under a different filename),
+        and refusing to start a game the user might be able to play is the worse
+        failure.
+        """
+        try:
+            ra = self._retroarch
+            if not ra or not platform_name:
+                return {}
+            sysdir = self._bios_dir()
+            if not sysdir:
+                return {}          # can't tell where BIOS lives; stay quiet
+            slug = (game.get('platform_slug')
+                    or (game.get('romm_data') or {}).get('platform_slug') or '')
+            core = ra.describe_core_resolution(
+                platform_name, system_slug=slug or None).get('resolved_core')
+            if not core:
+                return {}          # no core at all — _core_gap owns that message
+            entry = self._server_firmware().get(slug.lower()) or {}
+            wanted = [f['file_name'] for f in entry.get('files') or []]
+            required = self._required_firmware_for_core(core)
+            if not wanted:
+                # Nothing on the server to compare against (platform has no
+                # firmware uploaded, or we're offline) — fall back to the core's
+                # own required list so the check still works without RomM.
+                wanted = [desc or path for path, desc in required]
+            if not wanted:
+                return {}
+            rel, base = self._installed_bios_index()
+            missing = []
+            for w in wanted:
+                key = w.replace('\\', '/').strip('/').lower()
+                if key in rel or ('/' not in key and key in base):
+                    continue
+                missing.append(w)
+            if not missing:
+                return {}
+            return {'missing_bios': missing, 'core': core,
+                    'severity': 'required' if required else 'optional',
+                    'platform_slug': slug,
+                    'platform_name': platform_name,
+                    'bios_dir': str(sysdir)}
+        except Exception as e:
+            logging.warning(f"could not describe the BIOS gap: {e}")
+            return {}
+
+    async def get_bios_inventory(self, refresh: bool = False):
+        """Per-platform BIOS inventory for the BIOS page.
+
+        Distinct from get_bios_status below, which reports the *progress* of
+        BiosTrackingManager's background downloads. This one reports what the
+        server holds versus what is on disk.
+
+        {success, bios_dir, connected, platforms: [{slug, name, core, severity,
+         missing_count, files: [{name, size, present, local_size, verified}]}]}
+        """
+        try:
+            sysdir = self._bios_dir()
+            server = self._server_firmware(force=bool(refresh))
+            rel, base = self._installed_bios_index()
+            names = self._platform_slug_to_name or {}
+            out = []
+            for slug, entry in sorted(server.items(),
+                                      key=lambda kv: (kv[1].get('name') or kv[0]).lower()):
+                pname = names.get(slug) or entry.get('name') or slug
+                core = ''
+                severity = 'optional'
+                try:
+                    core = (self._retroarch.describe_core_resolution(
+                        pname, system_slug=slug).get('resolved_core') or '')
+                    if core and self._required_firmware_for_core(core):
+                        severity = 'required'
+                except Exception as e:
+                    logging.debug(f"[BIOS] core resolution for {slug}: {e}")
+                files, missing = [], 0
+                for f in entry.get('files') or []:
+                    key = f['file_name'].lower()
+                    present = key in rel or key in base
+                    local_size = 0
+                    if present and sysdir:
+                        try:
+                            local_size = (sysdir / f['file_name']).stat().st_size
+                        except OSError:
+                            local_size = 0
+                    if not present:
+                        missing += 1
+                    files.append({'name': f['file_name'], 'size': f['size'],
+                                  'present': present, 'local_size': local_size,
+                                  'verified': f['verified']})
+                out.append({'slug': slug, 'name': entry.get('name') or pname,
+                            'platform_name': pname, 'core': core,
+                            'severity': severity, 'missing_count': missing,
+                            'files': files})
+            return {'success': True, 'bios_dir': str(sysdir) if sysdir else '',
+                    'connected': bool(self._romm_client
+                                      and self._romm_client.authenticated),
+                    'platforms': out}
+        except Exception as e:
+            logging.error(f"get_bios_status error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e), 'platforms': []}
+
+    async def download_bios(self, platform_slug: str, file_name: str = ''):
+        """Fetch one BIOS file, or every missing file for the platform when
+        file_name is empty. Returns {success, downloaded: [...], failed: [...]}.
+        """
+        try:
+            bm = self._bios_manager()
+            if not bm:
+                return {'success': False, 'message': 'No BIOS manager'}
+            if not (self._romm_client and self._romm_client.authenticated):
+                return {'success': False, 'message': 'Not connected to RomM'}
+            slug = (platform_slug or '').lower()
+            entry = self._server_firmware().get(slug) or {}
+            if not entry:
+                return {'success': False, 'message': 'No firmware on the server '
+                                                     'for this platform'}
+            # download_bios_from_romm matches on the *server's* platform name,
+            # not our display name — pass what /api/platforms reported.
+            pname = entry.get('name') or slug
+            if file_name:
+                wanted = [file_name]
+            else:
+                rel, base = self._installed_bios_index()
+                wanted = [f['file_name'] for f in entry.get('files') or []
+                          if f['file_name'].lower() not in rel
+                          and f['file_name'].lower() not in base]
+            done, failed = [], []
+            for name in wanted:
+                try:
+                    ok = await asyncio.get_event_loop().run_in_executor(
+                        None, bm.download_bios_from_romm, pname, name)
+                except Exception as e:
+                    logging.warning(f"[BIOS] {name}: {e}")
+                    ok = False
+                (done if ok else failed).append(name)
+            if done:
+                # The gap check reads the directory listing, so refresh the
+                # manager's own cache too or its next scan still says missing.
+                try:
+                    bm.scan_installed_bios()
+                except Exception as e:
+                    logging.debug(f"[BIOS] rescan after download: {e}")
+            return {'success': bool(done) and not failed,
+                    'downloaded': done, 'failed': failed,
+                    'message': (f"Downloaded {len(done)} file(s)" if done and not failed
+                                else f"{len(failed)} file(s) failed" if failed
+                                else 'Nothing to download')}
+        except Exception as e:
+            logging.error(f"download_bios error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
 
     async def prepare_steam_launch(self, rom_id: int, disc: str = None,
                                    sibling_rom_id: int = None):
@@ -5173,6 +5764,7 @@ class Plugin:
             if gap.get('needs_core'):
                 return {'success': False, 'steam_host': False,
                         'message': f'No core installed for {platform_name}', **gap}
+            bios = self._bios_gap(g, platform_name)
             await self._pre_launch_sync(g)
             cmd, err = self._retroarch.build_launch_command(Path(launch_path), platform_name)
             if err or not cmd:
@@ -5197,7 +5789,8 @@ class Plugin:
                     logging.warning(f"could not persist last disc: {e}")
             logging.info(f"prepare_steam_launch: wrote spec for '{g.get('name')}' "
                          f"argv={cmd}")
-            return {'success': True, 'steam_host': True, 'message': 'Spec ready'}
+            return {'success': True, 'steam_host': True, 'message': 'Spec ready',
+                    **({'bios_warning': bios} if bios else {})}
         except Exception as e:
             logging.error(f"prepare_steam_launch error: {e}", exc_info=True)
             return {'success': False, 'steam_host': False, 'message': str(e)}
