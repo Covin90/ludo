@@ -5421,21 +5421,30 @@ class Plugin:
             await asyncio.to_thread(auto.refresh_save_dirs)
         except Exception as e:
             logging.warning(f"could not refresh save directories: {e}")
+        # Resolve the launching core FIRST: it decides which per-core folder the
+        # pre-launch download writes into, not just where reconcile tidies up
+        # afterwards.
+        core = None
         try:
-            await asyncio.to_thread(auto.sync_before_launch, game)
-        except Exception as e:
-            logging.warning(f"pre-launch sync failed (continuing): {e}")
-        # Whatever just came down has to sit where RetroArch will look for it,
-        # which depends on a config it has not written yet on a first run.
-        try:
-            core = None
             ra = self._retroarch
             if ra:
                 slug = (game.get('platform_slug')
                         or (game.get('romm_data') or {}).get('platform_slug'))
                 core, _ = ra.suggest_core_for_platform(
                     self._platform_name_for(game), system_slug=slug)
+        except Exception as e:
+            logging.warning(f"could not resolve launch core: {e}")
+        try:
+            await asyncio.to_thread(auto.sync_before_launch, game, core)
+        except Exception as e:
+            logging.warning(f"pre-launch sync failed (continuing): {e}")
+        # Whatever just came down has to sit where RetroArch will look for it,
+        # which depends on a config it has not written yet on a first run.
+        try:
             await asyncio.to_thread(auto.reconcile_game_saves, game, core)
+            # States are filed under the emulator RomM recorded, which is not
+            # necessarily the core about to launch (Beetle PSX vs Beetle PSX HW).
+            await asyncio.to_thread(auto.reconcile_game_states, game, core)
         except Exception as e:
             logging.warning(f"could not reconcile save locations: {e}")
 
