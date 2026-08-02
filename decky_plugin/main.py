@@ -1165,6 +1165,11 @@ class Plugin:
             # disk, but the app offered to download them again. The filesystem is
             # the authority here, so re-derive both on the way in. This also
             # picks up ROMs deleted outside the app.
+            # Before reconciling: a snapshot written by an older build can hold
+            # regional/disc variants as entries of their own, which is what put
+            # the same game on screen twice. Fold them into their parent first so
+            # the reconcile below runs over a clean library.
+            self._absorb_variant_entries(self._available_games)
             self._reconcile_downloads(self._available_games)
             self._romm_collections = data.get('collections') or None
             self._romm_virtual_collections = data.get('virtual_collections') or None
@@ -1219,6 +1224,24 @@ class Plugin:
                 g['local_size'] = local_size
                 g['is_multi_disc'] = is_md
                 g['disc_count'] = dc
+                # A game can be on the device under one of its other regions
+                # rather than its own file. Re-check those against the disk too:
+                # dropping them here would mark the game not-downloaded and
+                # offer to fetch a region the user already has.
+                variants = self._variant_downloads(g)
+                if variants:
+                    live = {str(vid): v for vid, v in variants.items()
+                            if v.get('local_path')
+                            and is_path_validly_downloaded(Path(v['local_path']))}
+                    if live:
+                        g['_variant_downloads'] = live
+                        if not is_downloaded:
+                            first = next(iter(live.values()))
+                            g['is_downloaded'] = True
+                            g['local_path'] = first['local_path']
+                            is_downloaded = True
+                    else:
+                        g.pop('_variant_downloads', None)
                 if is_downloaded:
                     found += 1
             except Exception as e:
@@ -1460,6 +1483,13 @@ class Plugin:
                                             + len(rom.get('_region_save_siblings') or [])),
                         '_sibling_files':  rom.get('_sibling_files', []),
                         'sibling_roms':    rom.get('sibling_roms', []),
+                        # Ids only — the pieces grouping dropped from
+                        # sibling_roms (folder members / per-region ROMs). Kept
+                        # so raw server rows can be folded back onto this entry;
+                        # see _variant_parent_index.
+                        '_region_variant_ids': [s.get('id') for s
+                                                in (rom.get('_region_save_siblings') or [])
+                                                if s.get('id')],
                         'romm_data': {
                             'fs_name':         rom.get('fs_name'),
                             'fs_name_no_ext':  rom.get('fs_name_no_ext'),
@@ -2077,6 +2107,9 @@ class Plugin:
                             'cover_path_large': rom.get('path_cover_large'),
                             '_sibling_files':  rom.get('_sibling_files', []),
                             'sibling_roms':    rom.get('sibling_roms', []),
+                            '_region_variant_ids': [s.get('id') for s
+                                                    in (rom.get('_region_save_siblings') or [])
+                                                    if s.get('id')],
                             'romm_data': {
                                 'fs_name': rom.get('fs_name'),
                                 'fs_name_no_ext': rom.get('fs_name_no_ext'),
@@ -3838,6 +3871,136 @@ class Plugin:
         """rom_id -> game dict, from the in-memory library."""
         return {g.get('rom_id'): g for g in (self._available_games or []) if g.get('rom_id')}
 
+    def _variant_parent_index(self, games=None):
+        """variant rom_id -> parent rom_id, from the grouped in-memory library.
+
+        The library we browse is grouped (_group_sibling_roms), but the server's
+        /api/roms responses are not: a multi-region or multi-disc game comes back
+        as one row per variant. Anything that renders raw server rows next to the
+        library must fold those rows onto the entry the user already knows, or
+        the same game appears several times (see search_games).
+        """
+        out = {}
+        for g in (self._available_games if games is None else games) or []:
+            pid = g.get('rom_id')
+            if not pid:
+                continue
+            for key in ('sibling_roms', '_sibling_files'):
+                for s in (g.get(key) or []):
+                    if not isinstance(s, dict):
+                        continue
+                    sid = s.get('id') or s.get('rom_id')
+                    if sid and sid != pid:
+                        out[sid] = pid
+            # Folder members / per-region ROMs grouping pruned off sibling_roms.
+            # Snapshots written before this field existed simply have none, and
+            # those groups keep the pre-fix behaviour until the next fetch.
+            for sid in (g.get('_region_variant_ids') or []):
+                if sid and sid != pid:
+                    out[sid] = pid
+        return out
+
+    @staticmethod
+    def _variant_downloads(game: dict) -> dict:
+        """{variant_rom_id: {file_name, local_path, name}} recorded on a parent.
+
+        Int keys, rebuilt on every read: the map round-trips through the JSON
+        snapshot, which turns every key into a string.
+        """
+        out = {}
+        for k, v in ((game or {}).get('_variant_downloads') or {}).items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                out[int(k)] = v
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _record_variant_download(self, parent: dict, variant_id: int, *,
+                                 name=None, file_name=None, local_path=None):
+        """Note that a regional/disc variant of `parent` is on disk.
+
+        A variant is NOT a library entry of its own — grouping folded it into
+        the parent on purpose, and appending it back (which is what downloading
+        or launching a region used to do) puts the same game on screen twice,
+        in the grid, in Recently Downloaded, and in every collection it belongs
+        to. It also persists into the snapshot, so the duplicate survives
+        restarts. Recording it against the parent keeps launch/delete working
+        without giving the variant a tile.
+        """
+        if not parent or not variant_id:
+            return
+        vd = dict(parent.get('_variant_downloads') or {})
+        entry = dict(vd.get(str(variant_id)) or {})
+        if name:
+            entry['name'] = name
+        if file_name:
+            entry['file_name'] = file_name
+        if local_path:
+            entry['local_path'] = str(local_path)
+        vd[str(variant_id)] = entry
+        parent['_variant_downloads'] = vd
+        # The game IS on the device now, just under one of its other regions.
+        # Without this the parent tile still offers Download and the user has no
+        # way back to what they just fetched.
+        if entry.get('local_path') and not parent.get('is_downloaded'):
+            parent['is_downloaded'] = True
+            parent['local_path'] = entry['local_path']
+
+    def _variant_game(self, idx: dict, rom_id: int, variant_id: int):
+        """A launchable game dict for a regional/disc variant of `rom_id`, or
+        None. The variant has no library entry by design (see
+        _record_variant_download), so build one from the parent plus the file
+        the parent recorded — parent metadata, variant path.
+        """
+        if not variant_id or variant_id == rom_id:
+            return None
+        parent = idx.get(rom_id) or {}
+        v = self._variant_downloads(parent).get(variant_id) or {}
+        path = v.get('local_path')
+        if not path or not is_path_validly_downloaded(Path(path)):
+            return None
+        is_md, dc = _detect_multi_disc(path, True)
+        return dict(parent, rom_id=variant_id,
+                    name=v.get('name') or parent.get('name'),
+                    file_name=v.get('file_name') or parent.get('file_name'),
+                    is_downloaded=True, local_path=path,
+                    is_multi_disc=is_md, disc_count=dc)
+
+    def _absorb_variant_entries(self, games: list):
+        """Fold variant entries a previous version appended back into their
+        parent, in place. Heals snapshots that already carry the duplicates.
+        """
+        try:
+            parents = {}
+            for g in games or []:
+                pid = g.get('rom_id')
+                if not pid:
+                    continue
+                parents[pid] = g
+            variant_of = self._variant_parent_index(games)
+            if not variant_of:
+                return
+            keep, absorbed = [], 0
+            for g in games or []:
+                pid = variant_of.get(g.get('rom_id'))
+                parent = parents.get(pid) if pid else None
+                if parent is None or parent is g:
+                    keep.append(g)
+                    continue
+                if g.get('is_downloaded'):
+                    self._record_variant_download(
+                        parent, g.get('rom_id'), name=g.get('name'),
+                        file_name=g.get('file_name'), local_path=g.get('local_path'))
+                absorbed += 1
+            if absorbed:
+                games[:] = keep
+                logging.info(f"Folded {absorbed} duplicate regional/disc variant "
+                             f"entries back into their parent games")
+        except Exception as e:
+            logging.warning(f"Could not fold variant entries: {e}")
+
     def _is_offline(self):
         """True when the server isn't reachable. Mirrors get_service_status:
         RomMClient.authenticated is sticky, so the reachability latch (_online)
@@ -3982,6 +4145,12 @@ class Plugin:
             sibling_roms = g.get('sibling_roms', [])
             ids = [rom_id] + [s.get('id') for s in sibling_roms if s.get('id')]
             downloaded = [rid for rid in ids if idx.get(rid, {}).get('is_downloaded')]
+            # Variants have no entry in the index (they're folded into this
+            # game), so the region picker learns which ones are already on disk
+            # from what the parent recorded.
+            for vid, v in self._variant_downloads(g).items():
+                if vid not in downloaded and v.get('local_path'):
+                    downloaded.append(vid)
             return {'success': True, 'downloaded_ids': downloaded}
         except Exception as e:
             logging.error(f"get_local_siblings error: {e}", exc_info=True)
@@ -4232,10 +4401,38 @@ class Plugin:
                     logging.warning(f"server search failed, falling back: {e}")
                     roms = []
             if roms:
+                # /api/roms is ungrouped: a multi-region or multi-disc game comes
+                # back as one row per variant, so an unfiltered render showed the
+                # same game two to a dozen times. Collapse it the way the browsed
+                # library is collapsed — first within the result set itself (this
+                # is all we have during the very first fetch, when there is no
+                # library yet), then onto the parent entry the library already
+                # holds, which also catches groups whose parent row didn't match
+                # the search term.
+                roms = self._romm_client._group_sibling_roms(roms)
                 idx = self._games_index()
+                parents = self._variant_parent_index()
                 out = []
+                seen = set()
                 for r in roms:
                     rid = r.get('id')
+                    pid = parents.get(rid)
+                    if pid and pid != rid and pid in idx:
+                        # Fold onto the library's entry for the group; the row we
+                        # matched is one of its variants, not its own game.
+                        parent = idx[pid]
+                        r = dict(r, id=pid,
+                                 name=(parent.get('display_name') or parent.get('name')
+                                       or r.get('name')),
+                                 path_cover_small=(parent.get('cover_path')
+                                                   or r.get('path_cover_small')),
+                                 sibling_roms=(parent.get('sibling_roms')
+                                               or r.get('sibling_roms') or []))
+                        rid = pid
+                    if rid is not None:
+                        if rid in seen:
+                            continue
+                        seen.add(rid)
                     local = idx.get(rid)
                     entry = {
                         'rom_id': rid,
@@ -5130,17 +5327,31 @@ class Plugin:
                     # longer the dict the library holds — so mutating it would
                     # silently do nothing. The current index is the only thing
                     # worth trusting here.
-                    live = self._games_index().get(rom_id) if ok else None
+                    idx = self._games_index() if ok else {}
+                    live = idx.get(rom_id) if ok else None
+                    parent = (idx.get(self._variant_parent_index().get(rom_id))
+                              if ok and not live else None)
                     if ok and live:
                         live['is_downloaded'] = True
                         live['local_path'] = str(final)
                         is_md, dc = _detect_multi_disc(str(final), True)
                         live['is_multi_disc'] = is_md
                         live['disc_count'] = dc
+                    elif ok and parent is not None:
+                        # A regional/disc variant the user picked from the region
+                        # picker. It has no tile of its own — the library folded
+                        # it into its parent — so record it there. Appending it
+                        # as a library entry (what this used to do) is exactly
+                        # how the same game came to show up twice in the grid,
+                        # in Recently Downloaded, and in its collections.
+                        self._record_variant_download(
+                            parent, rom_id, name=name, file_name=file_name,
+                            local_path=final)
+                        self._persist_snapshot_throttled()
                     elif ok:
-                        # Genuinely not in the library (e.g. a sibling region ROM)
-                        # — add it so launch_game can find it. Safe under
-                        # CPython's GIL (same assumption as the mutations above).
+                        # Genuinely not in the library and not a known variant —
+                        # add it so launch_game can find it. Safe under CPython's
+                        # GIL (same assumption as the mutations above).
                         is_md, dc = _detect_multi_disc(str(final), True)
                         self._available_games.append({
                             'name': name or 'Unknown',
@@ -5239,6 +5450,13 @@ class Plugin:
             g = idx.get(rom_id)
             download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                    _default_roms_dir())).expanduser()
+            # Regional/disc variants of this game are on disk under the parent's
+            # record, not as entries of their own — "delete from device" has to
+            # take them too, or the files stay behind with nothing pointing at
+            # them and the tile still reads as downloaded.
+            variant_paths = [v.get('local_path')
+                             for v in self._variant_downloads(g or {}).values()
+                             if v.get('local_path')]
             target = None
             if g and g.get('local_path'):
                 target = Path(g['local_path'])
@@ -5247,10 +5465,25 @@ class Plugin:
                 file_name = g.get('file_name') or (g.get('romm_data') or {}).get('fs_name')
                 if platform_slug and file_name:
                     target = download_dir / platform_slug / file_name
+            removed = 0
+            for p in variant_paths:
+                try:
+                    vp = Path(p)
+                    if target is not None and vp == target:
+                        continue      # handled below with the main target
+                    if vp.is_file():
+                        vp.unlink(); removed += 1
+                    elif vp.is_dir():
+                        shutil.rmtree(vp); removed += 1
+                except Exception as e:
+                    logging.warning(f"could not delete regional variant {p}: {e}")
+            if g:
+                g.pop('_variant_downloads', None)
             if not target or not target.exists():
                 if g:
                     g['is_downloaded'] = False; g['local_path'] = None
-                return {'success': True, 'message': 'Nothing to delete'}
+                return {'success': True,
+                        'message': 'Deleted' if removed else 'Nothing to delete'}
             if target.is_file():
                 target.unlink()
             else:
@@ -5469,6 +5702,8 @@ class Plugin:
             effective_rom_id = sibling_rom_id or rom_id
             g = idx.get(effective_rom_id)
             if not g or not g.get('is_downloaded') or not g.get('local_path'):
+                g = self._variant_game(idx, rom_id, effective_rom_id) or g
+            if not g or not g.get('is_downloaded') or not g.get('local_path'):
                 # Fallback: sibling ROM may be on disk but not in the index (e.g.,
                 # downloaded in a previous session). Try resolving from the API.
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
@@ -5513,6 +5748,15 @@ class Plugin:
                                 g.update({k: found[k] for k in (
                                     'is_downloaded', 'local_path',
                                     'is_multi_disc', 'disc_count')})
+                            elif effective_rom_id != rom_id and rom_id in idx:
+                                # A regional/disc variant: record it on the
+                                # parent instead of appending, or the game gets
+                                # a second tile everywhere it appears.
+                                self._record_variant_download(
+                                    idx[rom_id], effective_rom_id,
+                                    name=found['name'], file_name=fn,
+                                    local_path=candidate)
+                                g = found
                             else:
                                 g = found
                                 self._available_games.append(g)
@@ -6002,6 +6246,9 @@ class Plugin:
             idx = self._games_index()
             effective_rom_id = sibling_rom_id or rom_id
             g = idx.get(effective_rom_id)
+            if not g or not g.get('is_downloaded') or not g.get('local_path'):
+                # Regional/disc variants live on their parent, not in the index.
+                g = self._variant_game(idx, rom_id, effective_rom_id) or g
             if not g or not g.get('is_downloaded') or not g.get('local_path'):
                 return {'success': False, 'steam_host': False,
                         'message': 'Game not downloaded'}
