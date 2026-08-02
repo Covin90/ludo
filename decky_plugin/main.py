@@ -3081,7 +3081,8 @@ class Plugin:
             support = ra.core_download_support()
             return {'success': True, 'available_cores': available, 'mappings': rows,
                     'can_download_cores': support['available'],
-                    'download_unavailable_reason': support['reason']}
+                    'download_unavailable_reason': support['reason'],
+                    'download_unavailable_kind': support.get('kind') or ''}
         except Exception as e:
             logging.error(f"get_core_mappings error: {e}", exc_info=True)
             return {'success': False, 'mappings': [], 'available_cores': [], 'message': str(e)}

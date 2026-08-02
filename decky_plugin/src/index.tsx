@@ -9212,8 +9212,10 @@ function DownloadsPage() {
 // Glassy core picker (RomM v2 chrome, like the account/collection menus).
 // Lists "Auto" + every installed core, with RetroDECK's choices surfaced first
 // and the current selection check-marked. closeModal is injected by showModal.
-function CorePickerModal({ row, availableCores, canDownload, onPick, onDownload, closeModal }: {
-  row: any; availableCores: string[]; canDownload: boolean; onPick: (core: string) => void;
+function CorePickerModal({ row, availableCores, canDownload, noDownloadReason, noDownloadKind, onPick, onDownload, closeModal }: {
+  row: any; availableCores: string[]; canDownload: boolean;
+  noDownloadReason?: string; noDownloadKind?: string;
+  onPick: (core: string) => void;
   onDownload: (core: string) => void; closeModal?: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -9223,12 +9225,14 @@ function CorePickerModal({ row, availableCores, canDownload, onPick, onDownload,
   // opening the picker stays a local, offline-safe operation.
   const [catalogue, setCatalogue] = useState<string[] | null>(null);
   const rdSet = new Set<string>(row?.retrodeck_choices || []);
-  // RetroDECK's choices for this system are the cores actually meant for the
-  // platform (mGBA/VBA-M for gba, Swanstation/Beetle for psx, …). Show only
-  // those by default; expand to every installed core on demand (or when
-  // RetroDECK has no entry for this system, so the list wouldn't be empty).
-  const relevant = (row?.retrodeck_choices || []).filter((c: string) => availableCores.includes(c));
-  const [showAll, setShowAll] = useState(relevant.length === 0);
+  // Installed cores that can actually run this platform (RetroDECK's choices
+  // plus our own map). Only these are offered — pinning mupen64plus to Game Boy
+  // Advance just produces a launch that fails. The rest of the core folder is
+  // still reachable behind "show all" for cores we don't know about.
+  const relevant: string[] = (row?.platform_cores
+    || (row?.retrodeck_choices || []).filter((c: string) => availableCores.includes(c)));
+  const relevantSet = new Set<string>(relevant);
+  const [showAll, setShowAll] = useState(false);
   useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
 
   const q = query.trim().toLowerCase();
@@ -9237,7 +9241,7 @@ function CorePickerModal({ row, availableCores, canDownload, onPick, onDownload,
   const rdOrdered = relevant.filter((c: string) => match(c));
   // Filtering searches the whole installed set even when collapsed, so you can
   // find any core by typing without toggling "show all" first.
-  const others = (showAll || q) ? availableCores.filter((c) => !rdSet.has(c) && match(c)) : [];
+  const others = (showAll || q) ? availableCores.filter((c) => !relevantSet.has(c) && match(c)) : [];
   const current = row?.override || '';
 
   const pick = (core: string) => { closeModal?.(); onPick(core); };
@@ -9308,19 +9312,47 @@ function CorePickerModal({ row, availableCores, canDownload, onPick, onDownload,
           )}
           {rdOrdered.length > 0 && <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />}
           {rdOrdered.map(coreRow)}
-          {/* Expand to the full installed-core list (hidden by default so the
-              platform's own cores aren't buried). Only offered when RetroDECK
-              actually narrowed the list. */}
-          {relevant.length > 0 && (
+          {/* No installed core runs this platform — say so instead of leaving a
+              bare "Auto" that resolves to nothing. */}
+          {relevant.length === 0 && !q && (
             <>
               <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-              <UserMenuRow
-                icon={<FaLayerGroup size={13} />}
-                label={showAll ? 'Show only cores for this platform' : 'Show all installed cores'}
-                onSelect={() => setShowAll((v) => !v)} />
+              <div style={{ padding: '8px 10px', fontSize: '11.5px', color: V2.fgMuted, lineHeight: 1.45 }}>
+                {suggested.length > 0
+                  ? 'No installed core runs this platform — download one below.'
+                  /* Nothing to offer: either Ludo can't install cores here at all
+                     (RetroDECK, unsupported arch, read-only cores dir) or the
+                     buildbot has none for this platform. Both end the same way —
+                     RetroArch's own Online Updater is the way out, so say so
+                     instead of leaving a dead end. */
+                  /* RetroDECK's core set is fixed and read-only inside the
+                     flatpak, so its Online Updater can't write there either —
+                     pointing at it would just be a second dead end. */
+                  : noDownloadKind === 'retrodeck'
+                    ? 'No installed core runs this platform. RetroDECK ships a fixed core set that neither Ludo nor its own updater can add to, so there is nothing to install here — this platform needs a separate RetroArch to run.'
+                    : !canDownload
+                    ? `No installed core runs this platform, and Ludo can't install one${noDownloadReason ? ` — ${noDownloadReason}` : ''}. Add a core from RetroArch itself (Main Menu ▸ Online Updater ▸ Core Downloader), then come back and pin it here.`
+                    : 'No installed core runs this platform, and the libretro buildbot has none to offer for it. Check RetroArch\'s own Core Downloader (Main Menu ▸ Online Updater) — if it isn\'t there either, this platform has no libretro core.'}
+              </div>
             </>
           )}
-          {others.length > 0 && <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />}
+          {/* Escape hatch to the rest of the core folder, for cores our map
+              doesn't know about. Off by default so a core meant for another
+              system can't be pinned here by accident. */}
+          <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+          <UserMenuRow
+            icon={<FaLayerGroup size={13} />}
+            label={showAll ? 'Show only cores for this platform' : 'Show all installed cores'}
+            onSelect={() => setShowAll((v) => !v)} />
+          {others.length > 0 && (
+            <>
+              <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+              <div style={{
+                fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
+                color: V2.fgMuted, padding: '6px 8px 4px',
+              }}>Other installed cores · not for this platform</div>
+            </>
+          )}
           {others.map(coreRow)}
           {/* Not installed, but the libretro buildbot has it — same source
               RetroArch's own Online Updater uses. */}
@@ -9396,6 +9428,9 @@ function CoresPage() {
   // (RetroDECK bundles them read-only; unsupported CPU; no writable dir).
   const [canDownload, setCanDownload] = useState(false);
   const [noDownloadReason, setNoDownloadReason] = useState('');
+  // Which of those cases it is ('retrodeck', 'no_builds', …) — the picker words
+  // its advice per case rather than pattern-matching the reason text.
+  const [noDownloadKind, setNoDownloadKind] = useState('');
 
   const emu = useEmulatorStatus();
 
@@ -9407,6 +9442,7 @@ function CoresPage() {
         setCores(r.available_cores || []);
         setCanDownload(!!r.can_download_cores);
         setNoDownloadReason(r.download_unavailable_reason || '');
+        setNoDownloadKind(r.download_unavailable_kind || '');
       }
     } catch { /* ignore */ }
     finally { setLoading(false); }
@@ -9452,6 +9488,7 @@ function CoresPage() {
 
   const openPicker = (row: any) =>
     showModal(<CorePickerModal row={row} availableCores={cores} canDownload={canDownload}
+      noDownloadReason={noDownloadReason} noDownloadKind={noDownloadKind}
       onPick={(c) => apply(row.slug, c)}
       onDownload={(c) => install(row, c)} />);
 

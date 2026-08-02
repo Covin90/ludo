@@ -6087,12 +6087,22 @@ class RetroArchInterface:
         else:
             guess, _ = self._guess_core_for_platform(platform_name, available_cores)
             resolved, source = (guess, 'guess') if guess else (None, 'none')
+        platform_cores = self.installed_cores_for_platform(
+            platform_name, system_slug, available_cores)
+        # Whatever we'd actually launch belongs in the list — otherwise the
+        # picker can claim no core runs a platform while Auto resolves to one.
+        if resolved and resolved not in platform_cores:
+            platform_cores.insert(0, resolved)
         return {
             'resolved_core': resolved,
             'source': source,
             'override': override,
             'retrodeck_default': rd_default,
             'retrodeck_choices': [c for _, c in rd_choices],
+            # Every installed core that can actually run this platform — what the
+            # picker offers. Without it the picker fell back to "all installed
+            # cores", letting you pin mupen64plus to Game Boy Advance.
+            'platform_cores': platform_cores,
             # Cores this platform wants that aren't installed but the buildbot
             # can supply, best guess first — what the "Download" action offers
             # when resolved_core is None.
@@ -6112,6 +6122,48 @@ class RetroArchInterface:
         'beetle_lynx': 'mednafen_lynx',
     }
 
+    def _candidate_cores_for_platform(self, platform_name, system_slug=None):
+        """Every core name that can run this platform, best first, installed or
+        not: the exact platform_core_map entries plus keyword matches for the
+        many labels that don't match a key exactly ("Sega Mega Drive/Genesis").
+        Names as our map spells them — alias to the buildbot's separately."""
+        wanted = []
+        for key in (system_slug, platform_name):
+            for c in (self.platform_core_map.get(key) or []):
+                if c not in wanted:
+                    wanted.append(c)
+        for key in (system_slug, platform_name):
+            low = (key or '').lower()
+            if not low:
+                continue
+            for keyword, cores in self._PLATFORM_KEYWORD_CORES.items():
+                if keyword in low:
+                    for c in cores:
+                        if c not in wanted:
+                            wanted.append(c)
+        return wanted
+
+    def installed_cores_for_platform(self, platform_name, system_slug=None,
+                                     available_cores=None):
+        """Installed cores that can run this platform, best guess first.
+
+        Union of RetroDECK/ES-DE's choices for the system and our own
+        platform_core_map, matched against what's installed under both the
+        libretro-doc name and the buildbot's (beetle_psx ↔ mednafen_psx).
+        Empty when nothing installed fits — the picker then offers downloads
+        rather than the whole core folder.
+        """
+        installed = available_cores if available_cores is not None else self.get_available_cores()
+        wanted = []
+        for _, c in (self._retrodeck_core_map().get(system_slug, []) if system_slug else []):
+            if c not in wanted:
+                wanted.append(c)
+        for c in self._candidate_cores_for_platform(platform_name, system_slug):
+            for name in (c, self._BUILDBOT_ALIASES.get(c)):
+                if name and name not in wanted:
+                    wanted.append(name)
+        return [c for c in wanted if c in installed]
+
     def downloadable_cores_for_platform(self, platform_name, system_slug=None):
         """Core names this platform could use that aren't installed yet and the
         buildbot ships for this OS/arch, in our preference order.
@@ -6128,11 +6180,10 @@ class RetroArchInterface:
         if not index:
             return []
         wanted = []
-        for key in (system_slug, platform_name):
-            for c in (self.platform_core_map.get(key) or []):
-                c = self._BUILDBOT_ALIASES.get(c, c)
-                if c not in wanted:
-                    wanted.append(c)
+        for c in self._candidate_cores_for_platform(platform_name, system_slug):
+            c = self._BUILDBOT_ALIASES.get(c, c)
+            if c not in wanted:
+                wanted.append(c)
         return [c for c in wanted if c not in installed and c in index]
 
     def suggest_core_for_platform(self, platform_name, system_slug=None):
@@ -6174,8 +6225,23 @@ class RetroArchInterface:
         # Try fuzzy matching if exact match fails
         platform_lower = (platform_name or '').lower()
 
-        # Enhanced keyword mapping for better platform detection
-        platform_keywords = {
+        # Try keyword matching
+        for keyword, cores in self._PLATFORM_KEYWORD_CORES.items():
+            if keyword in platform_lower:
+                for core in cores:
+                    if core in available_cores:
+                        print(f"✅ Found fuzzy match core: {core} (matched keyword: {keyword})")
+                        return core, available_cores[core]
+
+        print(f"❌ No suitable core found for platform: {platform_name}")
+        print(f"Available cores: {list(available_cores.keys())}")
+        return None, None
+
+    # Keyword → cores, for the many platform names that don't match
+    # platform_core_map exactly ("Sega Mega Drive/Genesis", "Nintendo - Game Boy
+    # Advance", …). Shared by the guess, the picker's platform-core list and the
+    # download offer, so all three agree on what a platform can run.
+    _PLATFORM_KEYWORD_CORES = {
             'n64': ['mupen64plus_next', 'parallel_n64'],
             'nintendo 64': ['mupen64plus_next', 'parallel_n64'],
             'snes': ['snes9x', 'bsnes', 'mesen-s'],
@@ -6202,19 +6268,7 @@ class RetroArchInterface:
             'mega drive': ['genesis_plus_gx', 'blastem', 'picodrive'],
             'nintendo ds': ['desmume', 'melonds', 'melondsds'],
             'nds': ['desmume', 'melonds', 'melondsds'],
-        }
-
-        # Try keyword matching
-        for keyword, cores in platform_keywords.items():
-            if keyword in platform_lower:
-                for core in cores:
-                    if core in available_cores:
-                        print(f"✅ Found fuzzy match core: {core} (matched keyword: {keyword})")
-                        return core, available_cores[core]
-
-        print(f"❌ No suitable core found for platform: {platform_name}")
-        print(f"Available cores: {list(available_cores.keys())}")
-        return None, None
+    }
 
     def build_launch_command(self, rom_path, platform_name=None, core_name=None,
                              entry_slot=None):
@@ -7611,9 +7665,11 @@ class RetroArchInterface:
         return {'success': True, 'message': 'RetroArch installed', 'status': status}
 
     def core_download_support(self):
-        """{'available': bool, 'reason': str} — whether downloading cores makes
-        sense for the CURRENTLY SELECTED RetroArch, and a user-facing reason
-        when it doesn't.
+        """{'available': bool, 'reason': str, 'kind': str} — whether downloading
+        cores makes sense for the CURRENTLY SELECTED RetroArch, and a user-facing
+        reason when it doesn't. kind ∈ {'ok','no_emulator','retrodeck','no_builds',
+        'no_cores_dir'} so the UI can word its own advice per case instead of
+        pattern-matching the reason text.
 
         RetroDECK is the deliberate no-op: its cores dir (and the
         config/retroarch/cores "override", which is really a symlink into the
@@ -7628,21 +7684,21 @@ class RetroArchInterface:
         # without this check the UI would offer to download cores for an emulator
         # that isn't there.
         if not self.retroarch_executable:
-            return {'available': False,
+            return {'available': False, 'kind': 'no_emulator',
                     'reason': 'No emulator installed'}
         if 'retrodeck' in (self.retroarch_executable or '').lower():
             n = len(self.get_available_cores())
-            return {'available': False,
+            return {'available': False, 'kind': 'retrodeck',
                     'reason': f'RetroDECK manages its own cores'
                               + (f' — {n} already installed' if n else '')}
         if not self._buildbot_base()[0]:
             import platform as _plat
-            return {'available': False,
+            return {'available': False, 'kind': 'no_builds',
                     'reason': f'No libretro builds for this platform ({_plat.machine()})'}
         if not self.find_writable_cores_directory():
-            return {'available': False,
+            return {'available': False, 'kind': 'no_cores_dir',
                     'reason': 'No writable RetroArch cores directory found'}
-        return {'available': True, 'reason': ''}
+        return {'available': True, 'kind': 'ok', 'reason': ''}
 
     def download_core(self, core_name, progress_callback=None):
         support = self.core_download_support()
