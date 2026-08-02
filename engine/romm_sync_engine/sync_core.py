@@ -2466,7 +2466,13 @@ class RomMClient:
                 if total_games == 0:
                     return [], 0
 
-                chunk_size = 500
+                # RomM charges a fixed ~1.15s per request plus ~3.5ms per row, so
+                # small pages are dominated by overhead: measured on a 3,083-ROM
+                # instance, limit=100 costs 15ms/row and limit=1000 costs 4.8ms/row.
+                # 4 workers x 500 took 15.2s; x1000 takes 12.1s. Bigger pages keep
+                # helping in theory, but ~11.5s is the floor for any shape and one
+                # giant request loses both progress reporting and per-page retry.
+                chunk_size = 1000
                 total_chunks = (total_games + chunk_size - 1) // chunk_size
 
                 print(f"📚 Fetching {total_games:,} games in {total_chunks} chunks of {chunk_size:,} (parallel)...")

@@ -2928,6 +2928,34 @@ class Plugin:
             logging.error(f"logout error: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
+    def _push_device_name(self, device_id, remote=None):
+        """Tell RomM what this device is called. Blocking; call off the loop.
+
+        Without this the device shows in RomM under socket.gethostname() for
+        good, because register_device only ever sends a name once. RomM's own
+        Android client does the same PUT for the same reason.
+
+        `remote` is the name the server currently has, when the caller already
+        knows it — passing it skips the PUT when nothing changed.
+        """
+        if not (self._romm_client and self._romm_client.authenticated and device_id):
+            return False
+        try:
+            import socket as _socket
+            name = (self._settings.get('Device', 'device_name', '') or '').strip()
+            if not name or name == _socket.gethostname():
+                return False  # nothing the server doesn't already assume
+            if remote is not None and remote == name:
+                return False
+            if self._romm_client.update_device(device_id, {'name': name}):
+                logging.info(f"[DEVICE] renamed on server: {name}")
+                return True
+            logging.warning(f"[DEVICE] rename to {name!r} rejected by server")
+            return False
+        except Exception as e:
+            logging.error(f"[DEVICE] rename error: {e}", exc_info=True)
+            return False
+
     def _ensure_device_registered(self):
         """Ensure this device is registered with RomM and device_id is stored.
 
@@ -2940,9 +2968,16 @@ class Plugin:
             return None
         try:
             existing = self._settings.get('Device', 'device_id', '')
-            if existing and self._romm_client.get_device(existing):
-                logging.info(f"[DEVICE] verified on server: {existing}")
-                return existing
+            if existing:
+                device = self._romm_client.get_device(existing)
+                if device:
+                    logging.info(f"[DEVICE] verified on server: {existing}")
+                    # Reconcile a rename made while offline. set_device_name
+                    # pushes immediately when it can, but the wizard often runs
+                    # before the first connect, so the server would otherwise
+                    # keep showing the hostname forever.
+                    self._push_device_name(existing, remote=device.get('name'))
+                    return existing
 
             import socket as _socket
             device_id = self._romm_client.register_device(
@@ -3024,6 +3059,15 @@ class Plugin:
             if not SYNC_CORE_AVAILABLE:
                 return {'success': False, 'message': 'sync_core not available'}
             SettingsManager().set('Device', 'device_name', (name or '').strip())
+            # Settings are the source of truth, so the local write stands even if
+            # the server is unreachable — _ensure_device_registered pushes the
+            # name on the next connect. to_thread because update_device is a
+            # blocking HTTP call and this is a Decky callable: doing it inline
+            # would stall every other callable, which is exactly what made
+            # pairing look hung.
+            device_id = self._settings.get('Device', 'device_id', '') if self._settings else ''
+            if device_id:
+                await asyncio.to_thread(self._push_device_name, device_id)
             return {'success': True}
         except Exception as e:
             logging.error(f"set_device_name error: {e}", exc_info=True)
