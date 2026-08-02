@@ -66,7 +66,7 @@ try:
     from romm_sync_engine.sync_core import (
         SettingsManager, RomMClient, RetroArchInterface,
         AutoSyncManager, CollectionSyncManager,
-        BiosTrackingManager,
+        BiosTrackingManager, ROM_TRIM_FIELDS,
         SteamShortcutManager, CoverArtManager,
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
         _extract_archive, _archive_member_names,
@@ -999,7 +999,8 @@ class Plugin:
                             self._romm_client.count_roms() or 0),
                     }
                     roms_result = self._romm_client.get_roms(
-                        progress_callback=_on_fetch_progress)
+                        progress_callback=_on_fetch_progress,
+                        trim_fields=ROM_TRIM_FIELDS)
                 finally:
                     # Always clear, including on failure: a stuck count is worse
                     # than no count, since the banner would claim progress that
@@ -1548,7 +1549,8 @@ class Plugin:
                 new_roms_data = self._romm_client.get_roms(
                     limit=10000,  # High limit for incremental updates
                     offset=0,
-                    updated_after=updated_after
+                    updated_after=updated_after,
+                    trim_fields=ROM_TRIM_FIELDS
                 )
 
                 if new_roms_data and len(new_roms_data) == 2:
@@ -1609,7 +1611,7 @@ class Plugin:
                         logging.info("Incremental: no new/updated ROMs found")
             else:
                 # Full refresh - fetch all games
-                roms_result = self._romm_client.get_roms()
+                roms_result = self._romm_client.get_roms(trim_fields=ROM_TRIM_FIELDS)
                 if roms_result and len(roms_result) == 2:
                     raw_games, server_total = roms_result
                     # Keep the count probe's baseline in step with what we just

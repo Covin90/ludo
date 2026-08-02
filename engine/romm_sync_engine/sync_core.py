@@ -1616,6 +1616,36 @@ def _extract_7z_cli(exe, archive_path, dest_dir, emit):
     return True
 
 
+# Fields a ROM row is trimmed to when get_roms(trim_fields=...) is used.
+#
+# RomM ignores the `fields` query param (it is not a parameter of /api/roms at
+# all), so every row arrives complete — 73 fields including the `metadatum` and
+# `merged_ra_metadata` blobs. Parsed, that is ~35.6KB per ROM held for the whole
+# fetch; on an 80k library the accumulated rows peak near 3GB, which on a Steam
+# Deck sharing memory with a running game is fatal rather than slow.
+#
+# Projecting each row as its page arrives lets the rest be freed immediately:
+# measured 35.6KB -> 3.9KB retained per ROM, 9.1x, taking an 80k fetch from
+# ~2.9GB to ~0.3GB. This is the client-side version of the `fields` list we
+# already send and RomM ignores.
+#
+# Anything _group_sibling_roms reads must be in here — it needs id, sibling_roms,
+# files, fs_extension, rom_user, name and fs_name — as must anything a caller
+# reads off the returned rows.
+ROM_TRIM_FIELDS = (
+    'id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension', 'fs_size_bytes',
+    'platform_id', 'platform_slug', 'files', 'multi',
+    # RomM 5.1.0 has no `platform_name` — it is platform_display_name /
+    # platform_custom_name. main.py still reads 'platform_name', which has
+    # therefore always been None; carrying the real ones means the trim isn't
+    # what stands in the way of fixing that.
+    'platform_name', 'platform_display_name', 'platform_custom_name',
+    'platform_fs_slug',
+    'path_cover_large', 'path_cover_small', 'sibling_roms', 'rom_user',
+    'created_at', 'updated_at',
+)
+
+
 class RomMClient:
     """Client for interacting with RomM API"""
     
@@ -2055,7 +2085,8 @@ class RomMClient:
             pass
         return None
 
-    def get_roms(self, progress_callback=None, limit=500, offset=0, updated_after=None):
+    def get_roms(self, progress_callback=None, limit=500, offset=0, updated_after=None,
+                 trim_fields=None):
         """Get ROMs with pagination support - FIXED to fetch ALL games
 
         Args:
@@ -2070,7 +2101,7 @@ class RomMClient:
         try:
             # For backward compatibility, if no specific limit is requested, fetch ALL games
             if limit == 500 and offset == 0 and updated_after is None:
-                return self._fetch_all_games_chunked(progress_callback)
+                return self._fetch_all_games_chunked(progress_callback, trim_fields)
             else:
                 # Specific pagination request or filtered by updated_after
                 params = {
@@ -2099,6 +2130,10 @@ class RomMClient:
                 data = response.json()
                 items = data.get('items', [])
                 total = data.get('total', 0)
+                if trim_fields:
+                    # Same projection as the chunked path — see ROM_TRIM_FIELDS.
+                    items = [{k: row[k] for k in trim_fields if k in row}
+                             for row in items]
 
                 if progress_callback:
                     progress_callback('batch', {'items': items, 'total': total, 'offset': offset})
@@ -2435,7 +2470,7 @@ class RomMClient:
 
         return result_roms
 
-    def _fetch_all_games_chunked(self, progress_callback):
+    def _fetch_all_games_chunked(self, progress_callback, trim_fields=None):
         """Fetch all games using parallel requests"""
         try:
             with PerformanceTimer("API fetch - full sync") as timer:
@@ -2487,7 +2522,8 @@ class RomMClient:
 
                 # Use existing parallel fetching
                 fetch_start = time.time()
-                all_games = self._fetch_pages_parallel(total_games, chunk_size, total_chunks, progress_callback)
+                all_games = self._fetch_pages_parallel(total_games, chunk_size, total_chunks,
+                                                       progress_callback, trim_fields)
                 timer.checkpoint(f"Parallel fetch complete: {time.time() - fetch_start:.2f}s")
                 timer.checkpoint(f"Total fetch time: {time.time() - count_start:.2f}s")
 
@@ -2498,7 +2534,8 @@ class RomMClient:
             self.last_fetch_incomplete = True
             return [], 0
         
-    def _fetch_pages_parallel(self, total_items, page_size, pages_needed, progress_callback):
+    def _fetch_pages_parallel(self, total_items, page_size, pages_needed, progress_callback,
+                              trim_fields=None):
         """Memory-optimized: Stream and process games in smaller chunks"""
         import concurrent.futures
         import threading
@@ -2550,7 +2587,14 @@ class RomMClient:
                     )
 
                     if response.status_code == 200:
-                        return page_num, response.json().get('items', []), True
+                        items = response.json().get('items', [])
+                        if trim_fields:
+                            # Rebind so the full rows become garbage here, while
+                            # only this page is resident — not after the whole
+                            # library has accumulated. See ROM_TRIM_FIELDS.
+                            items = [{k: row[k] for k in trim_fields if k in row}
+                                     for row in items]
+                        return page_num, items, True
                     print(f"❌ Page {page_num}: HTTP {response.status_code}"
                           f"{' (retrying)' if attempt == 1 else ''}")
                 except Exception as e:
