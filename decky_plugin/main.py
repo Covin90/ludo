@@ -476,6 +476,20 @@ class Plugin:
     # that predates this field — in which case connect just fetches as before.
     _library_server_total: int = None
 
+    # {'loaded': N, 'total': M} while a full fetch is running, else None. The
+    # fetch is ~12s on a 3k library and the connecting banner otherwise says the
+    # same thing at second 1 and second 12, which is what makes a busy plugin
+    # look hung. Written from the fetch's worker threads and read by the status
+    # poll; a dict rebind is atomic under the GIL, so no lock — never mutate it
+    # in place.
+    _library_progress: dict = None
+
+    # One-shot toast request for the frontend: {'kind': 'ready', 'games': N} or
+    # {'kind': 'failed'}, else None. Only ever set for the FIRST library load on
+    # this device; the frontend calls ack_library_announcement() once it has
+    # shown it, which persists the fact so a plugin reload doesn't re-toast.
+    _announce_library: dict = None
+
     # Reachability latch, distinct from RomMClient.authenticated (which is sticky).
     # True while the server is responding; flipped False on any connected-branch
     # failure. A False→True transition triggers an offline save flush. Starts None
@@ -948,6 +962,7 @@ class Plugin:
             # Either probe returning None means the question is unanswered, and
             # we fetch. Manual refresh (force_full_refresh) bypasses all of this.
             skip_fetch = False
+            total = None   # server ROM count, when the skip check happened to ask
             if (self._available_games and self._snapshot_fetched_at
                     and self._library_server_total is not None):
                 total = self._romm_client.count_roms()
@@ -965,7 +980,31 @@ class Plugin:
                 self._last_full_fetch_time = self._snapshot_fetched_at
                 self._init_bios_tracking()
 
-            roms_result = None if skip_fetch else self._romm_client.get_roms()
+            def _on_fetch_progress(kind, payload):
+                if kind == 'loaded' and isinstance(payload, dict):
+                    self._library_progress = payload
+
+            if skip_fetch:
+                roms_result = None
+            else:
+                try:
+                    # Seed the total BEFORE fetching. Pages arrive whole and in
+                    # parallel, so the count itself barely moves until they land
+                    # — the number that actually helps from second zero is how
+                    # big the job is. A count probe is ~0.05s, and `total` is
+                    # already in hand when the skip check ran.
+                    self._library_progress = {
+                        'loaded': 0,
+                        'total': total if total is not None else (
+                            self._romm_client.count_roms() or 0),
+                    }
+                    roms_result = self._romm_client.get_roms(
+                        progress_callback=_on_fetch_progress)
+                finally:
+                    # Always clear, including on failure: a stuck count is worse
+                    # than no count, since the banner would claim progress that
+                    # stopped happening.
+                    self._library_progress = None
             if roms_result and len(roms_result) == 2:
                 raw_games, server_total = roms_result
                 # Ungrouped server count — see _library_server_total.
@@ -1019,6 +1058,16 @@ class Plugin:
                         },
                     })
                 logging.info(f"Loaded {len(self._available_games)} games")
+
+                # First successful library load ever gets a toast, because the
+                # user very likely wandered out of the plugin during the ~12s
+                # wait and nothing else would tell them it finished. Every load
+                # after this one is silent: reconnects happen on every wake from
+                # sleep, and a toast each time is noise that teaches people to
+                # ignore the toasts that matter.
+                if self._settings.get('UI', 'library_announced', '') != 'true':
+                    self._announce_library = {'kind': 'ready',
+                                              'games': len(self._available_games)}
 
                 self._last_full_fetch_time = datetime.now(timezone.utc).isoformat()
                 self._snapshot_fetched_at = self._last_full_fetch_time
@@ -1148,6 +1197,14 @@ class Plugin:
                 if self._connect_to_romm():
                     logging.info("Startup retry succeeded")
                     break
+            else:
+                # Two minutes of retries and still nothing to show. Worth a toast
+                # even though success after the first load isn't: an empty plugin
+                # with no explanation is the case where the user has no idea
+                # whether to wait, retry, or go check their server.
+                if (not self._available_games
+                        and self._settings.get('UI', 'library_announced', '') != 'true'):
+                    self._announce_library = {'kind': 'failed'}
 
         while not self._stop_event.is_set():
             self._stop_event.wait(300)  # sleep 5 minutes (or until _stop_sync wakes us)
@@ -1285,6 +1342,10 @@ class Plugin:
                     'status':                  'running',
                     'connection':              conn_state,
                     'unreachable_reason':      reason,
+                    # Present only while a full fetch is in flight, so the
+                    # connecting banner can count up instead of repeating itself.
+                    'library_progress':        self._library_progress,
+                    'library_announcement':    self._announce_library,
                     'snapshot_fetched_at':     self._snapshot_fetched_at,
                     'pending_saves':           self._count_pending_saves(),
                     'message':                 msg,
@@ -1353,6 +1414,8 @@ class Plugin:
                 # frontend gates the post-update "reopen Home" on this so covers
                 # don't fetch against a still-initializing backend.
                 'library_ready':           self._last_full_fetch_time is not None,
+                # One-shot; see _announce_library. Cleared via ack_library_announcement.
+                'library_announcement':    self._announce_library,
                 'game_count':              game_count,
                 'snapshot_fetched_at':     self._snapshot_fetched_at,
                 'pending_saves':           self._count_pending_saves(),
@@ -3071,6 +3134,22 @@ class Plugin:
             return {'success': True}
         except Exception as e:
             logging.error(f"set_device_name error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def ack_library_announcement(self):
+        """The frontend has shown the first-load toast; never show it again.
+
+        Persisted rather than kept in memory because the frontend remounts far
+        more often than the backend restarts, and a flag that resets on remount
+        would re-toast at the worst moments.
+        """
+        try:
+            self._announce_library = None
+            if self._settings:
+                self._settings.set('UI', 'library_announced', 'true')
+            return {'success': True}
+        except Exception as e:
+            logging.error(f"ack_library_announcement error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def delete_device(self):

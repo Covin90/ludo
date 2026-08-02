@@ -2571,6 +2571,14 @@ class RomMClient:
                         # Restore clear progress messages
                         if progress_callback:
                             progress_callback('page', f'⟳ Completed {completed_pages}/{pages_needed} pages ({len(final_games)} games loaded)')
+                            # Same fact as the line above, in a form a UI can put
+                            # a number on. A count that moves is the only honest
+                            # proof of life during a multi-second fetch — a
+                            # spinner keeps spinning after the fetch has died.
+                            progress_callback('loaded', {
+                                'loaded': len(final_games) + len(current_chunk),
+                                'total': total_items,
+                            })
             
             # Add batch completion message
             if progress_callback:

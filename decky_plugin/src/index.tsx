@@ -23,6 +23,7 @@ import { MdVerified } from "react-icons/md";
 
 // Call backend methods
 const getServiceStatus = callable<[], any>("get_service_status");
+const ackLibraryAnnouncement = callable<[], any>("ack_library_announcement");
 const notifyNetworkState = callable<[boolean], any>("notify_network_state");
 const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number }> }>("drain_notifications");
 const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
@@ -3936,6 +3937,10 @@ let _prevConn: string | null = null;
 // saturates the connection AND restarts sync at the same moment.
 let _offSamples = 0;
 
+// The ack is a round trip and this poll runs every 2s, so without this the same
+// announcement toasts two or three times before the backend clears it.
+let _annShown = false;
+
 const checkForNotifications = async () => {
   try {
     // Connection-lost / restored toast — runs here (not in a component) so it
@@ -3969,6 +3974,31 @@ const checkForNotifications = async () => {
           }
           _prevConn = conn;
         }
+      }
+      // First-library-load toast. Fires from here rather than a component
+      // because the whole point is the user who wandered off to Steam during
+      // the ~12s first fetch. The backend only ever raises this once per
+      // device — see _announce_library — so there's no rate limiting to do
+      // here, and routine reconnects stay silent.
+      const ann = st?.library_announcement;
+      if (ann?.kind && !_annShown) {
+        _annShown = true;   // stop the next 2s tick re-toasting before the ack lands
+        if (ann.kind === 'ready') {
+          toaster.toast({
+            title: 'Your library is ready',
+            body: `${(ann.games ?? 0).toLocaleString()} games from RomM`,
+            duration: 6000,
+            onClick: () => { try { Navigation.Navigate('/romm-sync-library'); } catch { /* ignore */ } },
+          });
+        } else {
+          toaster.toast({
+            title: "Couldn't load your library",
+            body: "Ludo can't reach your RomM server. Check that it's running, then try again from Settings.",
+            duration: 8000,
+            onClick: () => { try { Navigation.Navigate('/romm-sync-settings'); } catch { /* ignore */ } },
+          });
+        }
+        try { await ackLibraryAnnouncement(); } catch { /* retried next load */ }
       }
     } catch { /* transient */ }
 
@@ -5610,8 +5640,19 @@ function OfflineBanner({ status }: { status: any }) {
   let dot = V2.warning, title = '', detail = '';
   if (conn === 'connecting') {
     dot = V2.fgMuted;
-    title = 'Connecting to RomM…';
-    detail = 'Your downloaded games are ready to play in the meantime.';
+    // Connecting is over in well under a second; the rest of the wait is the
+    // library, so say so and put a number on it. A count that moves is what
+    // separates "busy" from "hung" — which is the whole reason a big library
+    // felt broken. No percentage bar: it implies an ETA we can't honour when
+    // the server stalls mid-fetch.
+    const prog = status?.library_progress;
+    if (prog?.total > 0) {
+      title = 'Loading your library…';
+      detail = `${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} games — you can play your downloaded games meanwhile.`;
+    } else {
+      title = prog ? 'Loading your library…' : 'Connecting to RomM…';
+      detail = 'Your downloaded games are ready to play in the meantime.';
+    }
   } else if (conn === 'offline_cached') {
     dot = V2.warning;
     title = noNetwork
