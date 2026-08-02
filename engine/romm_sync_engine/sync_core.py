@@ -6078,6 +6078,45 @@ class RetroArchInterface:
             cmd.extend(['--appendconfig', overlay])
         return cmd, None
 
+    # RetroArch's input_menu_toggle_gamepad_combo, "L3 + R3" — the second entry
+    # after "None" in its own list, and the one RetroDECK settles on.
+    MENU_TOGGLE_L3_R3 = '2'
+
+    def _menu_toggle_combo(self):
+        """The gamepad combo to give RetroArch's menu for this launch, or ''.
+
+        L3 + R3 — both analog sticks clicked in. With no combo bound, the only
+        way into RetroArch's menu on a controller is the guide button, and that
+        button belongs to Steam: in Gaming Mode it raises the Steam overlay over
+        the game, never reaching the emulator. RetroDECK binds this combo for
+        exactly that reason.
+
+        Three gates, because this is only ever the right answer in one place:
+
+          * Gaming Mode only (a gamescope session). In a desktop session — GNOME
+            on Bazzite/Fedora, Big Picture, the Decky plugin running on a normal
+            desktop — the guide button is not a problem worth solving this way:
+            the emulator has its own window, its own keyboard hotkey, and the
+            user has a desktop to alt-tab around. Rebinding their sticks there
+            is an unasked-for change to how their emulator behaves.
+          * Not RetroDECK. It manages its own retroarch.cfg and already binds
+            this combo; layering our copy over it can only cause drift.
+          * Only when the user has expressed no preference ('0' is RetroArch's
+            default for "no combo"). A chosen binding is theirs, and this file
+            overrides retroarch.cfg for the session.
+        """
+        try:
+            if not self._gamescope_running():
+                return ''
+            if self.is_retrodeck_installation():
+                return ''
+            current = self._retroarch_cfg_value('input_menu_toggle_gamepad_combo')
+        except Exception:
+            return ''
+        if current not in ('', '0'):
+            return ''
+        return self.MENU_TOGGLE_L3_R3
+
     def _launch_overlay_config(self):
         """Write the per-launch config overlay and return its path, or ''.
 
@@ -6094,12 +6133,14 @@ class RetroArchInterface:
             cfg_dir = Path(cfg_dir)
             cfg_dir.mkdir(parents=True, exist_ok=True)
             overlay = cfg_dir / 'ludo-launch.cfg'
-            overlay.write_text(
-                '# Written by Ludo before each launch. RetroArch layers this\n'
-                '# over its own configuration for this session only.\n'
-                'network_cmd_enable = "true"\n'
-                f'network_cmd_port = "{self.port}"\n',
-                encoding='utf-8')
+            lines = ['# Written by Ludo before each launch. RetroArch layers this',
+                     '# over its own configuration for this session only.',
+                     'network_cmd_enable = "true"',
+                     f'network_cmd_port = "{self.port}"']
+            combo = self._menu_toggle_combo()
+            if combo:
+                lines.append(f'input_menu_toggle_gamepad_combo = "{combo}"')
+            overlay.write_text('\n'.join(lines) + '\n', encoding='utf-8')
             return str(overlay)
         except Exception as e:
             print(f"⚠️  Could not write the launch config overlay: {e}")
