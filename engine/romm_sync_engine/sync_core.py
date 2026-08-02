@@ -27,7 +27,7 @@ import re
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import queue
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 
 # Recent-activity feed (Decky Settings UI). Optional so the desktop app —
 # which shares this module without py_modules/activity_log — degrades to no-op.
@@ -764,6 +764,107 @@ def _is_own_appimage(name):
         return True
     # Whatever this build calls itself, in case either name ever changes.
     return client_name().lower() in low or app_id().lower() in low
+
+
+# ---------------------------------------------------------------------------
+# Standalone emulators
+#
+# A handful of platforms have no usable libretro core, so a core-based launch
+# can never work for them no matter how many cores are installed. For those we
+# hand the ROM to an external emulator instead: find its executable, then run a
+# fixed argv template. Nothing else about it is ours to manage — no cores, no
+# save dirs, no config.
+#
+# `platforms` are matched case-insensitively against the RomM platform name AND
+# slug, as a substring of the platform name, so "Nintendo Switch", "switch" and
+# "Nintendo - Switch" all land on the same entry.
+# `args` is the argv after the executable; '{rom}' is replaced with the ROM path.
+# ---------------------------------------------------------------------------
+STANDALONE_EMULATORS = {
+    'eden': {
+        'name': 'Eden',
+        'platforms': ('nintendo switch', 'switch'),
+        'flatpak_id': 'dev.eden_emu.eden',
+        # Gear Lever installs land in ~/AppImages as a lowercase 'eden.appimage',
+        # so the match is on the stem rather than the official casing.
+        'binaries': ('eden',),
+        'args': ('-f', '-g', '{rom}'),
+    },
+}
+
+
+def _standalone_appimage_dirs():
+    """Directories to scan for a standalone emulator's AppImage, best first.
+
+    ~/AppImages comes first because that is where Gear Lever — the usual way an
+    AppImage gets "installed" on an immutable desktop — puts them.
+    """
+    home = Path.home()
+    return [home / 'AppImages', home / 'Applications', home / '.local/bin',
+            home / 'Applications/AppImages', home / 'Downloads', Path('/opt')]
+
+
+def find_standalone_executable(key, spec, settings=None):
+    """Locate the emulator for `key`, or '' when it isn't installed.
+
+    Order: an explicit user override, then flatpak, then an AppImage in the
+    usual places, then PATH. The override wins outright so a user with two
+    copies can say which one Ludo launches.
+    """
+    if settings is not None:
+        try:
+            custom = (settings.get('Emulators', f'{key}_path', '') or '').strip()
+        except Exception:
+            custom = ''
+        if custom and Path(custom).expanduser().exists():
+            return str(Path(custom).expanduser())
+
+    app_id_ = spec.get('flatpak_id')
+    if app_id_ and flatpak_app_installed(app_id_):
+        return f'flatpak:{app_id_}'
+
+    names = tuple(n.lower() for n in spec.get('binaries', ()))
+    for location in _standalone_appimage_dirs():
+        try:
+            if not location.is_dir():
+                continue
+            for entry in sorted(location.iterdir()):
+                low = entry.name.lower()
+                if not low.endswith('.appimage'):
+                    continue
+                if _is_own_appimage(entry.name):
+                    continue
+                stem = low[:-len('.appimage')]
+                # Startswith, not contains: an AppImage merely mentioning the
+                # emulator (a launcher, a sibling tool) is not the emulator.
+                if any(stem.startswith(n) for n in names):
+                    if entry.is_file() and os.access(entry, os.X_OK):
+                        return str(entry)
+        except Exception:
+            continue
+
+    for name in spec.get('binaries', ()):
+        found = shutil.which(name)
+        if found:
+            return found
+    return ''
+
+
+def standalone_emulator_for_platform(platform_name, platform_slug=None):
+    """(key, spec) for the standalone emulator that owns this platform, or None.
+
+    Says nothing about whether it is installed — that is a separate question,
+    and the two are worth keeping apart: "Switch is not a core platform" stays
+    true whether or not Eden is on disk.
+    """
+    haystack = ' '.join(str(x or '').lower() for x in (platform_name, platform_slug))
+    if not haystack.strip():
+        return None
+    for key, spec in STANDALONE_EMULATORS.items():
+        for token in spec['platforms']:
+            if token in haystack:
+                return key, spec
+    return None
 
 
 def detect_retrodeck():
@@ -3890,10 +3991,12 @@ class RomMClient:
                 now = datetime.datetime.now()
                 timestamp = now.strftime("%Y-%m-%d %H-%M-%S-%f")[:-3]
 
-            # Extract base name (remove timestamp and extension)
-            base_name_match = re.match(r'^(.+?)\s*\[', save_state_filename)
-            if base_name_match:
-                base_name = base_name_match.group(1).strip()
+            # Extract base name (everything before the timestamp bracket). Cut at
+            # the timestamp itself, not at the first '[': ROM names carry bracket
+            # tags of their own ("... (US)[!]"), and a non-greedy match dropped
+            # them — leaving a screenshot whose name no longer matched its state.
+            if timestamp_match:
+                base_name = save_state_filename[:timestamp_match.start()].strip()
             else:
                 base_name = Path(save_state_filename).stem
                 base_name = re.sub(r'\s*\[.*?\]', '', base_name)
@@ -5292,6 +5395,10 @@ class RetroArchInterface:
             'save_dirs': {k: str(v) for k, v in (self.save_dirs or {}).items()},
             'bios_dir': str((self.bios_manager and self.bios_manager.system_dir) or ''),
             'stale_paths': self.stale_emulator_paths(),
+            # Standalone emulators, which are a separate axis from 'installed'
+            # above: their platforms are playable with no RetroArch at all, so
+            # the UI must not dim Play for them on a RetroArch-less machine.
+            'standalone': self.standalone_emulators_status(),
             # The RAW configured values, so the UI can tell "the user set this"
             # from "we detected it". get_config() merges in fallbacks, which is
             # right for the wizard but hides the difference here.
@@ -6270,8 +6377,47 @@ class RetroArchInterface:
             'nds': ['desmume', 'melonds', 'melondsds'],
     }
 
+    def standalone_emulator_status(self, platform_name, platform_slug=None):
+        """What we know about the standalone emulator for a platform, or {}.
+
+        {key, name, executable, installed} — empty when the platform is served
+        by libretro cores like everything else.
+        """
+        match = standalone_emulator_for_platform(platform_name, platform_slug)
+        if not match:
+            return {}
+        key, spec = match
+        exe = find_standalone_executable(key, spec, self.settings)
+        return {'key': key, 'name': spec['name'], 'executable': exe,
+                'installed': bool(exe)}
+
+    def standalone_emulators_status(self):
+        """Every standalone emulator Ludo knows about, and whether it's here.
+
+        [{key, name, installed, executable, platforms}] — the UI uses the
+        platform tokens to decide whether a given game is playable, so they
+        travel with the entry rather than being duplicated in the frontend.
+        """
+        out = []
+        for key, spec in STANDALONE_EMULATORS.items():
+            try:
+                exe = find_standalone_executable(key, spec, self.settings)
+            except Exception:
+                exe = ''
+            out.append({'key': key, 'name': spec['name'],
+                        'installed': bool(exe), 'executable': exe,
+                        'platforms': list(spec['platforms'])})
+        return out
+
+    def build_standalone_launch_command(self, rom_path, key, spec, executable):
+        """argv for a standalone emulator, from its args template."""
+        args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
+        if executable.startswith('flatpak:'):
+            return ['flatpak', 'run', executable.split(':', 1)[1]] + args
+        return [executable] + args
+
     def build_launch_command(self, rom_path, platform_name=None, core_name=None,
-                             entry_slot=None):
+                             entry_slot=None, platform_slug=None):
         """Resolve the exact emulator argv for a ROM, without launching it.
 
         Returns (cmd_list, error). On success error is None. Shared by both the
@@ -6282,6 +6428,20 @@ class RetroArchInterface:
         --entryslot N, where 0 is "<rom>.state" and N is "<rom>.stateN") —
         used by "resume from Continue playing".
         """
+        # Standalone emulators come first, and deliberately do not require
+        # RetroArch to exist at all: a Switch ROM is playable on a machine that
+        # has only Eden installed, and every RetroArch-shaped step below (core
+        # resolution, the config overlay, --entryslot) is meaningless for it.
+        standalone = self.standalone_emulator_status(platform_name, platform_slug)
+        if standalone:
+            if not standalone['installed']:
+                return None, (f"{standalone['name']} is not installed — "
+                              f"{platform_name} needs it, no core can run it")
+            key = standalone['key']
+            return self.build_standalone_launch_command(
+                rom_path, key, STANDALONE_EMULATORS[key],
+                standalone['executable']), None
+
         if not self.retroarch_executable:
             return None, "RetroArch executable not found"
 
@@ -6439,16 +6599,20 @@ class RetroArchInterface:
         return core_path
 
     def launch_game(self, rom_path, platform_name=None, core_name=None,
-                    entry_slot=None):
-        """Launch a game in RetroArch with multi-installation support"""
-        if not self.retroarch_executable:
+                    entry_slot=None, platform_slug=None):
+        """Launch a game in RetroArch (or the platform's standalone emulator)."""
+        standalone = self.standalone_emulator_status(platform_name, platform_slug)
+        # The RetroArch guard is skipped for standalone platforms on purpose:
+        # Eden playing a Switch ROM does not need RetroArch to be installed.
+        if not standalone and not self.retroarch_executable:
             return False, "RetroArch executable not found"
 
         # RetroDECK is handled inside build_launch_command (run its bundled
         # RetroArch with the core, booting straight into the game — not the
         # RetroDECK frontend), so no special early-return here anymore.
         cmd, err = self.build_launch_command(rom_path, platform_name, core_name,
-                                             entry_slot=entry_slot)
+                                             entry_slot=entry_slot,
+                                             platform_slug=platform_slug)
         if err:
             return False, err
         # Recover the resolved core name for the success message below.
@@ -6469,7 +6633,8 @@ class RetroArchInterface:
 
             # On Steam Deck Gaming Mode (gamescope) the daemon-spawned window
             # won't gain focus on its own; tag it so gamescope shows it.
-            self._focus_window_after_launch(result, match='retroarch')
+            self._focus_window_after_launch(
+                result, match=(standalone['key'] if standalone else 'retroarch'))
 
             # Wait a moment to see if it fails immediately
             import time
@@ -6494,6 +6659,8 @@ class RetroArchInterface:
                 print(error_msg)
                 return False, error_msg
 
+            if standalone:
+                return True, f"Launched {rom_path.name} in {standalone['name']}"
             return True, f"Launched {rom_path.name} with {core_name} core"
             
         except Exception as e:
@@ -8601,6 +8768,20 @@ class AutoSyncManager:
         self.current_retroarch_game = None
         self.retroarch_running = False
 
+        # Bumped after every completed session save-sync. The UI has no other
+        # way to learn that a play session ended and changed what the server
+        # knows (last_played, new states): the emulator runs outside it, so
+        # rows built from that data stayed stale until the app restarted.
+        self.session_epoch = 0
+
+        # Launched-content aliases: on-disk stem -> rom_id. A ROM downloaded as
+        # an archive can extract to files named nothing like the RomM entry (a
+        # GDI dump's "<title> v1.004 ...gdi" inside "<title>.zip"), and RetroArch
+        # names saves/states after the file it booted. Nothing on the server
+        # carries that name, so name matching cannot attribute those saves — but
+        # we launched the file, so we know. Bounded: only recent launches matter.
+        self._launch_aliases = OrderedDict()
+
         # Add lock mechanism
         self.lock = AutoSyncLock()
         self.instance_id = f"{'gui' if parent_window else 'daemon'}_{os.getpid()}"
@@ -9214,10 +9395,18 @@ class AutoSyncManager:
             games = self.get_games()
             matching_game = None
 
+            # A game we launched ourselves is already identified — trust that
+            # over name matching, which cannot know an extracted archive's
+            # internal filenames.
+            alias_id = self._rom_id_for_launch_alias(rom_stem)
+            if alias_id:
+                matching_game = next(
+                    (g for g in games if g.get('rom_id') == alias_id), None)
+
             # DEBUG: Log what we're trying to match
             
 
-            for game in games:
+            for game in ([] if matching_game else games):
                 game_filename = game.get('file_name', '')
                 game_stem = Path(game_filename).stem if game_filename else ''
                 game_name = game.get('name', '')
@@ -10149,6 +10338,10 @@ class AutoSyncManager:
             except Exception as e:
                 self.log(f"❌ Session save-sync failed: {e}")
             finally:
+                # After the sync, not before: whoever is watching this epoch
+                # wants the state the server holds once this session's uploads
+                # have landed.
+                self.session_epoch += 1
                 self._session_sync_lock.release()
 
         threading.Thread(target=_run, daemon=True, name="romm-session-sync").start()
@@ -10425,6 +10618,12 @@ class AutoSyncManager:
             import re
             clean_basename = re.sub(r'\s*\[.*?\]', '', save_basename)
 
+            # TIER 0: the file we launched. Saves are named after it, and for an
+            # extracted archive no server-side name will ever match it.
+            alias_id = self._rom_id_for_launch_alias(save_basename, clean_basename)
+            if alias_id:
+                return alias_id
+
             # DEBUG: Log what we're trying to match
             
 
@@ -10656,6 +10855,36 @@ class AutoSyncManager:
             return ''
         normalized = romm_emulator.lower().replace('-', '_')
         return core_to_platform.get(normalized, romm_emulator)
+
+    # How many launches to remember. Only the running session is ever consulted;
+    # a few spare entries cover a quick game-to-game hop.
+    _LAUNCH_ALIAS_LIMIT = 8
+
+    def note_launch_content(self, game, launch_path):
+        """Record that `game` was launched as `launch_path`.
+
+        RetroArch reports and names saves after the file it booted, which for an
+        extracted archive need not resemble anything RomM knows. Registering the
+        real on-disk stem here is what lets save attribution find its way back to
+        the ROM (see _rom_id_for_launch_alias)."""
+        try:
+            rom_id = game.get('rom_id')
+            stem = Path(launch_path).stem
+            if not rom_id or not stem:
+                return
+            self._launch_aliases.pop(stem, None)
+            self._launch_aliases[stem] = rom_id
+            while len(self._launch_aliases) > self._LAUNCH_ALIAS_LIMIT:
+                self._launch_aliases.popitem(last=False)
+        except Exception as e:
+            logging.debug(f"could not record launch alias: {e}")
+
+    def _rom_id_for_launch_alias(self, *names):
+        """rom_id for any of these on-disk names, or None."""
+        for n in names:
+            if n and n in self._launch_aliases:
+                return self._launch_aliases[n]
+        return None
 
     def sync_before_launch(self, game, core_name=None):
         """Sync saves before launching a specific game.

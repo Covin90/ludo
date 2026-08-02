@@ -84,7 +84,7 @@ const prepareSteamLaunch = callable<[number, (string | null)?, (number | null)?,
 // own screenshot, used as that row's art.
 const getResumeStateEnabled = callable<[], boolean>("get_resume_state_enabled");
 const setResumeStateEnabled = callable<[boolean], boolean>("set_resume_state_enabled");
-const getStateThumbnails = callable<[number[]], any>("get_state_thumbnails");
+const getStateThumbnails = callable<[number[], (boolean)?], any>("get_state_thumbnails");
 const getSessionHostPath = callable<[], any>("get_session_host_path");
 // BIOS inventory: what RomM holds per platform vs. what's in RetroArch's system
 // dir. Distinct from get_bios_status, which reports background download progress.
@@ -93,6 +93,7 @@ const downloadBios = callable<[string, (string)?], any>("download_bios");
 const getLocalDiscs = callable<[number], any>("get_local_discs");
 const getLocalSiblings = callable<[number], any>("get_local_siblings");
 const getHomeData = callable<[], any>("get_home_data");
+const getSyncEpoch = callable<[], any>("get_sync_epoch");
 const getPluginLogo = callable<[], any>("get_plugin_logo");
 const getRommArtwork = callable<[], any>("get_romm_artwork");
 const getRommLogo = callable<[], any>("get_romm_logo");
@@ -1324,8 +1325,13 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
   const doLaunch = async () => {
     if (busy) return;
     // A on a tile has no dimmed state to read, so say it out loud instead.
-    if (_emuStatus && !_emuStatus.installed) {
-      toaster.toast({ title: 'No emulator', body: 'Install RetroArch from Home to play this.' });
+    if (cannotLaunch(_emuStatus, game.platform, game.platform_slug)) {
+      const alt = standaloneFor(_emuStatus, game.platform, game.platform_slug);
+      toaster.toast({
+        title: 'No emulator',
+        body: alt ? `${alt.name} is not installed — ${game.platform || 'this platform'} needs it.`
+                  : 'Install RetroArch from Home to play this.',
+      });
       return;
     }
     setBusy('launch');
@@ -1755,6 +1761,11 @@ type EmuStalePath = {
   section: string; key: string; label: string; kind: string;
   value: string; reason: string; suggested: string;
 };
+type EmuStandalone = {
+  key: string; name: string; installed: boolean; executable: string;
+  // Lowercase tokens matched against a game's platform name and slug.
+  platforms: string[];
+};
 type EmuStatus = {
   installed: boolean;
   kind: 'retrodeck' | 'flatpak' | 'snap' | 'native' | 'none';
@@ -1762,6 +1773,9 @@ type EmuStatus = {
   cores_dir: string | null;
   core_count: number;
   stale_paths: EmuStalePath[];
+  // Emulators outside RetroArch that own a platform outright (Eden for Switch).
+  // Independent of `installed` above: their games play with no RetroArch here.
+  standalone: EmuStandalone[];
   save_dirs: Record<string, string>;
   bios_dir: string;
   // Raw configured values by kind — '' means "not set, we detect it".
@@ -1800,6 +1814,7 @@ async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
           cores_dir: r.cores_dir || null,
           core_count: r.core_count || 0,
           stale_paths: r.stale_paths || [],
+          standalone: r.standalone || [],
           save_dirs: r.save_dirs || {},
           bios_dir: r.bios_dir || '',
           configured_paths: r.configured_paths || {},
@@ -1814,6 +1829,28 @@ async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
   })();
   _emuInflight = run;
   return run;
+}
+
+// The standalone emulator that owns a game's platform, installed or not — Eden
+// for a Switch ROM. Matched on the same tokens the backend uses, against both
+// the platform name and its slug, so "Nintendo Switch" and "switch" both hit.
+function standaloneFor(status: EmuStatus | null,
+                       platform?: string | null,
+                       slug?: string | null): EmuStandalone | null {
+  if (!status?.standalone?.length) return null;
+  const hay = `${platform || ''} ${slug || ''}`.toLowerCase();
+  if (!hay.trim()) return null;
+  return status.standalone.find((s) => s.platforms.some((p) => hay.includes(p))) || null;
+}
+
+// True when this game can't be launched: no RetroArch, and no standalone
+// emulator that covers its platform either.
+function cannotLaunch(status: EmuStatus | null,
+                      platform?: string | null, slug?: string | null): boolean {
+  if (status == null) return false;
+  const alt = standaloneFor(status, platform, slug);
+  if (alt) return !alt.installed;   // its platform never uses a core
+  return !status.installed;
 }
 
 function useEmulatorStatus(): EmuStatus | null {
@@ -3028,16 +3065,25 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
           {done ? (
             <UserMenuRow icon={<FaPlay size={14} />} label="Play now" onSelect={playNow} />
           ) : !gap.can_download ? (
-            <div style={{ padding: '4px 12px 10px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
-              {gap.download_reason
-                || 'Cores cannot be installed from here. Add one in RetroArch, then try again.'}
-            </div>
+            // Dead ends still need a focusable row: without one nothing inside
+            // the panel takes gamepad focus, so B never reaches this modal and
+            // navigates the page behind it instead.
+            <>
+              <div style={{ padding: '4px 12px 10px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
+                {gap.download_reason
+                  || 'Cores cannot be installed from here. Add one in RetroArch, then try again.'}
+              </div>
+              <CoreDeadEndActions closeModal={closeModal} />
+            </>
           ) : !gap.candidates.length ? (
-            <div style={{ padding: '4px 12px 10px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
-              No core for {gap.platform_name} is available from the libretro
-              buildbot for this system. You can install one inside RetroArch and
-              pick it in Settings ▸ Emulator Cores.
-            </div>
+            <>
+              <div style={{ padding: '4px 12px 10px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
+                No core for {gap.platform_name} is available from the libretro
+                buildbot for this system. You can install one inside RetroArch and
+                pick it in Settings ▸ Emulator Cores.
+              </div>
+              <CoreDeadEndActions closeModal={closeModal} />
+            </>
           ) : (
             <>
               <CoreOption core={recommended} recommended busy={busy === recommended}
@@ -3067,6 +3113,20 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
         </Focusable>
       </Focusable>
     </ModalRoot>
+  );
+}
+
+// Rows for the branches that have no core to offer. "Manage cores" is the only
+// way forward from here; "Close" exists so the panel always owns focus.
+function CoreDeadEndActions({ closeModal }: { closeModal?: () => void }) {
+  return (
+    <>
+      <div style={{ height: '1px', background: V2.border, margin: '4px' }} />
+      <UserMenuRow icon={<FaCog size={14} />} label="Manage cores"
+        onSelect={() => { closeModal?.(); libNavigate('/romm-sync-cores'); }} />
+      <UserMenuRow icon={<FaTimes size={14} />} label="Close"
+        onSelect={() => closeModal?.()} />
+    </>
   );
 }
 
@@ -5443,7 +5503,19 @@ let _stateThumbsInflight: Promise<void> | null = null;
 // 15-card row into 15 websocket round-trips, each of which could fall through
 // to its own RomM request; batched, the backend overlaps the misses on a thread
 // pool and answers once. Resolves when the map has been filled.
-async function loadStateThumbs(romIds: number[]): Promise<void> {
+// A play session creates or replaces save states, and "this game has no state"
+// is cached as null just as firmly as a picture — so after playing, the row
+// would keep showing box art until the next app start. Drop the lot; the row's
+// own effect refetches, and a Continue-playing-sized batch is one call.
+const _stateThumbListeners = new Set<() => void>();
+function invalidateStateThumbs() {
+  _stateThumbs.clear();
+  // Clearing alone isn't enough: the row refetches from an effect keyed on the
+  // games it shows, and after a session those are usually the same games.
+  _stateThumbListeners.forEach((l) => { try { l(); } catch { } });
+}
+
+async function loadStateThumbs(romIds: number[], force = false): Promise<void> {
   const missing = romIds.filter((id) => !_stateThumbs.has(id));
   if (!missing.length) return;
   if (_stateThumbsInflight) await _stateThumbsInflight;
@@ -5451,7 +5523,7 @@ async function loadStateThumbs(romIds: number[]): Promise<void> {
   if (!still.length) return;
   _stateThumbsInflight = (async () => {
     try {
-      const r = await getStateThumbnails(still);
+      const r = await getStateThumbnails(still, force);
       const thumbs = r?.thumbs || {};
       // Absent keys are recorded as null too: the backend answered, and without
       // this the next visit would ask again for the same nothing.
@@ -5491,14 +5563,24 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   // One batched fetch for the whole row, started as soon as the games are known
   // — not per tile, and not gated on anything else finishing.
   const [thumbTick, setThumbTick] = useState(0);
+  // Bumped when a play session invalidates the cache, so the fetch below reruns
+  // even though the row is showing the same games it was before.
+  const [thumbEpoch, setThumbEpoch] = useState(0);
+  useEffect(() => {
+    const l = () => setThumbEpoch((e) => e + 1);
+    _stateThumbListeners.add(l);
+    return () => { _stateThumbListeners.delete(l); };
+  }, []);
   useEffect(() => {
     if (!resumeStates || !continuePlaying.length) return;
     let alive = true;
-    loadStateThumbs(continuePlaying.map((g) => g.rom_id))
+    // After a session, force: the backend's own memory cache is keyed per rom,
+    // so without this it would hand back the picture from the PREVIOUS state.
+    loadStateThumbs(continuePlaying.map((g) => g.rom_id), thumbEpoch > 0)
       .then(() => { if (alive) setThumbTick((t) => t + 1); })
       .catch(() => { /* the row keeps its existing art */ });
     return () => { alive = false; };
-  }, [resumeStates, continuePlaying]);
+  }, [resumeStates, continuePlaying, thumbEpoch]);
 
   useEffect(() => {
     let alive = true;
@@ -7793,6 +7875,10 @@ function regionDisplayLabel(fname: string): string {
 // unavailable) it falls back to the direct daemon launch.
 async function launchGameSmart(romId: number, disc: string | null = null,
   siblingRomId: number | null = null, resume: boolean = false): Promise<any> {
+  // Armed here rather than per caller so every way into a game — tile, disc
+  // picker, region picker, resume — gets its rows refreshed when it ends. A
+  // launch that never starts is harmless: the watcher gives up on its own.
+  watchForSessionEnd();
   try {
     // Re-resolve the live tile appid: SetShortcutExe renumbers it (appid is a
     // hash of exe+name), so a cached _rommAppId can be stale.
@@ -7850,6 +7936,40 @@ function offerCoreInstall(r: any, retry: () => void): boolean {
       onPlay={retry} />
   );
   return true;
+}
+
+// Refresh what a play session changed, once it has actually ended.
+//
+// The emulator is a separate process that takes over the screen, so nothing in
+// the UI observes the session: Continue playing (RomM's server-side
+// last_played) and the resume screenshots both only change after the
+// end-of-session save-sync uploads. Without this the row was a restart behind —
+// the game just played wasn't in it, and its new state had no thumbnail.
+//
+// The backend's sync epoch advances when that sync completes, so poll it until
+// it moves. Cheap (an int over the existing RPC channel) and self-limiting.
+let _sessionWatch: any = null;
+function watchForSessionEnd() {
+  if (_sessionWatch) return;   // one watcher is enough; launches are serial
+  const POLL_MS = 5000;
+  // ~4h. A session longer than this is possible, but a watcher that outlives
+  // its usefulness should stop rather than poll for the rest of the session.
+  const MAX_TICKS = 2880;
+  let ticks = 0;
+  let base: number | null = null;
+  const stop = () => { clearInterval(_sessionWatch); _sessionWatch = null; };
+  _sessionWatch = setInterval(async () => {
+    if (++ticks > MAX_TICKS) { stop(); return; }
+    try {
+      const e = (await getSyncEpoch())?.epoch;
+      if (typeof e !== 'number') return;
+      if (base === null) { base = e; return; }
+      if (e === base) return;
+      stop();
+      invalidateStateThumbs();
+      _broadcastLibRefresh();
+    } catch { /* transient — keep watching */ }
+  }, POLL_MS);
 }
 
 async function runLaunch(romId: number, gameName: string, disc: string | null,
@@ -8047,7 +8167,10 @@ function GameDetailPage() {
   // when focused. Downloading stays available — building a library before you
   // own an emulator is legitimate.
   const emu = useEmulatorStatus();
-  const noEmulator = emu != null && !emu.installed;
+  // Per-game, not global: a Switch ROM is playable on a machine with only Eden,
+  // and unplayable on one with only RetroArch — no core can run it either way.
+  const gameStandalone = standaloneFor(emu, game?.platform, game?.platform_slug);
+  const noEmulator = cannotLaunch(emu, game?.platform, game?.platform_slug);
   const [ctaFocused, setCtaFocused] = useState(false);
   // Land gamepad focus on the primary CTA (Play / Download) when the page
   // opens. As an internal view (LibraryRootPage) there is no route change, so
@@ -8361,7 +8484,9 @@ function GameDetailPage() {
                     : <FaPlay size={14} style={{ marginLeft: '2px' }} />} />
                 {noEmulator && ctaFocused && (
                   <span style={{ fontSize: '12px', color: V2.warning, maxWidth: '260px', lineHeight: 1.35 }}>
-                    No emulator installed — install RetroArch from Home to play.
+                    {gameStandalone
+                      ? `${gameStandalone.name} is not installed — ${game?.platform || 'this platform'} needs it to play.`
+                      : 'No emulator installed — install RetroArch from Home to play.'}
                   </span>
                 )}
                 <GameActionButton variant="surface" accent="danger" onClick={() => setConfirmDelete(true)}
@@ -9948,6 +10073,7 @@ function FoldersSection() {
           executable: r.executable || null, cores_dir: r.cores_dir || null,
           core_count: r.core_count ?? status.core_count,
           stale_paths: r.stale_paths || [], save_dirs: r.save_dirs || {},
+          standalone: r.standalone || status.standalone || [],
           bios_dir: r.bios_dir || '', configured_paths: r.configured_paths || {},
           default_paths: r.default_paths || status.default_paths || {},
           expected_paths: r.expected_paths || status.expected_paths || {},
