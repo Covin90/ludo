@@ -6216,12 +6216,17 @@ class RetroArchInterface:
         print(f"Available cores: {list(available_cores.keys())}")
         return None, None
 
-    def build_launch_command(self, rom_path, platform_name=None, core_name=None):
+    def build_launch_command(self, rom_path, platform_name=None, core_name=None,
+                             entry_slot=None):
         """Resolve the exact emulator argv for a ROM, without launching it.
 
         Returns (cmd_list, error). On success error is None. Shared by both the
         direct desktop launch (launch_game) and the Steam Deck session-host path
         (prepare_steam_launch in the Decky backend), so the two never drift.
+
+        `entry_slot` boots straight into a save state (RetroArch's
+        --entryslot N, where 0 is "<rom>.state" and N is "<rom>.stateN") —
+        used by "resume from Continue playing".
         """
         if not self.retroarch_executable:
             return None, "RetroArch executable not found"
@@ -6288,6 +6293,12 @@ class RetroArchInterface:
         overlay = self._launch_overlay_config()
         if overlay:
             cmd.extend(['--appendconfig', overlay])
+
+        # Boot into a state. Appended last so it survives every branch above,
+        # and only when a slot was actually resolved — RetroArch fails the
+        # launch outright if the entry state file isn't there.
+        if entry_slot is not None:
+            cmd.extend(['--entryslot', str(int(entry_slot))])
         return cmd, None
 
     # RetroArch's input_menu_toggle_gamepad_combo, "L3 + R3" — the second entry
@@ -6373,7 +6384,8 @@ class RetroArchInterface:
             return '/app' + core_path[idx:]
         return core_path
 
-    def launch_game(self, rom_path, platform_name=None, core_name=None):
+    def launch_game(self, rom_path, platform_name=None, core_name=None,
+                    entry_slot=None):
         """Launch a game in RetroArch with multi-installation support"""
         if not self.retroarch_executable:
             return False, "RetroArch executable not found"
@@ -6381,7 +6393,8 @@ class RetroArchInterface:
         # RetroDECK is handled inside build_launch_command (run its bundled
         # RetroArch with the core, booting straight into the game — not the
         # RetroDECK frontend), so no special early-return here anymore.
-        cmd, err = self.build_launch_command(rom_path, platform_name, core_name)
+        cmd, err = self.build_launch_command(rom_path, platform_name, core_name,
+                                             entry_slot=entry_slot)
         if err:
             return False, err
         # Recover the resolved core name for the success message below.
@@ -9739,6 +9752,66 @@ class AutoSyncManager:
     # stores alongside each one.
     _STATE_RE = re.compile(r'^\.state(\d+)?(\.auto)?(\.png)?$', re.IGNORECASE)
 
+    def state_location_for_game(self, game, core_name=None):
+        """(states_base, target_dir, stem) for this game, or (None, None, '').
+
+        `target_dir` is the folder RetroArch will actually read states from for
+        this launch — which depends on its savestate-subdir mode and, in core
+        mode, on the core about to run. Shared by reconcile_game_states (which
+        moves files INTO it) and latest_state_slot (which reads what's there).
+        """
+        base = (getattr(self.retroarch, 'save_dirs', {}) or {}).get('states')
+        if not base:
+            return None, None, ''
+        base = Path(base)
+        local_path = game.get('local_path') or ''
+        stem = Path(local_path).stem if local_path else (game.get('name') or '')
+        if not stem:
+            return None, None, ''
+
+        mode = self.retroarch.get_save_subdir_mode('states')
+        if mode == 'content':
+            sub = self._content_dir_for_game(game) or game.get('platform_slug')
+            if not sub:
+                return None, None, ''
+            target_dir = base / sub
+        else:
+            core_dir = None
+            if core_name:
+                core_dir = base / self.retroarch.get_retroarch_directory_name(core_name)
+            target_dir = core_dir if (mode == 'core' and core_dir) else base
+        return base, target_dir, stem
+
+    def latest_state_slot(self, game, core_name=None):
+        """(slot, path) of this game's most recent save state, or (None, None).
+
+        Only looks where the imminent launch will read from, since that is the
+        only place RetroArch's --entryslot can load from; call it AFTER
+        reconcile_game_states, which is what puts the newest copy of each slot
+        there. Slot numbering matches RetroArch's own: "<stem>.state" is 0,
+        "<stem>.stateN" is N. ".state.auto" is skipped — RetroArch loads that
+        one itself when autoload is on, and it has no slot number to pass.
+        """
+        try:
+            _, target_dir, stem = self.state_location_for_game(game, core_name)
+            if not target_dir or not target_dir.is_dir():
+                return None, None
+            newest, newest_mtime, slot = None, -1.0, None
+            for f in target_dir.glob(stem + '.state*'):
+                if not f.is_file():
+                    continue
+                m = re.match(r'^\.state(\d*)$', f.name[len(stem):], re.IGNORECASE)
+                if not m:
+                    continue
+                mtime = f.stat().st_mtime
+                if mtime > newest_mtime:
+                    newest, newest_mtime = f, mtime
+                    slot = int(m.group(1)) if m.group(1) else 0
+            return slot, newest
+        except Exception as e:
+            print(f"⚠️  Could not resolve the latest save state: {e}")
+            return None, None
+
     def reconcile_game_states(self, game, core_name=None):
         """Put this game's save STATES where RetroArch will actually read them.
 
@@ -9757,26 +9830,9 @@ class AutoSyncManager:
         Returns a short description of what it did, or '' for nothing.
         """
         try:
-            base = (getattr(self.retroarch, 'save_dirs', {}) or {}).get('states')
-            if not base:
+            base, target_dir, stem = self.state_location_for_game(game, core_name)
+            if not target_dir:
                 return ''
-            base = Path(base)
-            local_path = game.get('local_path') or ''
-            stem = Path(local_path).stem if local_path else (game.get('name') or '')
-            if not stem:
-                return ''
-
-            mode = self.retroarch.get_save_subdir_mode('states')
-            if mode == 'content':
-                sub = self._content_dir_for_game(game) or game.get('platform_slug')
-                if not sub:
-                    return ''
-                target_dir = base / sub
-            else:
-                core_dir = None
-                if core_name:
-                    core_dir = base / self.retroarch.get_retroarch_directory_name(core_name)
-                target_dir = core_dir if (mode == 'core' and core_dir) else base
 
             # Group every copy by file name, so each slot is reconciled on its
             # own. ".backup" copies are Ludo's own pre-overwrite safety net and

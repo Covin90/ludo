@@ -76,10 +76,15 @@ const toggleCollectionSync = callable<[string, boolean], any>("toggle_collection
 const deleteCollectionRoms = callable<[string, string], any>("delete_collection_roms");
 const getDownloadProgress = callable<[number], any>("get_download_progress");
 const deleteGame = callable<[number], any>("delete_game");
-const launchGame = callable<[number, (string | null)?, (number | null)?], any>("launch_game");
+const launchGame = callable<[number, (string | null)?, (number | null)?, (boolean)?], any>("launch_game");
 // Steam Deck session-host launch: resolves argv + writes a launch-spec; the tile
 // is then RunGame'd so the emulator is a child of a Steam-tracked game (overlay).
-const prepareSteamLaunch = callable<[number, (string | null)?, (number | null)?], any>("prepare_steam_launch");
+const prepareSteamLaunch = callable<[number, (string | null)?, (number | null)?, (boolean)?], any>("prepare_steam_launch");
+// Continue playing: resume from the newest save state (opt-in) and the state's
+// own screenshot, used as that row's art.
+const getResumeStateEnabled = callable<[], boolean>("get_resume_state_enabled");
+const setResumeStateEnabled = callable<[boolean], boolean>("set_resume_state_enabled");
+const getStateThumbnails = callable<[number[]], any>("get_state_thumbnails");
 const getSessionHostPath = callable<[], any>("get_session_host_path");
 // BIOS inventory: what RomM holds per platform vs. what's in RetroArch's system
 // dir. Distinct from get_bios_status, which reports background download progress.
@@ -485,6 +490,27 @@ function ScreenshotArt({ path, onLoaded, onRatio }:
           if (w && h) onRatio?.(w / h);
         }}
         style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />}
+    </div>
+  );
+}
+
+// Save-state art — the same landscape box as ScreenshotArt, but for an image
+// the caller already holds (get_state_thumbnail returns the bytes inline, so
+// there is nothing left to fetch here).
+function StateArt({ uri, onLoaded, onRatio }:
+  { uri: string; onLoaded?: (uri: string | null) => void; onRatio?: (ratio: number) => void }) {
+  useEffect(() => { onLoaded?.(uri); }, [uri]);
+  return (
+    <div style={{
+      position: 'absolute', inset: 0, background: V2.coverPlaceholder,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <img src={uri}
+        onLoad={(e: any) => {
+          const w = e.target?.naturalWidth, h = e.target?.naturalHeight;
+          if (w && h) onRatio?.(w / h);
+        }}
+        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
     </div>
   );
 }
@@ -1135,9 +1161,15 @@ function useAutoFocus(ready: boolean, dep?: any) {
 // like the whole grid remounting). With stable props (game ref, useCallback'd
 // onOpen, useState setter onActiveCover) only the newly focused/blurred tile
 // re-renders for its own scale animation.
-const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef, index, onFocusIdx, focusable }:
-  { game: LibGame; onOpen: (g: LibGame) => void; onActiveCover: (uri: string | null) => void; focusRef?: React.Ref<any>; index?: number; onFocusIdx?: (i: number) => void; focusable?: boolean }) {
-  const wide = !!game.screenshot;
+// `resume` is set by the Continue playing row when the resume-from-state
+// setting is on: the tile then boots into the newest save state and shows that
+// state's own screenshot instead of the rom's marketing art.
+// `stateThumb` is fetched by the ROW, not here: one batched call fills every
+// card at once (see loadStateThumbs). Until it lands the card shows whatever art
+// it would otherwise have had, so the row never flashes empty.
+const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef, index, onFocusIdx, focusable, resume, stateThumb }:
+  { game: LibGame; onOpen: (g: LibGame) => void; onActiveCover: (uri: string | null) => void; focusRef?: React.Ref<any>; index?: number; onFocusIdx?: (i: number) => void; focusable?: boolean; resume?: boolean; stateThumb?: string | null }) {
+  const wide = !!game.screenshot || !!stateThumb;
   // Wide cards adopt the screenshot's NATURAL aspect ratio (RomM derives the
   // card width from the cover's true shape at a fixed height); 16:9 until loaded.
   const [shotRatio, setShotRatio] = useState(16 / 9);
@@ -1298,7 +1330,7 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
     }
     setBusy('launch');
     try {
-      const r = await launchGameSmart(game.rom_id);
+      const r = await launchGameSmart(game.rom_id, null, null, !!resume);
       // No success toast — the screen transitions to the launch immediately, so
       // the toast just races the thing it announces. Surface failures only.
       if (!r?.success && !offerCoreInstall(r, () => void doLaunch())) {
@@ -1414,12 +1446,18 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
       onSecondaryActionDescription="Details"
       onOptionsButton={() => { if (dl) requestDelete(); }}
       onOptionsActionDescription={dl ? (confirmDelete ? 'Confirm delete' : 'Delete') : undefined}
-      onOKActionDescription={dl ? (isMultiRegion ? 'Launch (hold: regions)' : isMultiDisc ? (discsAreRegion ? 'Launch (hold: regions)' : 'Launch (hold: discs)') : 'Launch') : 'Download'}
+      onOKActionDescription={dl ? (isMultiRegion ? 'Launch (hold: regions)' : isMultiDisc ? (discsAreRegion ? 'Launch (hold: regions)' : 'Launch (hold: discs)') : (resume ? 'Resume' : 'Launch')) : 'Download'}
       onFocus={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); if (index !== undefined) onFocusIdx?.(index); _tileFocusScrub(selfRef.current, game.name); }}
       onBlur={() => setFocused(false)}
       onMouseEnter={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); }}
       onMouseLeave={() => setFocused(false)}
-      style={{ cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: '7px' }}
+      style={{
+        cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: '7px',
+        // Resume tiles size themselves: the row can't know in advance whether a
+        // state screenshot will arrive and turn a portrait card landscape, so
+        // the portrait width lives here rather than on the row's wrapper.
+        ...(resume && !wide ? { width: '132px' } : {}),
+      }}
     >
       <div className="romm-gt-cover" style={{
         position: 'relative', overflow: 'hidden',
@@ -1433,7 +1471,9 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
       }}>
         {wide ? (
           <>
-            <ScreenshotArt path={game.screenshot!} onLoaded={(u) => { uriRef.current = u; }} onRatio={setShotRatio} />
+            {stateThumb
+              ? <StateArt uri={stateThumb} onLoaded={(u) => { uriRef.current = u; }} onRatio={setShotRatio} />
+              : <ScreenshotArt path={game.screenshot!} onLoaded={(u) => { uriRef.current = u; }} onRatio={setShotRatio} />}
             <CoverPip romId={game.rom_id} hasCover={game.has_cover} hidden={focused} />
           </>
         ) : (
@@ -5380,6 +5420,52 @@ function EmulatorBanner() {
   );
 }
 
+// Last known value of the resume-from-state preference. Persisted, because the
+// Home row has to decide how to draw itself on the FIRST frame: read from the
+// backend it arrives a round-trip late, and the row visibly re-lays-itself out
+// from box art to state screenshots every time Home opens.
+const _LS_RESUME_PREF = 'romm:resumestates:v1';
+let _resumeStatesPref = (() => {
+  try { return _lsAvail && localStorage.getItem(_LS_RESUME_PREF) === '1'; }
+  catch { return false; }
+})();
+function _setResumeStatesPref(v: boolean) {
+  _resumeStatesPref = v;
+  try { if (_lsAvail) localStorage.setItem(_LS_RESUME_PREF, v ? '1' : '0'); } catch { }
+}
+
+// Save-state screenshots for the Continue playing row, rom_id → data URI (null
+// = this game has no state picture). Module-level so returning to Home repaints
+// from memory instead of re-asking, and shared by every mount of the row.
+const _stateThumbs = new Map<number, string | null>();
+let _stateThumbsInflight: Promise<void> | null = null;
+// Fetches every missing thumbnail in ONE backend call. Per-tile calls turned a
+// 15-card row into 15 websocket round-trips, each of which could fall through
+// to its own RomM request; batched, the backend overlaps the misses on a thread
+// pool and answers once. Resolves when the map has been filled.
+async function loadStateThumbs(romIds: number[]): Promise<void> {
+  const missing = romIds.filter((id) => !_stateThumbs.has(id));
+  if (!missing.length) return;
+  if (_stateThumbsInflight) await _stateThumbsInflight;
+  const still = romIds.filter((id) => !_stateThumbs.has(id));
+  if (!still.length) return;
+  _stateThumbsInflight = (async () => {
+    try {
+      const r = await getStateThumbnails(still);
+      const thumbs = r?.thumbs || {};
+      // Absent keys are recorded as null too: the backend answered, and without
+      // this the next visit would ask again for the same nothing.
+      for (const id of still) _stateThumbs.set(id, thumbs[String(id)] ?? null);
+    } catch {
+      // Leave them unset so the next visit retries rather than caching a
+      // failure as "no state".
+    } finally {
+      _stateThumbsInflight = null;
+    }
+  })();
+  await _stateThumbsInflight;
+}
+
 function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   { onOpen: (g: LibGame) => void; onOpenGroup: (mode: string, g: LibGroup, gs: LibGroup[]) => void; onBg: (uri: string | null) => void; visible: boolean }) {
   // Seed from the module-level cache so re-mounting (tab switch back to Home)
@@ -5392,6 +5478,27 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   const [collections, setCollections] = useState<LibGroup[]>(c0?.collections || []);
   const [loading, setLoading] = useState(!c0);
   const offline = useOffline();
+  // "Resume from the newest save state" (Settings → Gameplay). Cached at module
+  // level so returning to Home doesn't re-ask the backend and re-render the row.
+  const [resumeStates, setResumeStates] = useState<boolean>(_resumeStatesPref);
+  useEffect(() => {
+    let alive = true;
+    getResumeStateEnabled()
+      .then((v) => { _setResumeStatesPref(!!v); if (alive) setResumeStates(!!v); })
+      .catch(() => { /* keep the last known answer */ });
+    return () => { alive = false; };
+  }, [visible]);
+  // One batched fetch for the whole row, started as soon as the games are known
+  // — not per tile, and not gated on anything else finishing.
+  const [thumbTick, setThumbTick] = useState(0);
+  useEffect(() => {
+    if (!resumeStates || !continuePlaying.length) return;
+    let alive = true;
+    loadStateThumbs(continuePlaying.map((g) => g.rom_id))
+      .then(() => { if (alive) setThumbTick((t) => t + 1); })
+      .catch(() => { /* the row keeps its existing art */ });
+    return () => { alive = false; };
+  }, [resumeStates, continuePlaying]);
 
   useEffect(() => {
     let alive = true;
@@ -5491,8 +5598,16 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
           {continuePlaying.map((g, i) => (
             // Screenshot cards size to their natural (landscape) width; games
             // with no screenshot fall back to the portrait 132px cover.
-            <div key={g.rom_id} style={{ flexShrink: 0, ...(g.screenshot ? {} : { width: '132px' }) }}>
-              <GameTile game={g} onOpen={onOpen} onActiveCover={onBg}
+            <div key={g.rom_id} style={{
+              flexShrink: 0,
+              // In resume mode the tile owns its width — a state screenshot can
+              // turn a portrait card landscape after this wrapper is laid out.
+              ...(resumeStates || g.screenshot ? {} : { width: '132px' }),
+            }}>
+              <GameTile game={g} onOpen={onOpen} onActiveCover={onBg} resume={resumeStates}
+                // thumbTick is what re-reads the module-level map once the batch
+                // lands; the value itself carries no meaning.
+                stateThumb={resumeStates && thumbTick >= 0 ? (_stateThumbs.get(g.rom_id) ?? null) : null}
                 focusRef={firstList === 'cp' && i === 0 ? firstRef : undefined} focusable={visible} />
             </div>
           ))}
@@ -7677,7 +7792,7 @@ function regionDisplayLabel(fname: string): string {
 // Steam-tracked child. Anywhere that fails (not gamescope, no tile, RunGame
 // unavailable) it falls back to the direct daemon launch.
 async function launchGameSmart(romId: number, disc: string | null = null,
-  siblingRomId: number | null = null): Promise<any> {
+  siblingRomId: number | null = null, resume: boolean = false): Promise<any> {
   try {
     // Re-resolve the live tile appid: SetShortcutExe renumbers it (appid is a
     // hash of exe+name), so a cached _rommAppId can be stale.
@@ -7685,7 +7800,7 @@ async function launchGameSmart(romId: number, disc: string | null = null,
     const appId = (liveIds.length ? liveIds[0] : (_rommAppId ?? await findRommShortcut()));
     if (appId != null) {
       _rommAppId = appId;
-      const prep = await prepareSteamLaunch(romId, disc, siblingRomId);
+      const prep = await prepareSteamLaunch(romId, disc, siblingRomId, resume);
       if (prep?.steam_host) {
         _rommLaunchPending = true;
         // Mark the session active HERE, not only in the GameActionStart
@@ -7714,7 +7829,7 @@ async function launchGameSmart(romId: number, disc: string | null = null,
       }
     }
   } catch (e) { console.error('[RomM] launchGameSmart', e); }
-  return await launchGame(romId, disc, siblingRomId);
+  return await launchGame(romId, disc, siblingRomId, resume);
 }
 
 // A launch that failed for a missing core: offer to install one and start the
@@ -10053,6 +10168,24 @@ function SettingsPage() {
     return () => clearTimeout(shapeTimer);
   }, []);
 
+  // Gameplay: resume Continue playing from the newest save state.
+  const [resumeStates, setResumeStates] = useState<boolean>(_resumeStatesPref);
+  useEffect(() => {
+    getResumeStateEnabled()
+      .then((v) => { _setResumeStatesPref(!!v); setResumeStates(!!v); })
+      .catch(() => { /* leave the last known value */ });
+  }, []);
+  const handleResumeStatesToggle = async (enabled: boolean) => {
+    setResumeStates(enabled);
+    _setResumeStatesPref(enabled);
+    try {
+      await setResumeStateEnabled(enabled);
+    } catch {
+      setResumeStates(!enabled);
+      _setResumeStatesPref(!enabled);
+    }
+  };
+
   const handleRdButtonToggle = async (enabled: boolean) => {
     setRdButton(enabled);
     try {
@@ -10450,6 +10583,16 @@ function SettingsPage() {
         opacity: shapeReady ? 1 : 0,
         transition: 'opacity 140ms ease-out',
       }}>
+      <V2SettingsSection title="Gameplay">
+        <V2SettingsRow
+          icon={<FaPlay size={16} />}
+          title="Resume from your last save state"
+          subtitle="Games started from Continue playing boot straight into their newest save state, and the row shows that state's screenshot. Games with no state start normally."
+          onClick={() => handleResumeStatesToggle(!resumeStates)}
+          right={<V2Switch checked={resumeStates} />}
+        />
+      </V2SettingsSection>
+
       {rdDetected && (
         <V2SettingsSection title="RetroDECK">
           <V2SettingsRow

@@ -3825,6 +3825,144 @@ class Plugin:
             logging.error(f"get_save_screenshot error: {e}", exc_info=True)
             return {'success': False, 'data_uri': None, 'message': str(e)}
 
+    # rom_ids whose thumbnail lookup came back empty, with the time it did.
+    # Only the *negative* answer needs a clock: a hit is fingerprinted by the
+    # file it came from, but "this game has no state" is proved by a directory
+    # scan plus (for games not downloaded here) a RomM round-trip, and repeating
+    # that for every rom on every visit to Home is the one cost with nothing to
+    # show for it.
+    _state_thumb_miss: dict = {}
+    _STATE_MISS_TTL = 300.0
+
+    def _state_thumb_blocking(self, rom_id: int):
+        """Data URI of the newest save state's screenshot, or None. Sync.
+
+        Local first: RetroArch writes a .png beside each state it saves, which
+        is both the freshest picture of where the player actually is and free
+        to read. Only when there is no local state (a game played on another
+        device, and not downloaded here) does this fall back to the server's
+        copy, which costs a RomM round-trip.
+
+        Everything is routed through the same two caches the cover art uses —
+        memory, then the on-disk thumbnail cache — and downscaled by
+        _store_thumb on the way in. A raw savestate PNG inlined as base64 is
+        several hundred KB crossing the websocket for a card 176px tall.
+        """
+        ck = ('state', rom_id)
+        hit = self._cover_cache_get(ck)
+        if hit is not None:
+            return hit
+        miss_at = self._state_thumb_miss.get(rom_id)
+        if miss_at is not None and (time.time() - miss_at) < self._STATE_MISS_TTL:
+            return None
+
+        def _finish(fp, raw, mime):
+            tkey = f"statet:{rom_id}:{fp}"
+            disk = self._disk_cover_get(tkey)
+            if disk:
+                self._cover_cache_put(ck, disk)
+                return disk
+            if raw is None:
+                return None
+            return self._store_thumb(ck, tkey, raw, mime, False)
+
+        g = self._games_index().get(rom_id)
+        if g:
+            core = None
+            try:
+                ra = self._retroarch
+                if ra:
+                    slug = (g.get('platform_slug')
+                            or (g.get('romm_data') or {}).get('platform_slug'))
+                    core, _ = ra.suggest_core_for_platform(
+                        self._platform_name_for(g), system_slug=slug)
+            except Exception:
+                pass
+            auto = self._auto_sync
+            state = None
+            if auto is not None:
+                try:
+                    _, state = auto.latest_state_slot(g, core)
+                except Exception:
+                    state = None
+            if state is not None and self._retroarch:
+                thumb = self._retroarch.find_thumbnail_for_save_state(state)
+                if thumb:
+                    thumb = Path(thumb)
+                    # The mtime alone identifies the picture: a new state in the
+                    # same slot rewrites this exact file.
+                    fp = f"l{int(thumb.stat().st_mtime)}"
+                    # The disk-cache probe inside _finish means the bytes are
+                    # only read (and re-encoded) when the thumbnail is new.
+                    if self._disk_cover_get(f"statet:{rom_id}:{fp}"):
+                        return _finish(fp, None, None)
+                    return _finish(fp, thumb.read_bytes(), 'image/png')
+
+        # No local state (or no thumbnail beside it) — ask the server.
+        if not (self._romm_client and self._romm_client.authenticated):
+            return None
+        _, states = self._romm_client.get_save_history(rom_id)
+        states = [s for s in (states or []) if s.get('screenshot')]
+        if not states:
+            self._state_thumb_miss[rom_id] = time.time()
+            return None
+        entry = max(states, key=lambda e: (e.get('updated_at')
+                                           or e.get('created_at') or ''))
+        fp = f"s{entry.get('id')}-{entry.get('updated_at') or ''}".replace(':', '')
+        if self._disk_cover_get(f"statet:{rom_id}:{fp}"):
+            return _finish(fp, None, None)
+        data = self._romm_client.fetch_screenshot_bytes(entry, 'states')
+        if not data:
+            self._state_thumb_miss[rom_id] = time.time()
+            return None
+        return _finish(fp, data, 'image/png')
+
+    async def get_state_thumbnail(self, rom_id: int):
+        """One game's save-state screenshot (see _state_thumb_blocking)."""
+        try:
+            uri = await asyncio.to_thread(self._state_thumb_blocking, rom_id)
+            return {'success': True, 'data_uri': uri}
+        except Exception as e:
+            logging.error(f"get_state_thumbnail error: {e}", exc_info=True)
+            return {'success': False, 'data_uri': None, 'message': str(e)}
+
+    async def get_state_thumbnails(self, rom_ids: list):
+        """Save-state screenshots for a whole row, in one call.
+
+        The Continue playing row wants up to fifteen of these at once. Asked one
+        at a time they serialise into fifteen round-trips over the websocket, and
+        the ones that fall through to the server serialise fifteen RomM requests
+        behind them — which is what made the row take seconds to fill in. Here
+        the misses overlap on a small pool (they are IO, not CPU) and the whole
+        row comes back as a single message.
+
+        Returns {'thumbs': {'<rom_id>': data_uri|None}}. Keys are strings
+        because this crosses JSON.
+        """
+        try:
+            ids = [int(r) for r in (rom_ids or [])][:40]
+            if not ids:
+                return {'success': True, 'thumbs': {}}
+
+            def _all():
+                from concurrent.futures import ThreadPoolExecutor
+                out = {}
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    futs = {pool.submit(self._state_thumb_blocking, r): r
+                            for r in ids}
+                    for f in futs:
+                        r = futs[f]
+                        try:
+                            out[str(r)] = f.result()
+                        except Exception as e:
+                            logging.warning(f"state thumb {r} failed: {e}")
+                            out[str(r)] = None
+                return out
+            return {'success': True, 'thumbs': await asyncio.to_thread(_all)}
+        except Exception as e:
+            logging.error(f"get_state_thumbnails error: {e}", exc_info=True)
+            return {'success': False, 'thumbs': {}, 'message': str(e)}
+
     async def restore_save_version(self, rom_id: int, save_id: int,
                                    save_type: str, as_copy: bool = False):
         """Restore a server save/state version to local disk.
@@ -5639,6 +5777,9 @@ class Plugin:
         silence, which reads as "my saves aren't there" and appears to fix itself
         only on the next app start. Never blocks the launch for long: five
         seconds, then go.
+
+        Returns the core name the launch will use, or None — the caller needs it
+        to find the states RetroArch is about to read (resume-from-state).
         """
         auto = self._auto_sync
         if auto is None and self._romm_client is not None:
@@ -5652,7 +5793,7 @@ class Plugin:
         if auto is None:
             logging.warning("launching without a pre-launch save sync — "
                             "sync is not connected yet")
-            return
+            return None
         try:
             # The emulator may have created its save tree since sync started
             # (first run after an install). Re-resolve BEFORE the session so the
@@ -5686,8 +5827,55 @@ class Plugin:
             await asyncio.to_thread(auto.reconcile_game_states, game, core)
         except Exception as e:
             logging.warning(f"could not reconcile save locations: {e}")
+        return core
 
-    async def launch_game(self, rom_id: int, disc: str = None, sibling_rom_id: int = None):
+    # -----------------------------------------------------------------------
+    # Resume from the latest save state (Continue playing)
+    # -----------------------------------------------------------------------
+
+    async def get_resume_state_enabled(self):
+        """Whether Continue playing resumes from the newest save state."""
+        try:
+            return bool(load_decky_settings().get('resume_state_from_continue', False))
+        except Exception as e:
+            logging.error(f"get_resume_state_enabled error: {e}")
+            return False
+
+    async def set_resume_state_enabled(self, enabled: bool):
+        try:
+            settings = load_decky_settings()
+            settings['resume_state_from_continue'] = bool(enabled)
+            save_decky_settings(settings)
+            return bool(enabled)
+        except Exception as e:
+            logging.error(f"set_resume_state_enabled error: {e}")
+            return False
+
+    def _resume_entry_slot(self, game: dict, core: str = None):
+        """RetroArch slot number to boot into for this game, or None.
+
+        None whenever anything is missing — no sync manager, no state on disk —
+        because --entryslot pointing at a file that isn't there aborts the
+        launch, and a game that won't start at all is far worse than a game
+        that starts at the title screen.
+        """
+        auto = self._auto_sync
+        if auto is None:
+            return None
+        try:
+            slot, path = auto.latest_state_slot(game, core)
+            if path is None:
+                logging.info(f"resume: no save state on disk for "
+                             f"{game.get('name', 'this game')} — normal launch")
+                return None
+            logging.info(f"resume: booting into slot {slot} ({path})")
+            return slot
+        except Exception as e:
+            logging.warning(f"could not resolve a state to resume: {e}")
+            return None
+
+    async def launch_game(self, rom_id: int, disc: str = None, sibling_rom_id: int = None,
+                          resume: bool = False):
         """Launch a downloaded game in RetroArch (A button on a downloaded card).
 
         `disc` optionally names a specific disc file inside a multi-disc folder
@@ -5696,6 +5884,9 @@ class Plugin:
         falling back to the first disc.
         `sibling_rom_id` optionally overrides the ROM to launch — used when the
         user picks a regional variant from the region picker.
+        `resume` asks to boot straight into the newest save state (Continue
+        playing, when the setting is on); it degrades to a normal launch
+        whenever no state can be resolved.
         """
         try:
             idx = self._games_index()
@@ -5802,8 +5993,13 @@ class Plugin:
 
             # Pull down the latest saves/states from RomM before launching so the
             # session starts from the most recent progress (no-op if download is off).
-            await self._pre_launch_sync(g)
-            ok, msg = self._retroarch.launch_game(Path(launch_path), platform_name)
+            core = await self._pre_launch_sync(g)
+            # Resolved AFTER the sync: the state to resume into may be the one
+            # that just came down from the server, and reconcile has to have
+            # filed it under the launching core first.
+            entry_slot = self._resume_entry_slot(g, core) if resume else None
+            ok, msg = self._retroarch.launch_game(Path(launch_path), platform_name,
+                                                  entry_slot=entry_slot)
             # Remember an explicit disc choice so the next plain Play resumes it.
             if ok and disc:
                 try:
@@ -6269,7 +6465,8 @@ class Plugin:
             return {'success': False, 'message': str(e)}
 
     async def prepare_steam_launch(self, rom_id: int, disc: str = None,
-                                   sibling_rom_id: int = None):
+                                   sibling_rom_id: int = None,
+                                   resume: bool = False):
         """Resolve a game's emulator argv and write a launch-spec for the Steam
         session-host tile (Steam Deck Gaming Mode only).
 
@@ -6313,8 +6510,10 @@ class Plugin:
                 return {'success': False, 'steam_host': False,
                         'message': f'No core installed for {platform_name}', **gap}
             bios = self._bios_gap(g, platform_name)
-            await self._pre_launch_sync(g)
-            cmd, err = self._retroarch.build_launch_command(Path(launch_path), platform_name)
+            core = await self._pre_launch_sync(g)
+            entry_slot = self._resume_entry_slot(g, core) if resume else None
+            cmd, err = self._retroarch.build_launch_command(
+                Path(launch_path), platform_name, entry_slot=entry_slot)
             if err or not cmd:
                 return {'success': False, 'steam_host': False,
                         'message': err or 'Could not resolve launch command'}
