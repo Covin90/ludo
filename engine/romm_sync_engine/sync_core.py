@@ -2103,6 +2103,36 @@ class RomMClient:
             print(f"❌ Error fetching ROMs: {e}")
             return [], 0
 
+    def count_roms(self, updated_after=None):
+        """How many ROMs the server has, without fetching any of them.
+
+        `total` comes back on any page, so a limit=1 probe answers it for a
+        fraction of a real page: measured against a 3,083-ROM instance, this is
+        ~0.05s where one 500-ROM page is ~3.0s (the cost is almost entirely
+        server-side response building, so asking for one row skips nearly all of
+        it). With `updated_after` it answers "how many changed since X" for
+        ~0.2s, which lets a caller decide whether a full fetch is worth doing.
+
+        Returns None if the probe fails — callers must be able to tell "nothing
+        changed" apart from "couldn't find out", since treating an error as
+        no-change would silently pin a stale library.
+        """
+        if not self.ensure_authenticated():
+            return None
+        try:
+            params = {'limit': 1, 'offset': 0, 'fields': 'id'}
+            if updated_after:
+                params['updated_after'] = updated_after
+            response = self.session.get(
+                urljoin(self.base_url, '/api/roms'), params=params, timeout=15)
+            if response.status_code != 200:
+                print(f"❌ ROM count probe: HTTP {response.status_code}")
+                return None
+            return response.json().get('total')
+        except Exception as e:
+            print(f"❌ ROM count probe error: {e}")
+            return None
+
     def search_roms(self, search_term, limit=200):
         """Search the whole library server-side, mirroring RomM's Search view.
 
@@ -2494,8 +2524,13 @@ class RomMClient:
             
             return page_num, []
         
-        # Process in smaller batches to reduce memory spikes
-        batch_size = 2  # Smaller batches = less memory pressure
+        # Process in batches to reduce memory spikes. Matched to max_workers:
+        # at 2 the pool sat half idle and every batch still paid the slowest
+        # page's latency. Measured against a 3,083-ROM instance: 2 workers
+        # 17.5s, 4 workers 14.8s, 8 workers 15.8s — the server becomes the
+        # contended resource past 4, so this tracks max_workers rather than
+        # growing further.
+        batch_size = max_workers
         
         for batch_start in range(1, pages_needed + 1, batch_size):
             batch_end = min(batch_start + batch_size, pages_needed + 1)

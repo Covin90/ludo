@@ -467,6 +467,15 @@ class Plugin:
     # from N ago" copy in the offline banner. None until hydrated/fetched.
     _snapshot_fetched_at: str = None
 
+    # Server-side ROM count matching the library in memory. NOT len(_available_games):
+    # the fetch groups regional variants under a parent (3,083 rows came back as
+    # 2,440 entries on a real instance), so the grouped list can never be compared
+    # to a server count directly. This is the ungrouped figure get_roms returns
+    # alongside the games, and it is what the connect-time count probe compares
+    # against. None until fetched, or when hydrated from a pre-existing snapshot
+    # that predates this field — in which case connect just fetches as before.
+    _library_server_total: int = None
+
     # Reachability latch, distinct from RomMClient.authenticated (which is sticky).
     # True while the server is responding; flipped False on any connected-branch
     # failure. A False→True transition triggers an offline save flush. Starts None
@@ -785,6 +794,10 @@ class Plugin:
                 'fetched_at': datetime.now(timezone.utc).isoformat(),
                 'server_url': url,
                 'games': self._available_games or [],
+                # Ungrouped server count for the next connect's count probe.
+                # Absent in snapshots written before this existed; hydrate reads
+                # it as None and that connect simply fetches.
+                'server_total': self._library_server_total,
                 'collections': self._romm_collections or [],
                 'virtual_collections': self._romm_virtual_collections or [],
                 'platform_slug_to_name': self._platform_slug_to_name or {},
@@ -820,12 +833,31 @@ class Plugin:
             self._romm_virtual_collections = data.get('virtual_collections') or None
             self._platform_slug_to_name = data.get('platform_slug_to_name') or {}
             self._snapshot_fetched_at = data.get('fetched_at')
+            self._library_server_total = data.get('server_total')
             logging.info(f"Hydrated {len(self._available_games)} games from snapshot "
                          f"(fetched {self._snapshot_fetched_at})")
             return self._snapshot_fetched_at
         except Exception as e:
             logging.warning(f"Failed to hydrate library snapshot: {e}")
             return None
+
+    def _init_bios_tracking(self):
+        """Stand up BIOS tracking against the current library.
+
+        Shared by both connect paths — a fresh fetch and a snapshot the count
+        probes proved still current — because either way we now hold the real
+        library and the BIOS scan is driven off it.
+        """
+        self._bios_tracking = BiosTrackingManager(
+            retroarch=self._retroarch,
+            romm_client=self._romm_client,
+            collection_sync=self._collection_sync,  # May be None initially
+            available_games_list=self._available_games,
+            platform_slug_to_name=self._platform_slug_to_name,
+            log_callback=lambda msg: logging.info(f"[BIOS] {msg}"),
+        )
+        # Returns immediately — it runs the scan on its own thread.
+        self._bios_tracking.scan_library_bios()
 
     def _connect_to_romm(self):
         """Connect to RomM, load game list, and start AutoSyncManager."""
@@ -898,10 +930,46 @@ class Plugin:
             # — behind it, save-sync stays dead for that whole stretch.
             self._ensure_device_registered()
 
-            # Load game list
-            roms_result = self._romm_client.get_roms()
+            # Load game list — unless the server provably still holds exactly
+            # what we hydrated from the snapshot.
+            #
+            # A full fetch is ~3.0s per 500 ROMs and that cost is almost all
+            # server-side response building: `fields` is ignored (RomM 5.1.0),
+            # dropping file expansion saves 4%, deep offsets don't degrade, and
+            # four workers only buy 1.27x before the server itself becomes the
+            # contended resource. So there is no fetch strategy that makes a
+            # 3k-ROM library cost less than ~15s, and a 30k one is minutes.
+            # The only real win is not fetching.
+            #
+            # Two probes decide it, ~0.25s together:
+            #   total unchanged      — catches adds and deletes
+            #   0 rows since fetch   — catches an add+delete that nets to the
+            #                          same total, and any in-place edit
+            # Either probe returning None means the question is unanswered, and
+            # we fetch. Manual refresh (force_full_refresh) bypasses all of this.
+            skip_fetch = False
+            if (self._available_games and self._snapshot_fetched_at
+                    and self._library_server_total is not None):
+                total = self._romm_client.count_roms()
+                if total is not None and total == self._library_server_total:
+                    changed = self._romm_client.count_roms(
+                        updated_after=self._snapshot_fetched_at)
+                    skip_fetch = (changed == 0)
+
+            if skip_fetch:
+                logging.info(f"Library unchanged since {self._snapshot_fetched_at} "
+                             f"({len(self._available_games)} games); skipping fetch")
+                # The hydrated snapshot IS the current server state, so it counts
+                # as a completed fetch — get_service_status reports library_ready
+                # from this, and refresh_library uses it as its incremental base.
+                self._last_full_fetch_time = self._snapshot_fetched_at
+                self._init_bios_tracking()
+
+            roms_result = None if skip_fetch else self._romm_client.get_roms()
             if roms_result and len(roms_result) == 2:
-                raw_games, _ = roms_result
+                raw_games, server_total = roms_result
+                # Ungrouped server count — see _library_server_total.
+                self._library_server_total = server_total
                 self._available_games.clear()
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                         _default_roms_dir())).expanduser()
@@ -958,17 +1026,7 @@ class Plugin:
                 # Library is fetched on connect and on manual refresh (the reference
                 # client's on-demand model) — no background polling.
 
-                # Initialize BiosTrackingManager
-                self._bios_tracking = BiosTrackingManager(
-                    retroarch=self._retroarch,
-                    romm_client=self._romm_client,
-                    collection_sync=self._collection_sync,  # May be None initially
-                    available_games_list=self._available_games,
-                    platform_slug_to_name=self._platform_slug_to_name,
-                    log_callback=lambda msg: logging.info(f"[BIOS] {msg}"),
-                )
-                # Returns immediately — it runs the scan on its own thread.
-                self._bios_tracking.scan_library_bios()
+                self._init_bios_tracking()
 
             # AutoSyncManager (save/state sync)
             if self._auto_sync is None:
@@ -1478,7 +1536,10 @@ class Plugin:
                 # Full refresh - fetch all games
                 roms_result = self._romm_client.get_roms()
                 if roms_result and len(roms_result) == 2:
-                    raw_games, _ = roms_result
+                    raw_games, server_total = roms_result
+                    # Keep the count probe's baseline in step with what we just
+                    # loaded, or the next connect compares against a stale total.
+                    self._library_server_total = server_total
                     self._available_games.clear()
                     download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                             _default_roms_dir())).expanduser()
@@ -1525,6 +1586,15 @@ class Plugin:
                             },
                         })
                     logging.info(f"Full refresh: loaded {len(self._available_games)} games")
+
+            if use_incremental:
+                # An incremental merge never learns the server's total (the
+                # response's `total` counts only the updated slice), and a stale
+                # baseline would stop the next connect's probe from ever matching.
+                # One extra probe is ~0.05s.
+                probed = self._romm_client.count_roms()
+                if probed is not None:
+                    self._library_server_total = probed
 
             self._last_full_fetch_time = current_time
             self._snapshot_fetched_at = current_time
