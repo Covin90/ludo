@@ -1007,8 +1007,17 @@ class Plugin:
                     self._library_progress = None
             if roms_result and len(roms_result) == 2:
                 raw_games, server_total = roms_result
-                # Ungrouped server count — see _library_server_total.
-                self._library_server_total = server_total
+                # Ungrouped server count — see _library_server_total. A fetch
+                # that dropped pages must NOT record it: the count would still
+                # match the server on the next connect and nothing would have
+                # been updated since, so the skip check would fire and pin a
+                # short library in place permanently. None forces a real fetch
+                # next time, which is the safe direction to be wrong in.
+                incomplete = getattr(self._romm_client, 'last_fetch_incomplete', False)
+                if incomplete:
+                    logging.warning("Library fetch was incomplete — not caching the "
+                                    "server count, so the next connect refetches")
+                self._library_server_total = None if incomplete else server_total
                 self._available_games.clear()
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                         _default_roms_dir())).expanduser()
@@ -1065,7 +1074,10 @@ class Plugin:
                 # after this one is silent: reconnects happen on every wake from
                 # sleep, and a toast each time is noise that teaches people to
                 # ignore the toasts that matter.
-                if self._settings.get('UI', 'library_announced', '') != 'true':
+                if (self._settings.get('UI', 'library_announced', '') != 'true'
+                        and not incomplete):
+                    # Never announce a short library as ready — the count in the
+                    # toast would be wrong and the user has no way to know.
                     self._announce_library = {'kind': 'ready',
                                               'games': len(self._available_games)}
 
@@ -1602,7 +1614,12 @@ class Plugin:
                     raw_games, server_total = roms_result
                     # Keep the count probe's baseline in step with what we just
                     # loaded, or the next connect compares against a stale total.
-                    self._library_server_total = server_total
+                    # None on an incomplete fetch, for the same reason as in
+                    # _connect_to_romm: a cached count that matches the server
+                    # while the library is short pins the short one forever.
+                    self._library_server_total = (
+                        None if getattr(self._romm_client, 'last_fetch_incomplete', False)
+                        else server_total)
                     self._available_games.clear()
                     download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                             _default_roms_dir())).expanduser()

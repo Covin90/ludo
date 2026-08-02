@@ -1628,6 +1628,12 @@ class RomMClient:
         # see confirm_save_downloaded.
         self._confirm_unsupported = set()
 
+        # True when the last full ROM fetch dropped one or more pages, so the
+        # games it returned are a subset of the library rather than all of it.
+        # Callers that cache or compare against the server's ROM count must
+        # check this — see _fetch_pages_parallel.
+        self.last_fetch_incomplete = False
+
         # OAuth2 token storage
         self.access_token = None
         self.refresh_token = None
@@ -2454,6 +2460,7 @@ class RomMClient:
                     timer.checkpoint(f"Initial count request: {time.time() - count_start:.2f}s")
 
                     if response.status_code != 200:
+                        self.last_fetch_incomplete = True
                         return [], 0
 
                     data = response.json()
@@ -2464,6 +2471,7 @@ class RomMClient:
                     self._cached_game_count_time = current_time
 
                 if total_games == 0:
+                    self.last_fetch_incomplete = False
                     return [], 0
 
                 # RomM charges a fixed ~1.15s per request plus ~3.5ms per row, so
@@ -2487,6 +2495,7 @@ class RomMClient:
 
         except Exception as e:
             print(f"❌ Parallel fetch error: {e}")
+            self.last_fetch_incomplete = True
             return [], 0
         
     def _fetch_pages_parallel(self, total_items, page_size, pages_needed, progress_callback):
@@ -2494,8 +2503,17 @@ class RomMClient:
         import concurrent.futures
         import threading
         
-        max_workers = 4
+        # Measured against a real instance: RomM serves concurrent /api/roms
+        # requests almost serially. One 500-row page alone is 2.9s; two issued
+        # together are 5.4s EACH; four are ~8s each. So four workers buy only
+        # ~1.36x wall-clock while inflating every individual request ~2.3x —
+        # and it is the individual request that hits the timeout, shows up in
+        # the server's access log as an alarming 23s, and competes with
+        # everything else the user's RomM is serving. Two keeps most of the
+        # speedup at half the latency cost.
+        max_workers = 2
         completed_pages = 0
+        failed_pages = []
         lock = threading.Lock()
         
         # Instead of accumulating ALL games, process in streaming chunks
@@ -2506,29 +2524,43 @@ class RomMClient:
         def fetch_single_page(page_num):
             offset = (page_num - 1) * page_size
             if offset >= total_items:
-                return page_num, []
+                return page_num, [], True
             
-            try:
-                response = self.session.get(
-                    urljoin(self.base_url, '/api/roms'),
-                    params={
-                        'limit': page_size,
-                        'offset': offset,
-                        # RomM 4.9.0: file expansion is opt-in (with_files default False).
-                        'with_files': 'true',
-                        'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
-                    },
-                    timeout=60
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    items = data.get('items', [])
-                    return page_num, items
-            except Exception as e:
-                print(f"❌ Page {page_num} error: {e}")
-            
-            return page_num, []
+            # Concurrency inflates each request's latency roughly in proportion
+            # to the worker count (measured: one 500-row page alone 2.9s, four
+            # issued together ~8s each), so the read budget has to cover a big
+            # page on a slow server under contention. A flat 60s covered 500 rows
+            # on a fast instance and nothing else — a 15k library on a modest box
+            # was logging 23s per page already. Connect stays short: an
+            # unreachable server should still fail fast.
+            timeout = (10, 60 + page_size // 10)
+
+            for attempt in (1, 2):
+                try:
+                    response = self.session.get(
+                        urljoin(self.base_url, '/api/roms'),
+                        params={
+                            'limit': page_size,
+                            'offset': offset,
+                            # RomM 4.9.0: file expansion is opt-in (with_files default False).
+                            'with_files': 'true',
+                            'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
+                        },
+                        timeout=timeout
+                    )
+
+                    if response.status_code == 200:
+                        return page_num, response.json().get('items', []), True
+                    print(f"❌ Page {page_num}: HTTP {response.status_code}"
+                          f"{' (retrying)' if attempt == 1 else ''}")
+                except Exception as e:
+                    print(f"❌ Page {page_num} error: {e}"
+                          f"{' (retrying)' if attempt == 1 else ''}")
+
+            # The third element lets the caller tell a failed page from a
+            # genuinely empty one. It could not before, so a dropped page meant
+            # silently returning a short library that still looked complete.
+            return page_num, [], False
         
         # Process in batches to reduce memory spikes. Matched to max_workers:
         # at 2 the pool sat half idle and every batch still paid the slowest
@@ -2552,7 +2584,10 @@ class RomMClient:
                 batch_games_count = 0  # Track games in this batch
                 
                 for future in concurrent.futures.as_completed(future_to_page):
-                    page_num, page_roms = future.result()
+                    page_num, page_roms, ok = future.result()
+                    if not ok:
+                        with lock:
+                            failed_pages.append(page_num)
                     batch_games_count += len(page_roms)  # Count games in batch
                     
                     # Process games immediately instead of accumulating
@@ -2599,7 +2634,16 @@ class RomMClient:
         if current_chunk:
             final_games.extend(current_chunk)
 
-        print(f"✓ Fetch complete: {len(final_games):,} games loaded with optimized memory usage")
+        # Read by callers that cache or compare against the server's count: a
+        # short library must never be mistaken for an accurate one. Set on every
+        # fetch so a previous failure can't leak into a later success.
+        self.last_fetch_incomplete = bool(failed_pages)
+        if failed_pages:
+            print(f"⚠️ Fetch INCOMPLETE: {len(failed_pages)} of {pages_needed} pages "
+                  f"failed after a retry each (pages {sorted(failed_pages)}) — "
+                  f"{len(final_games):,} games returned, which is not the whole library")
+        else:
+            print(f"✓ Fetch complete: {len(final_games):,} games loaded with optimized memory usage")
 
         # Group sibling ROMs (regional variants) before returning
         final_games = self._group_sibling_roms(final_games)
