@@ -3061,42 +3061,49 @@ class Plugin:
             download_dir = Path(config.get('Download', 'rom_directory',
                                            fallback=_default_roms_dir())).expanduser()
 
-            # Delete ROMs from ALL collections (not just actively syncing)
+            # Delete every ROM we downloaded, off the live library rather than the
+            # server.
+            #
+            # This used to open a NEW RomMClient from username/password and walk
+            # every collection's ROMs. It deleted nothing at all for anyone paired
+            # with a Client API Token (the recommended path — no password is
+            # stored, so the all([url, username, password]) guard skipped the
+            # whole block in silence), and even when it did run it could only
+            # delete games that happen to belong to a collection. A user who
+            # picked "delete my games" got a success toast and kept their games.
+            #
+            # _available_games is the same list the Downloaded row is built from,
+            # already carries the resolved local_path, and needs no network — so
+            # what we delete is exactly what we showed as downloaded.
             deleted_roms = 0
-            if SYNC_CORE_AVAILABLE and download_dir.exists():
-                romm_url = config.get('RomM', 'url',      fallback='')
-                username = config.get('RomM', 'username', fallback='')
-                password = config.get('RomM', 'password', fallback='')
-                if all([romm_url, username, password]):
-                    try:
-                        client = RomMClient(romm_url, username, password)
-                        if client.authenticated:
-                            all_collections = client.get_collections()
-                            for col in all_collections:
-                                col_id   = col.get('id')
-                                col_name = col.get('name', '')
-                                if col_id is None:
-                                    continue
-                                for rom in client.get_collection_roms(col_id):
-                                    platform_slug = rom.get('platform_slug', '')
-                                    file_name     = rom.get('fs_name') or rom.get('file_name', '')
-                                    if not (platform_slug and file_name):
-                                        continue
-                                    rom_path = download_dir / platform_slug / file_name
-                                    if rom_path.exists():
-                                        try:
-                                            if rom_path.is_file():
-                                                rom_path.unlink()
-                                            else:
-                                                shutil.rmtree(rom_path)
-                                            deleted_roms += 1
-                                        except Exception as e:
-                                            logging.error(f"Reset: failed to delete {rom_path}: {e}")
-                                logging.info(f"Reset: deleted ROMs from '{col_name}'")
-                        else:
-                            logging.warning("Reset: could not authenticate — ROM files not deleted")
-                    except Exception as e:
-                        logging.error(f"Reset: ROM deletion error: {e}", exc_info=True)
+            for g in (self._available_games or []):
+                if not g.get('is_downloaded'):
+                    continue
+                lp = g.get('local_path')
+                if not lp:
+                    # Downloaded but unresolved: reconstruct the standard layout.
+                    slug = g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug')
+                    fn = g.get('file_name')
+                    if not (slug and fn):
+                        continue
+                    lp = download_dir / slug / fn
+                rom_path = Path(lp)
+                try:
+                    if rom_path.is_dir():
+                        shutil.rmtree(rom_path)   # multi-disc / multi-file ROM
+                        deleted_roms += 1
+                    elif rom_path.exists():
+                        rom_path.unlink()
+                        deleted_roms += 1
+                    # Clear the flag even when the file was already gone: the
+                    # entry is stale either way, and leaving it set keeps a
+                    # phantom in the Downloaded row with nothing behind it.
+                    g['is_downloaded'] = False
+                    g['local_path'] = None
+                    g['local_size'] = 0
+                except Exception as e:
+                    logging.error(f"Reset: failed to delete {rom_path}: {e}")
+            logging.info(f"Reset: deleted {deleted_roms} ROM file(s)")
 
             # Delete downloaded BIOS files from the system directory
             deleted_bios = 0
@@ -3736,11 +3743,15 @@ class Plugin:
         get_library_games.
         """
         try:
-            # False until the first library fetch lands. Both modes are derived
-            # from state that connect fills in — _available_games for platforms,
-            # _romm_collections for collections — so an early caller gets empty
-            # groups that are correct-for-now and wrong a few seconds later.
-            ready = self._last_full_fetch_time is not None
+            # Readiness is per-mode, and deliberately so. Collections are fetched
+            # early in connect — one small request each — while the ROM fetch that
+            # feeds the platform index runs for seconds or minutes behind them.
+            # Gating both on the ROM fetch held the Collections rows back for the
+            # whole wait with the data already in hand.
+            if mode == 'collection':
+                ready = self._romm_collections is not None
+            else:
+                ready = self._last_full_fetch_time is not None
             if mode == 'collection':
                 # Offline: collection contents are fetched live per-open, so they
                 # can't be browsed without the server. Show none rather than
