@@ -69,6 +69,7 @@ try:
         BiosTrackingManager, ROM_TRIM_FIELDS, LIBRARY_PAGE_SIZE,
         SteamShortcutManager, CoverArtManager,
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
+        flatpak_app_installed,
         _extract_archive, _archive_member_names,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
     )
@@ -4833,7 +4834,12 @@ class Plugin:
             ['flatpak', 'run', 'net.retrodeck.retrodeck'],
             ['retrodeck'],
         ]
-        flatpak_installed = (Path.home() / '.var' / 'app' / 'net.retrodeck.retrodeck').exists()
+        # ~/.var/app/<id> is the app's DATA dir, not proof of installation: it
+        # survives an uninstall, and a system-wide install that has never been
+        # launched doesn't have one at all. Ask the shared detector instead —
+        # it checks the deployment dirs (including /run/host for sandboxed
+        # shells) and only falls back to `flatpak info`.
+        flatpak_installed = flatpak_app_installed('net.retrodeck.retrodeck')
         for argv in candidates:
             if not shutil.which(argv[0]):
                 continue

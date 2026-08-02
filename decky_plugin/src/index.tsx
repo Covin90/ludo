@@ -2403,14 +2403,34 @@ function useNavChrome(): NavChrome {
     const chrome = (async () => {
       try { const a = await getImage('/assets/isotipo.svg'); if (alive) setIso(a?.data_uri || null); } catch { }
       try { const b = await getImage('/assets/logotipo.svg'); if (alive) setWord(b?.data_uri || null); } catch { }
-      try {
-        const on = await getRetrodeckButtonEnabled();
-        if (alive) setRdEnabled(!!on);
-        if (on) { const r = await getRetrodeckLogo(); if (alive) setRdIcon(r?.data_uri || null); }
-      } catch { }
+      await readRd();
     })();
     void Promise.all([identity, chrome]);
-    return () => { alive = false; };
+    // Settings can flip the toggle while this page is still mounted, and the
+    // fetch above only runs once — without this the button (or its removal)
+    // waited for the next launch. Same window-event pattern as 'romm:toastpos'.
+    const onRdChange = () => { void readRd(); };
+    try { window.addEventListener('romm:rdbutton', onRdChange); } catch { /* ignore */ }
+    return () => {
+      alive = false;
+      try { window.removeEventListener('romm:rdbutton', onRdChange); } catch { /* ignore */ }
+    };
+
+    // Declared last (hoisted) so the two chains above read top-to-bottom.
+    // The logo is fetched the first time the button turns on and kept after —
+    // re-enabling shouldn't cost another round-trip, and a stale icon behind a
+    // hidden button is harmless.
+    async function readRd() {
+      try {
+        const on = await getRetrodeckButtonEnabled();
+        if (!alive) return;
+        setRdEnabled(!!on);
+        if (on) {
+          const r = await getRetrodeckLogo();
+          if (alive) setRdIcon(r?.data_uri || null);
+        }
+      } catch { /* leave whatever we last knew */ }
+    }
   }, []);
   return { iso, word, username, role, avatar, rdEnabled, rdIcon };
 }
@@ -10013,8 +10033,12 @@ function SettingsPage() {
 
   const handleRdButtonToggle = async (enabled: boolean) => {
     setRdButton(enabled);
-    try { await setRetrodeckButtonEnabled(enabled); }
-    catch { setRdButton(!enabled); }
+    try {
+      await setRetrodeckButtonEnabled(enabled);
+      // Tell the (still-mounted) library page's top bar to re-read, so the
+      // launch button appears/disappears now rather than on the next launch.
+      try { window.dispatchEvent(new Event('romm:rdbutton')); } catch { /* ignore */ }
+    } catch { setRdButton(!enabled); }
   };
 
   const handleSteamTileToggle = async (enabled: boolean) => {
