@@ -890,6 +890,14 @@ class Plugin:
             threading.Thread(target=self._fetch_disabled_counts,
                              daemon=True, name="romm-disabled-counts").start()
 
+            # Register this device with RomM so save-sync (the /negotiate engine)
+            # has a device_id. Without it the session sync can't run and battery
+            # saves never sync. Mirrors the GTK app's initialize_device().
+            # Ahead of the library fetch on purpose: registration is one small
+            # request, while the fetch below runs for minutes on a large library
+            # — behind it, save-sync stays dead for that whole stretch.
+            self._ensure_device_registered()
+
             # Load game list
             roms_result = self._romm_client.get_roms()
             if roms_result and len(roms_result) == 2:
@@ -959,12 +967,8 @@ class Plugin:
                     platform_slug_to_name=self._platform_slug_to_name,
                     log_callback=lambda msg: logging.info(f"[BIOS] {msg}"),
                 )
+                # Returns immediately — it runs the scan on its own thread.
                 self._bios_tracking.scan_library_bios()
-
-            # Register this device with RomM so save-sync (the /negotiate engine)
-            # has a device_id. Without it the session sync can't run and battery
-            # saves never sync. Mirrors the GTK app's initialize_device().
-            self._ensure_device_registered()
 
             # AutoSyncManager (save/state sync)
             if self._auto_sync is None:
@@ -2915,18 +2919,25 @@ class Plugin:
             save_decky_settings(ds)
             logging.info("Paired with RomM via Client API Token")
 
-            connected = self._connect_to_romm()
-            if connected:
-                _record_activity('account', 'Signed in', url)
+            # Hand the connect to the retry thread instead of running it here.
+            # _connect_to_romm() fetches the WHOLE library, and this is an async
+            # callable — doing it inline blocks Decky's event loop, so on a large
+            # library every other callable (status polls included) stalls for
+            # minutes and the wizard looks hung. save_config takes exactly this
+            # route for password auth; pairing was the odd one out.
+            self._stop_sync()
+            await asyncio.sleep(0.5)
+            self._start_sync()
+            _record_activity('account', 'Signed in', url)
             # 'paired' is reported separately from 'success' because the two mean
             # different things to a caller deciding whether to retry: the code is
             # single-use and is spent by the time we get here, so a retry after a
             # merely-failed CONNECTION would come back "invalid or expired" and
             # strand a device that is, in fact, paired.
-            return {'success': bool(connected),
+            return {'success': True,
                     'paired': True,
-                    'message': 'Paired and connected' if connected
-                    else 'Paired, but connection failed'}
+                    'connecting': True,
+                    'message': 'Paired'}
         except Exception as e:
             logging.error(f"pair_device error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}

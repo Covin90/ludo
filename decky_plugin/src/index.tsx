@@ -56,7 +56,7 @@ const getPluginStats = callable<[], any>("get_plugin_stats");
 const saveConfig = callable<[string, string, string, string, string, string, string], any>("save_config");
 const testRommConnection = callable<[string, string, string], any>("test_connection");
 const pairDevice = callable<[string, string], any>("pair_device");
-const setDeviceName = callable<[string], any>("set_device_name");
+const setDeviceNameRpc = callable<[string], any>("set_device_name");
 const getSaveHistory = callable<[number], any>("get_save_history");
 const getPendingUploads = callable<[], any>("get_pending_uploads");
 const getSaveScreenshot = callable<[number, number, string], any>("get_save_screenshot");
@@ -10593,7 +10593,12 @@ function SetupWizard() {
       const r = await pairDevice(url.trim(), pairCode.trim());
       if (r?.paired) {
         setPaired(true);
-        if (!r?.success) {
+        if (r?.connecting) {
+          // The connect now runs on the sync thread, so it is still going when
+          // we get here — on a large library, for minutes. Say so rather than
+          // letting the next steps imply the library is already there.
+          setTestResult({ success: true, message: 'Paired — loading your library in the background.' });
+        } else if (!r?.success) {
           setTestResult({ success: true, message: 'Paired — the server isn\'t answering yet, but that can settle on its own.' });
         }
         next();
@@ -10647,7 +10652,7 @@ function SetupWizard() {
         // library on, so a failure is reported and setup still completes.
         try {
           await setLibraryPaths(romDir.trim(), saveDir.trim(), biosDir.trim(), undefined);
-          await setDeviceName(deviceName.trim() || deviceNameDefault);
+          await setDeviceNameRpc(deviceName.trim() || deviceNameDefault);
         } catch (e) {
           console.error('[RomM] wizard paired-finish', e);
           toaster.toast({ title: 'Ludo', body: 'Saved, but your folders may need checking in Settings.' });
