@@ -66,7 +66,7 @@ try:
     from romm_sync_engine.sync_core import (
         SettingsManager, RomMClient, RetroArchInterface,
         AutoSyncManager, CollectionSyncManager,
-        BiosTrackingManager, ROM_TRIM_FIELDS,
+        BiosTrackingManager, ROM_TRIM_FIELDS, LIBRARY_PAGE_SIZE,
         SteamShortcutManager, CoverArtManager,
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
         _extract_archive, _archive_member_names,
@@ -125,6 +125,23 @@ settings_file = CONFIG_DIR / 'decky_settings.json'
 # _load_snapshot. SCHEMA bumps when the persisted game/collection shape changes.
 snapshot_file = CONFIG_DIR / 'library_snapshot.json'
 SNAPSHOT_SCHEMA = 1
+
+# Partial-fetch checkpoint. A full library fetch is ~6 minutes at 80k ROMs, and
+# anything that interrupts it — suspend, a network blip, a Decky reload — used to
+# throw away every page already paid for. Pages are appended here as they arrive
+# and replayed on the next attempt.
+#
+# NDJSON, one line per page, because rewriting a single JSON document after every
+# page is quadratic in a library's size: at 80 pages that is 80 rewrites of a
+# file that ends up hundreds of MB. Appending is O(1) per page.
+#
+# First line is a manifest; each later line is {"offset": N, "rows": [...]}.
+# Deleted on success, so its presence means the last attempt did not finish.
+resume_file = CONFIG_DIR / 'library_resume.ndjson'
+RESUME_SCHEMA = 1
+# Same 24h bound Argosy puts on its sync-resume generation: past that, the
+# library has probably moved on and replaying stale pages is worse than refetching.
+RESUME_TTL_SECONDS = 24 * 3600
 
 
 def load_decky_settings():
@@ -484,6 +501,12 @@ class Plugin:
     # in place.
     _library_progress: dict = None
 
+    # Open append handle for the partial-fetch checkpoint, and the lock guarding
+    # it — pages are written from the fetch's worker threads, and a torn line
+    # would cost every page after it on the next resume.
+    _resume_handle = None
+    _resume_lock = threading.Lock()
+
     # One-shot toast request for the frontend: {'kind': 'ready', 'games': N} or
     # {'kind': 'failed'}, else None. Only ever set for the FIRST library load on
     # this device; the frontend calls ack_library_announcement() once it has
@@ -797,6 +820,94 @@ class Plugin:
         except (TypeError, ValueError):
             return None
 
+    def _resume_begin(self, total, page_size):
+        """Open a checkpoint for a fetch about to start, replaying any usable one.
+
+        Returns {offset: rows} for pages an interrupted attempt already fetched.
+        A checkpoint is only reused when it describes the same server, the same
+        ROM count and the same page size — if any of those moved, the offsets no
+        longer point at the same rows and replaying them would silently build a
+        library out of two different servers or two different orderings.
+        """
+        url = self._settings.get('RomM', 'url') if self._settings else ''
+        resumed = {}
+        try:
+            if resume_file.exists():
+                with open(resume_file, 'r', encoding='utf-8') as f:
+                    manifest = json.loads(f.readline() or '{}')
+                age = time.time() - (manifest.get('started_at') or 0)
+                usable = (manifest.get('schema') == RESUME_SCHEMA
+                          and manifest.get('server_url') == url
+                          and manifest.get('total') == total
+                          and manifest.get('page_size') == page_size
+                          and age < RESUME_TTL_SECONDS)
+                if usable:
+                    with open(resume_file, 'r', encoding='utf-8') as f:
+                        f.readline()
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                page = json.loads(line)
+                            except json.JSONDecodeError:
+                                # A line torn by a hard kill mid-append. Every
+                                # page before it is still good, so stop here
+                                # rather than discard the whole checkpoint.
+                                logging.info("Resume checkpoint truncated; keeping "
+                                             f"the {len(resumed)} complete pages")
+                                break
+                            if isinstance(page.get('rows'), list):
+                                resumed[page['offset']] = page['rows']
+                    if resumed:
+                        logging.info(f"Resuming fetch: {len(resumed)} of "
+                                     f"{-(-total // page_size)} pages already on disk")
+                        self._resume_handle = open(resume_file, 'a', encoding='utf-8')
+                        return resumed
+                else:
+                    logging.info("Resume checkpoint doesn't match this fetch; starting over")
+        except Exception as e:
+            logging.warning(f"Couldn't read resume checkpoint: {e}")
+            resumed = {}
+
+        try:
+            resume_file.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(resume_file, 'w', encoding='utf-8')
+            handle.write(json.dumps({'schema': RESUME_SCHEMA, 'server_url': url,
+                                     'total': total, 'page_size': page_size,
+                                     'started_at': time.time()}) + '\n')
+            handle.flush()
+            self._resume_handle = handle
+        except Exception as e:
+            logging.warning(f"Couldn't open resume checkpoint: {e}")
+            self._resume_handle = None
+        return {}
+
+    def _resume_write_page(self, offset, rows):
+        """Append one fetched page. Called from the fetch's worker threads."""
+        handle = self._resume_handle
+        if not handle:
+            return
+        line = json.dumps({'offset': offset, 'rows': rows}, separators=(',', ':')) + '\n'
+        with self._resume_lock:
+            handle.write(line)
+            # Flushed per page: an unflushed buffer is exactly what a suspend or
+            # a kill would take with it, which is the case this exists for.
+            handle.flush()
+
+    def _resume_finish(self):
+        """Close and delete the checkpoint. Safe to call when there isn't one."""
+        handle, self._resume_handle = self._resume_handle, None
+        try:
+            if handle:
+                handle.close()
+        except Exception:
+            pass
+        try:
+            resume_file.unlink(missing_ok=True)
+        except Exception as e:
+            logging.warning(f"Couldn't remove resume checkpoint: {e}")
+
     def _persist_snapshot(self):
         """Write-through the live library to disk so a cold start can hydrate it
         offline. Called after every successful fetch. Best-effort: never raises
@@ -993,14 +1104,23 @@ class Plugin:
                     # — the number that actually helps from second zero is how
                     # big the job is. A count probe is ~0.05s, and `total` is
                     # already in hand when the skip check ran.
-                    self._library_progress = {
-                        'loaded': 0,
-                        'total': total if total is not None else (
-                            self._romm_client.count_roms() or 0),
-                    }
+                    known_total = total if total is not None else self._romm_client.count_roms()
+                    self._library_progress = {'loaded': 0, 'total': known_total or 0}
+                    # Replay whatever an interrupted attempt already fetched. The
+                    # page size has to match what _fetch_all_games_chunked will
+                    # use, or the checkpoint is correctly rejected as mismatched.
+                    resumed = (self._resume_begin(known_total, LIBRARY_PAGE_SIZE)
+                               if known_total else {})
                     roms_result = self._romm_client.get_roms(
                         progress_callback=_on_fetch_progress,
-                        trim_fields=ROM_TRIM_FIELDS)
+                        trim_fields=ROM_TRIM_FIELDS,
+                        resumed_pages=resumed,
+                        page_sink=self._resume_write_page)
+                    if not getattr(self._romm_client, 'last_fetch_incomplete', False):
+                        # Only a whole library retires the checkpoint. An
+                        # incomplete fetch keeps it, so the next attempt starts
+                        # from the pages that did land.
+                        self._resume_finish()
                 finally:
                     # Always clear, including on failure: a stuck count is worse
                     # than no count, since the banner would claim progress that

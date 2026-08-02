@@ -1616,6 +1616,14 @@ def _extract_7z_cli(exe, archive_path, dest_dir, emit):
     return True
 
 
+# Rows per /api/roms request during a full library fetch. RomM charges a fixed
+# ~1.15s per request plus ~3.5ms per row, so small pages are overhead-dominated:
+# measured on a 3,083-ROM instance, limit=100 costs 15ms/row and limit=1000 costs
+# 4.8ms/row. Exported because a resume checkpoint is only valid for the page size
+# that produced it — see main.py's _resume_begin.
+LIBRARY_PAGE_SIZE = 1000
+
+
 # Fields a ROM row is trimmed to when get_roms(trim_fields=...) is used.
 #
 # RomM ignores the `fields` query param (it is not a parameter of /api/roms at
@@ -2086,7 +2094,7 @@ class RomMClient:
         return None
 
     def get_roms(self, progress_callback=None, limit=500, offset=0, updated_after=None,
-                 trim_fields=None):
+                 trim_fields=None, resumed_pages=None, page_sink=None):
         """Get ROMs with pagination support - FIXED to fetch ALL games
 
         Args:
@@ -2101,7 +2109,8 @@ class RomMClient:
         try:
             # For backward compatibility, if no specific limit is requested, fetch ALL games
             if limit == 500 and offset == 0 and updated_after is None:
-                return self._fetch_all_games_chunked(progress_callback, trim_fields)
+                return self._fetch_all_games_chunked(progress_callback, trim_fields,
+                                                    resumed_pages, page_sink)
             else:
                 # Specific pagination request or filtered by updated_after
                 params = {
@@ -2470,7 +2479,8 @@ class RomMClient:
 
         return result_roms
 
-    def _fetch_all_games_chunked(self, progress_callback, trim_fields=None):
+    def _fetch_all_games_chunked(self, progress_callback, trim_fields=None,
+                                 resumed_pages=None, page_sink=None):
         """Fetch all games using parallel requests"""
         try:
             with PerformanceTimer("API fetch - full sync") as timer:
@@ -2509,13 +2519,10 @@ class RomMClient:
                     self.last_fetch_incomplete = False
                     return [], 0
 
-                # RomM charges a fixed ~1.15s per request plus ~3.5ms per row, so
-                # small pages are dominated by overhead: measured on a 3,083-ROM
-                # instance, limit=100 costs 15ms/row and limit=1000 costs 4.8ms/row.
-                # 4 workers x 500 took 15.2s; x1000 takes 12.1s. Bigger pages keep
-                # helping in theory, but ~11.5s is the floor for any shape and one
-                # giant request loses both progress reporting and per-page retry.
-                chunk_size = 1000
+                # Bigger pages keep helping in theory, but ~11.5s is the floor
+                # for any shape on a 3k library, and one giant request loses
+                # both progress reporting and per-page retry.
+                chunk_size = LIBRARY_PAGE_SIZE
                 total_chunks = (total_games + chunk_size - 1) // chunk_size
 
                 print(f"📚 Fetching {total_games:,} games in {total_chunks} chunks of {chunk_size:,} (parallel)...")
@@ -2523,7 +2530,8 @@ class RomMClient:
                 # Use existing parallel fetching
                 fetch_start = time.time()
                 all_games = self._fetch_pages_parallel(total_games, chunk_size, total_chunks,
-                                                       progress_callback, trim_fields)
+                                                       progress_callback, trim_fields,
+                                                       resumed_pages, page_sink)
                 timer.checkpoint(f"Parallel fetch complete: {time.time() - fetch_start:.2f}s")
                 timer.checkpoint(f"Total fetch time: {time.time() - count_start:.2f}s")
 
@@ -2535,7 +2543,14 @@ class RomMClient:
             return [], 0
         
     def _fetch_pages_parallel(self, total_items, page_size, pages_needed, progress_callback,
-                              trim_fields=None):
+                              trim_fields=None, resumed_pages=None, page_sink=None):
+        """Fetch every page, in parallel, streaming rows into one list.
+
+        resumed_pages: {offset: rows} already fetched by an interrupted run, used
+            in place of a request. page_sink: called (offset, rows) for each page
+            fetched here, so a caller can checkpoint. Both optional; the engine
+            owns neither the storage nor the policy, only the plumbing.
+        """
         """Memory-optimized: Stream and process games in smaller chunks"""
         import concurrent.futures
         import threading
@@ -2555,8 +2570,7 @@ class RomMClient:
         
         # Instead of accumulating ALL games, process in streaming chunks
         final_games = []
-        chunk_size = 200  # Process in smaller chunks
-        current_chunk = []
+        pages_out = {}   # page_num -> rows, so assembly order is page order
         
         def fetch_single_page(page_num):
             offset = (page_num - 1) * page_size
@@ -2571,6 +2585,11 @@ class RomMClient:
             # was logging 23s per page already. Connect stays short: an
             # unreachable server should still fail fast.
             timeout = (10, 60 + page_size // 10)
+
+            if resumed_pages and offset in resumed_pages:
+                # Already fetched by a run that was interrupted. Not re-requested
+                # and not re-sunk: it is already on disk.
+                return page_num, resumed_pages[offset], True
 
             for attempt in (1, 2):
                 try:
@@ -2594,6 +2613,13 @@ class RomMClient:
                             # library has accumulated. See ROM_TRIM_FIELDS.
                             items = [{k: row[k] for k in trim_fields if k in row}
                                      for row in items]
+                        if page_sink:
+                            try:
+                                page_sink(offset, items)
+                            except Exception as e:
+                                # Checkpointing is an optimisation; losing it
+                                # must never cost us the page we just fetched.
+                                print(f"⚠️ page_sink failed for offset {offset}: {e}")
                         return page_num, items, True
                     print(f"❌ Page {page_num}: HTTP {response.status_code}"
                           f"{' (retrying)' if attempt == 1 else ''}")
@@ -2632,20 +2658,21 @@ class RomMClient:
                 if not ok:
                     failed_pages.append(page_num)
 
-                # Process games immediately instead of accumulating
-                for rom in page_roms:
-                    current_chunk.append(rom)
-
-                    if len(current_chunk) >= chunk_size:
-                        final_games.extend(current_chunk)
-                        current_chunk = []
+                # Held by page number, then concatenated in page order below.
+                # Assembling in completion order instead made the result depend
+                # on which request won the race: _group_sibling_roms picks the
+                # "main" ROM of a variant group by input order, so a group split
+                # across two pages could elect a different rom_id from one fetch
+                # to the next. Resuming a partial fetch made that visible — the
+                # replayed pages always land first — but it was always there.
+                pages_out[page_num] = page_roms
 
                 # as_completed hands futures back one at a time, so this runs
-                # single-threaded; the lock is kept because failed_pages and the
-                # counter are still touched from the callback's point of view.
+                # single-threaded; the lock is kept because the counter is also
+                # read by the progress callback's point of view.
                 with lock:
                     completed_pages += 1
-                    loaded = len(final_games) + len(current_chunk)
+                    loaded = sum(len(v) for v in pages_out.values())
                     if progress_callback:
                         progress_callback('page', f'⟳ Completed {completed_pages}/{pages_needed} pages ({loaded} games loaded)')
                         # Same fact, in a form a UI can put a number on. A count
@@ -2672,9 +2699,9 @@ class RomMClient:
                         import gc
                         gc.collect()
 
-        # Handle remaining chunk
-        if current_chunk:
-            final_games.extend(current_chunk)
+        for page_num in sorted(pages_out):
+            final_games.extend(pages_out[page_num])
+        pages_out.clear()
 
         # Read by callers that cache or compare against the server's count: a
         # short library must never be mistaken for an accurate one. Set on every
