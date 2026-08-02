@@ -95,35 +95,67 @@ function pressed(btn) {
 }
 
 function startPolling() {
-  const btnState = {};        // GamepadButtonId → last-sent pressed bool
-  let dirState = null;        // last-sent direction string | null
-  // Whether Chromium is currently reporting a pad of its own. When it is, its
-  // poll wins and the main process's kernel reader is ignored, so a pad the
-  // browser can see is never driven by both paths at once.
-  let chromiumHasPad = false;
+  // Input arrives from two places at once — Chromium's poll and the kernel
+  // reader in the main process — and NEITHER is reliable on its own:
+  //
+  //   * Chromium reports a pad it cannot actually read. A pad switched on after
+  //     launch shows up in getGamepads() (the gamepadconnected listener below
+  //     arms that) while delivering no button state at all — measured, see
+  //     native-input.cjs. The 8BitDo Ultimate goes further and enumerates TWO
+  //     interfaces, at least one of which is permanently silent.
+  //   * The kernel reader sees everything, but a multi-interface pad reports the
+  //     same physical press on every one of its nodes.
+  //
+  // This used to be a winner-takes-all latch: the first frame Chromium admitted
+  // to ANY pad, the kernel path was discarded for the rest of the session. That
+  // is exactly backwards when the pad Chromium is holding is the silent one —
+  // the controller worked for the split second before the first press, then went
+  // dead for good, and a power-cycled pad never came back.
+  //
+  // So don't arbitrate: MERGE. Every source publishes its full current state and
+  // the UI sees the union — a button is down if any source says it is, and the
+  // direction is the first source with one. Duplicate nodes reporting the same
+  // press collapse to a single press, a source that reports nothing contributes
+  // nothing instead of masking the one that works, and a skew between two nodes
+  // can no longer have one's release cancel the other's live press.
+  const sources = new Map();  // source key → { buttons: Set<id>, dir: string|null }
+  let sent = { buttons: new Set(), dir: null };  // what the UI last heard
   // Set while the window is in the background, so the first frame after focus
   // returns can re-sync silently instead of replaying held buttons as presses.
   let wasUnfocused = false;
+  // Swallow the next flush, adopting its state as the baseline without
+  // announcing it (see the wasUnfocused note in poll()).
+  let adoptNext = false;
 
-  function emitButton(id, isDown) {
-    if (btnState[id] === isDown) return;
-    const firstSighting = !(id in btnState);
-    btnState[id] = isDown;
-    // Don't announce a release for a button we never saw pressed — the frame a
-    // pad first appears would otherwise blast button(id,false) for every idle
-    // control, spuriously firing onButtonUp handlers.
-    if (firstSighting && !isDown) return;
-    window.__rommGamepad && window.__rommGamepad.button(id, isDown);
+  function sourceFor(key) {
+    let s = sources.get(key);
+    if (!s) { s = { buttons: new Set(), dir: null }; sources.set(key, s); }
+    return s;
   }
-  function emitDir(dir) {
-    if (dir === dirState) return;
-    dirState = dir;
-    window.__rommGamepad && window.__rommGamepad.direction(dir);
+
+  // Union of every source, and the only thing the UI is told about.
+  function flush() {
+    const buttons = new Set();
+    let dir = null;
+    for (const s of sources.values()) {
+      for (const id of s.buttons) buttons.add(id);
+      if (dir === null) dir = s.dir;
+    }
+    if (adoptNext) { adoptNext = false; sent = { buttons, dir }; return; }
+    const pad = window.__rommGamepad;
+    if (pad) {
+      // Presses first, then releases: a press and a release in the same flush is
+      // a real tap, and the UI activates on the release.
+      for (const id of buttons) if (!sent.buttons.has(id)) pad.button(id, true);
+      for (const id of sent.buttons) if (!buttons.has(id)) pad.button(id, false);
+      if (dir !== sent.dir) pad.direction(dir);
+    }
+    sent = { buttons, dir };
   }
 
   function releaseAll() {
-    for (const id of Object.keys(btnState)) emitButton(Number(id), false);
-    emitDir(null);
+    sources.clear();
+    flush();
   }
 
   function poll() {
@@ -142,14 +174,20 @@ function startPolling() {
 
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     let gp = null;
-    for (const p of pads) { if (p && p.connected) { gp = p; break; } }
-    chromiumHasPad = !!gp;
+    // Require the STANDARD mapping. Every index in BUTTON_MAP and DPAD is a
+    // standard-layout index, so on a pad Chromium reports with any other mapping
+    // they address the wrong controls — reading a garbage layout and publishing
+    // it as fact is worse than not reading the pad at all. Those pads are left to
+    // the kernel reader, which works from stable evdev codes.
+    for (const p of pads) {
+      if (p && p.connected && p.mapping === "standard") { gp = p; break; }
+    }
 
     if (!gp) {
-      // No pad the browser will admit to. Don't releaseAll() here: the kernel
-      // reader may be driving a hot-plugged pad that Chromium never surfaces
-      // (see native-input.cjs), and clearing state every frame would cancel its
-      // presses. Focus loss and real disconnects still release, below.
+      // No pad the browser will admit to. Drop only OUR source: the kernel reader
+      // may be driving a hot-plugged pad Chromium never surfaces (see
+      // native-input.cjs), and its presses must survive.
+      if (sources.delete("chromium")) flush();
       requestAnimationFrame(poll);
       return;
     }
@@ -165,16 +203,14 @@ function startPolling() {
     // that still had focus and relaunched the game the user had just quit.
     if (wasUnfocused) {
       wasUnfocused = false;
-      for (const [idx, id] of Object.entries(BUTTON_MAP)) {
-        btnState[id] = pressed(gp.buttons[idx]);
-      }
-      requestAnimationFrame(poll);
-      return;
+      adoptNext = true;
     }
 
     // Face/shoulder/trigger/menu buttons.
+    const s = sourceFor("chromium");
+    s.buttons.clear();
     for (const [idx, id] of Object.entries(BUTTON_MAP)) {
-      emitButton(id, pressed(gp.buttons[idx]));
+      if (pressed(gp.buttons[idx])) s.buttons.add(id);
     }
 
     // Direction: d-pad buttons first, else the left stick past the deadzone.
@@ -184,8 +220,8 @@ function startPolling() {
     const down = pressed(gp.buttons[DPAD.down]) || axY > STICK_DEADZONE;
     const left = pressed(gp.buttons[DPAD.left]) || axX < -STICK_DEADZONE;
     const right = pressed(gp.buttons[DPAD.right]) || axX > STICK_DEADZONE;
-    const dir = up ? "up" : down ? "down" : left ? "left" : right ? "right" : null;
-    emitDir(dir);
+    s.dir = up ? "up" : down ? "down" : left ? "left" : right ? "right" : null;
+    flush();
 
     requestAnimationFrame(poll);
   }
@@ -195,11 +231,21 @@ function startPolling() {
   // browser poll, so held-button release, focus gating and de-duplication all
   // behave identically no matter which source produced the press.
   ipcRenderer.on("romm:native-pad", (_e, kind, payload) => {
-    // Chromium's own report wins whenever it has one, and a pad must not move the
-    // UI while a launched game holds focus.
-    if (chromiumHasPad || !document.hasFocus()) return;
-    if (kind === "button") emitButton(payload.id, payload.down);
-    else if (kind === "direction") emitDir(payload.dir);
+    // A pad must not move the UI while a launched game holds focus.
+    if (!document.hasFocus()) return;
+    // One source PER DEVICE NODE, keyed by the evdev path. This is what makes a
+    // multi-interface pad behave: the 8BitDo Ultimate reports each press on both
+    // of its nodes, and merging them by union turns the duplicate into one press
+    // instead of two events that can interleave into a self-cancelling mess.
+    const s = sourceFor(payload.node || "native");
+    if (kind === "button") {
+      if (payload.down) s.buttons.add(payload.id); else s.buttons.delete(payload.id);
+    } else if (kind === "direction") {
+      s.dir = payload.dir;
+    } else if (kind === "gone") {
+      sources.delete(payload.node);
+    }
+    flush();
   });
 
   // Chromium only starts exposing a HOT-PLUGGED pad through getGamepads() once

@@ -323,16 +323,18 @@ function createWindow(url, fullscreen) {
 
   // Kernel-level pad reading, for controllers Chromium refuses to expose to the
   // renderer (see native-input.cjs — a pad switched on after launch never reaches
-  // navigator.getGamepads()). preload.cjs ignores these events whenever Chromium
-  // IS reporting a pad, so the two paths can't both drive the UI.
+  // navigator.getGamepads()). preload.cjs MERGES these with Chromium's own poll by
+  // union instead of picking a winner, so a pad both paths can see still produces
+  // a single press, and a pad only one path can see still works.
   //
   // Focus gating lives in the renderer, not here: preload.cjs already drops input
   // while the window is unfocused (a running game owns the pad) and, crucially,
   // releases everything it had held when focus goes — a button that happens to be
   // down at that moment would otherwise stay stuck down forever.
   stopNativeInput = startNativeInput({
-    button(id, down) { sendPadEvent(win, "button", { id, down }); },
-    direction(dir) { sendPadEvent(win, "direction", { dir }); },
+    button(id, down, node) { sendPadEvent(win, "button", { id, down, node }); },
+    direction(dir, node) { sendPadEvent(win, "direction", { dir, node }); },
+    gone(node) { sendPadEvent(win, "gone", { node }); },
   });
   win.on("closed", () => {
     win = null;

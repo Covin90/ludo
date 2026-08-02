@@ -126,9 +126,13 @@ class PadReader {
 
   close() {
     // Release anything still held, or the UI keeps a phantom press after unplug.
-    for (const id of this.held) this.emit.button(id, false);
+    for (const id of this.held) this.emit.button(id, false, this.node);
     this.held.clear();
-    if (this.dir) { this.dir = null; this.emit.direction(null); }
+    if (this.dir) { this.dir = null; this.emit.direction(null, this.node); }
+    // Drop the renderer's state for this node entirely. Releasing the held
+    // buttons above is not enough on its own: a node that disappears while the
+    // UI still carries its direction would leave that direction pinned forever.
+    this.emit.gone(this.node);
     try { fs.closeSync(this.fd); } catch { /* already gone */ }
     this.fd = null;
   }
@@ -180,7 +184,7 @@ class PadReader {
   setButton(id, down) {
     if (down === this.held.has(id)) return;
     if (down) this.held.add(id); else this.held.delete(id);
-    this.emit.button(id, down);
+    this.emit.button(id, down, this.node);
   }
 
   // D-pad first, then the left stick past the deadzone; vertical wins over
@@ -193,7 +197,7 @@ class PadReader {
     const dir = up ? "up" : down ? "down" : left ? "left" : right ? "right" : null;
     if (dir === this.dir) return;
     this.dir = dir;
-    this.emit.direction(dir);
+    this.emit.direction(dir, this.node);
   }
 }
 
@@ -203,7 +207,11 @@ const PUMP_MS = 16;
 const SCAN_MS = 1000;
 
 // Start reading attached pads and forwarding their events through `emit`
-// ({button(id, down), direction(dir|null)}). Returns a stop() function.
+// ({button(id, down, node), direction(dir|null, node), gone(node)}). Every call
+// carries the evdev node it came from: a pad can present several nodes that all
+// report the same press (the 8BitDo Ultimate does), and the renderer needs to
+// tell them apart to merge them instead of counting each press twice. Returns a
+// stop() function.
 function startNativeInput(emit) {
   if (process.platform !== "linux") return () => {};
 
