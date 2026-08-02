@@ -924,6 +924,32 @@ class Plugin:
         except Exception as e:
             logging.warning(f"Couldn't remove resume checkpoint: {e}")
 
+    def _clear_library_cache(self):
+        """Drop every trace of the previous account's library, on disk and in
+        memory, so the next login refetches from scratch.
+
+        Without this, logging in as a different user on the same server hydrates
+        the old user's games (the snapshot is keyed on server_url, not account)
+        and — worse — the count probe in _connect_to_romm can match the stale
+        server_total and skip the fetch entirely, pinning the wrong library.
+        Best-effort: logout must succeed even if a file can't be removed."""
+        self._resume_finish()
+        try:
+            snapshot_file.unlink(missing_ok=True)
+        except Exception as e:
+            logging.warning(f"Couldn't remove library snapshot: {e}")
+
+        self._available_games = []
+        self._romm_collections = None
+        self._romm_virtual_collections = None
+        self._platform_slug_to_name = {}
+        self._snapshot_fetched_at = None
+        self._library_server_total = None
+        self._last_full_fetch_time = None
+        self._library_progress = None
+        self._announce_library = None
+        logging.info("Cleared cached library state")
+
     def _persist_snapshot(self):
         """Write-through the live library to disk so a cold start can hydrate it
         offline. Called after every successful fetch. Best-effort: never raises
@@ -3132,6 +3158,7 @@ class Plugin:
             settings.set('RomM', 'auto_connect', 'false')
 
             self._romm_client = None
+            self._clear_library_cache()
 
             ds = load_decky_settings()
             ds['needs_onboarding'] = True

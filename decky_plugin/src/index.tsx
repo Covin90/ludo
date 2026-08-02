@@ -3859,6 +3859,28 @@ function persistGroupsCache() {
   try { localStorage.setItem(_LS_GROUPS_KEY, JSON.stringify({ t: Date.now(), v: _groupsCache })); } catch { }
 }
 
+// Wipe every cached browse list, in memory and in localStorage. Called on logout:
+// the caches outlive the session, so without this the next sign-in paints the
+// previous account's games from disk until a fetch replaces them.
+// Not exported — see clearIdentityCache: a named export off this entry file
+// breaks the bundle.
+function clearBrowseCaches() {
+  _libGamesCache.clear();
+  _homeCache = null;
+  for (const k of Object.keys(_groupsCache)) delete _groupsCache[k];
+  if (!_lsAvail) return;
+  try {
+    const stale: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(_LS_LIB_PREFIX)) stale.push(k);
+    }
+    for (const k of stale) localStorage.removeItem(k);
+    localStorage.removeItem(_LS_HOME_KEY);
+    localStorage.removeItem(_LS_GROUPS_KEY);
+  } catch { }
+}
+
 // Hydrate both caches once at module load from any non-expired localStorage data.
 (function _hydrateBrowseCaches() {
   if (!_lsAvail) return;
@@ -9886,6 +9908,9 @@ function SettingsPage() {
         // Drop the remembered pill identity, or the next launch paints the
         // signed-out user's name and avatar until the fetch says otherwise.
         clearIdentityCache();
+        // The browse lists are cached to localStorage for instant repaint, so
+        // they'd otherwise survive the logout and greet the next user.
+        clearBrowseCaches();
         toaster.toast({
           title: 'Logged out',
           body: wipeData
