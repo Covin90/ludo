@@ -4008,11 +4008,11 @@ const checkForNotifications = async () => {
         if (ann.kind === 'ready') {
           toaster.toast({
             title: 'Your library is ready',
-            // Say where the difference comes from when there is one, or the
-            // number looks like Ludo dropped games off RomM's own count.
-            body: (ann.files && ann.files > (ann.games ?? 0))
-              ? `${(ann.games ?? 0).toLocaleString()} games from ${ann.files.toLocaleString()} ROM files — regional versions of a game are grouped.`
-              : `${(ann.games ?? 0).toLocaleString()} games from RomM`,
+            // Report the server's own ROM count, not our grouped entry count:
+            // it's the number RomM shows the user everywhere else, and the
+            // grouping is an implementation detail a completion toast is the
+            // wrong place to explain.
+            body: `${(ann.files ?? ann.games ?? 0).toLocaleString()} games from RomM`,
             duration: 6000,
             onClick: () => { try { Navigation.Navigate('/romm-sync-library'); } catch { /* ignore */ } },
           });
@@ -5260,6 +5260,24 @@ function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         }
         if (p?.success) next.platforms = upd(p.groups || [], prev?.platforms, setPlatforms);
         if (c?.success) next.collections = upd(c.groups || [], prev?.collections, setCollections);
+        // On a first run the wizard lands here while the initial fetch is still
+        // going, so every one of these calls answers truthfully-empty: no games
+        // yet means no Recently added, no platforms, no collections. Those
+        // answers must not be cached — the seed is what Home paints on the next
+        // mount, and nothing else would have gone back for the real ones.
+        // Keep asking until the backend says the library is in.
+        const notReady = h?.library_ready === false
+          || p?.library_ready === false || c?.library_ready === false;
+        if (notReady) {
+          // Every 3s, capped at ~10min: enough for the 50–80k libraries this is
+          // worst on, and bounded so a backend that never becomes ready doesn't
+          // leave a poll running for the session.
+          if (attempt < 200) {
+            clearTimeout(retry);
+            retry = setTimeout(() => { if (alive) load(attempt + 1); }, 3000);
+          }
+          return;
+        }
         _homeCache = next;
         persistHomeCache();
       } catch (e) { console.error('home load failed', e); }
@@ -5465,6 +5483,7 @@ function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
   const seq = useRef(0);
   useEffect(() => {
     if (!visible) return;
+    let retry: any = null;
     const load = async () => {
       const s = ++seq.current;
       try {
@@ -5472,6 +5491,15 @@ function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
         if (s !== seq.current) return;
         if (res?.success) {
           const next: LibGroup[] = res.groups || [];
+          // Same first-run trap as HomePanel: an answer given before the
+          // initial fetch lands is empty and correct, and must not become the
+          // cached seed. Show it, don't persist it, and come back for the
+          // real one.
+          if (res.library_ready === false) {
+            setGroups(next);
+            retry = setTimeout(() => { if (s === seq.current) load(); }, 3000);
+            return;
+          }
           if (JSON.stringify(next) !== JSON.stringify(_groupsCache[mode])) {
             _groupsCache[mode] = next;
             persistGroupsCache();
@@ -5490,7 +5518,7 @@ function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
     // Re-fetch on a manual "Refresh library" (account menu) so a same-tab
     // refresh shows up immediately instead of waiting for a tab switch.
     _libRefreshListeners.add(load);
-    return () => { _libRefreshListeners.delete(load); };
+    return () => { clearTimeout(retry); _libRefreshListeners.delete(load); };
   }, [visible, offline]);
 
   // visible in the ready flag so the focus grab refires on each return to the
@@ -5676,16 +5704,21 @@ function OfflineBanner({ status }: { status: any }) {
     // felt broken. No percentage bar: it implies an ETA we can't honour when
     // the server stalls mid-fetch.
     const prog = status?.library_progress;
+    // Nothing has ever been fetched, so there is nothing downloaded to fall
+    // back on — the "play your downloaded games meanwhile" line is only true
+    // from the second run onward, and on a first run it points at an empty
+    // library. snapshot_fetched_at is present in both status branches and is
+    // null until a fetch has succeeded once.
+    const firstRun = !status?.snapshot_fetched_at;
+    const meanwhile = firstRun ? '' : ' — you can play your downloaded games meanwhile';
     if (prog?.total > 0) {
       title = 'Loading your library…';
-      // "ROM files", not "games": the total comes from the server's row count,
-      // and the library ends up smaller once regional variants are grouped.
-      // Counting up to a number the finished library never reaches reads as a
-      // failure — same reason the ready toast reports both numbers.
-      detail = `${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} ROM files — you can play your downloaded games meanwhile.`;
+      detail = `${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} games${meanwhile}.`;
     } else {
       title = prog ? 'Loading your library…' : 'Connecting to RomM…';
-      detail = 'Your downloaded games are ready to play in the meantime.';
+      detail = firstRun
+        ? 'This can take a minute on a large library.'
+        : 'Your downloaded games are ready to play in the meantime.';
     }
   } else if (conn === 'offline_cached') {
     dot = V2.warning;

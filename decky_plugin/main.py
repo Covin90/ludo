@@ -1249,10 +1249,12 @@ class Plugin:
                         and not incomplete):
                     # Never announce a short library as ready — the count in the
                     # toast would be wrong and the user has no way to know.
-                    # Both numbers: RomM's own UI counts ROM files (3,083 here)
-                    # while we group regional variants of the same game into one
-                    # entry (2,440). Reporting only ours reads as "Ludo lost 643
-                    # games". See _group_sibling_roms.
+                    # 'files' is the server's ungrouped ROM count, which is what
+                    # the toast reports — it matches what RomM itself shows the
+                    # user. Our own entry count is smaller because regional
+                    # variants of a game collapse into one entry
+                    # (_group_sibling_roms), and a completion toast quoting the
+                    # smaller number just reads as games having gone missing.
                     self._announce_library = {'kind': 'ready',
                                               'games': len(self._available_games),
                                               'files': server_total}
@@ -3734,13 +3736,19 @@ class Plugin:
         get_library_games.
         """
         try:
+            # False until the first library fetch lands. Both modes are derived
+            # from state that connect fills in — _available_games for platforms,
+            # _romm_collections for collections — so an early caller gets empty
+            # groups that are correct-for-now and wrong a few seconds later.
+            ready = self._last_full_fetch_time is not None
             if mode == 'collection':
                 # Offline: collection contents are fetched live per-open, so they
                 # can't be browsed without the server. Show none rather than
                 # tiles that error on open — the platform view (downloaded-only)
                 # is the offline browse path.
                 if self._is_offline():
-                    return {'success': True, 'mode': mode, 'groups': []}
+                    return {'success': True, 'mode': mode, 'groups': [],
+                            'library_ready': ready}
                 actively = (self._settings.get('Collections', 'actively_syncing', '')
                             if self._settings else '')
                 synced_set = {c for c in actively.split('|') if c}
@@ -3791,7 +3799,8 @@ class Plugin:
                                     'virtual': True, 'synced': False})
                 vgroups.sort(key=lambda x: (x['label'] or '').lower())
                 groups.extend(vgroups)
-                return {'success': True, 'mode': mode, 'groups': groups}
+                return {'success': True, 'mode': mode, 'groups': groups,
+                        'library_ready': ready}
 
             # default: platform
             # Offline: only downloaded games are playable, so restrict the index
@@ -3811,7 +3820,8 @@ class Plugin:
                 if g.get('is_downloaded'):
                     a['downloaded'] += 1
             groups = sorted(agg.values(), key=lambda x: (x['label'] or '').lower())
-            return {'success': True, 'mode': 'platform', 'groups': groups}
+            return {'success': True, 'mode': 'platform', 'groups': groups,
+                    'library_ready': ready}
         except Exception as e:
             logging.error(f"get_library_groups error: {e}", exc_info=True)
             return {'success': False, 'groups': [], 'message': str(e)}
@@ -4903,6 +4913,11 @@ class Plugin:
             continue_playing = await asyncio.to_thread(self._fetch_continue_playing, 15)
             return {
                 'success': True,
+                # False while the very first library fetch is still running. The
+                # Home rows are built from _available_games, so a caller that
+                # asks too early gets a legitimately-empty payload and would
+                # cache it as the answer — see HomePanel's retry.
+                'library_ready': self._last_full_fetch_time is not None,
                 'stats': {
                     'games': total,
                     'downloaded': downloaded,
