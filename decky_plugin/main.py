@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import logging
+import logging.handlers
 import mimetypes
 import re
 import sys
@@ -69,9 +70,12 @@ try:
         BiosTrackingManager, ROM_TRIM_FIELDS, LIBRARY_PAGE_SIZE,
         SteamShortcutManager, CoverArtManager,
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
+        platform_folder_candidates,
         flatpak_app_installed,
         _extract_archive, _archive_member_names,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
+        drain_notifications as _drain_notifications,
+        flush_pending_game_toasts as _flush_pending_game_toasts,
     )
     SYNC_CORE_AVAILABLE = True
 except ImportError as e:
@@ -211,10 +215,31 @@ logging_enabled = decky_settings.get('logging_enabled', True)
 _root_logger = logging.getLogger()
 _file_handler = None
 
+# DEBUG logging is verbose enough (a library fetch alone emits a line per page,
+# per cover, per save) that an unbounded file grows without limit on a device
+# where nobody ever looks at ~/.config/ludo. Cap it at 2 MB total: the newest
+# 1 MB in debug.log, the previous 1 MB in debug.log.1.
+#
+# Sized off measured sessions: ~14 KB median, ~84 KB p90, 290 KB for the
+# heaviest (one that did a full library fetch — routine on a large library, so
+# budget against that end). 2 MB is ~7 heavy sessions or ~70 typical ones,
+# which is more than a bug report ever needs. The one backup file exists so a
+# crash landing just after a roll still leaves the preceding session readable,
+# instead of a near-empty log.
+LOG_MAX_BYTES = 1 * 1024 * 1024
+LOG_BACKUP_COUNT = 1
+
+
+def _make_log_handler():
+    handler = logging.handlers.RotatingFileHandler(
+        str(log_file), maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    return handler
+
+
 if logging_enabled:
-    _file_handler = logging.FileHandler(str(log_file))
-    _file_handler.setLevel(logging.DEBUG)
-    _file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    _file_handler = _make_log_handler()
     _root_logger.addHandler(_file_handler)
     _root_logger.setLevel(logging.DEBUG)
 
@@ -287,17 +312,25 @@ def _resolve_download_path(download_dir, platform_slug, file_name):
     accept that extracted folder before declaring the game not downloaded —
     otherwise a restart re-scans for the now-deleted archive and reports every
     unpacked game as missing.
+
+    Both folder names are searched: ROMs downloaded before the ES-DE folder
+    mapping existed sit under the raw RomM slug (roms/dc), newer ones under the
+    ES-DE name (roms/dreamcast), and a library is routinely a mix of the two.
     """
-    base = Path(download_dir) / platform_slug / file_name
-    if is_path_validly_downloaded(base):
-        return base, True
+    folders = platform_folder_candidates(platform_slug)
+    for folder in folders:
+        base = Path(download_dir) / folder / file_name
+        if is_path_validly_downloaded(base):
+            return base, True
     if Path(file_name).suffix.lower() in ('.zip', '.7z'):
         stem = Path(file_name).stem
-        for cand in (Path(download_dir) / platform_slug / stem,
-                     Path(download_dir) / platform_slug / (stem + '__extracted')):
-            if is_path_validly_downloaded(cand):
-                return cand, True
-    return base, False
+        for folder in folders:
+            for cand in (Path(download_dir) / folder / stem,
+                         Path(download_dir) / folder / (stem + '__extracted')):
+                if is_path_validly_downloaded(cand):
+                    return cand, True
+    # Not downloaded — report where it *would* go, i.e. the ES-DE folder.
+    return Path(download_dir) / folders[0] / file_name, False
 
 
 def _detect_multi_disc(local_path, is_downloaded):
@@ -656,6 +689,26 @@ class Plugin:
             self._available_games = []
         self._connection_attempted = False
 
+        # Built here, not in _connect, even though auto-sync itself only starts
+        # once connected. Resolving a game's save state is a purely local
+        # question (state_location_for_game → glob), and Home asks it for the
+        # Continue-playing row on the first frame — well before connect finishes
+        # the library fetch and BIOS scan. When this was constructed down in
+        # _connect, every one of those early requests saw None, skipped the
+        # local state entirely, and fell through to the server's copy — which is
+        # stale for exactly the case that matters, a state made on another device
+        # (or in RetroDECK while Ludo was closed) that hasn't uploaded yet.
+        # The client is attached in _connect; nothing here touches the network.
+        if self._auto_sync is None:
+            self._auto_sync = AutoSyncManager(
+                romm_client=None,
+                retroarch=self._retroarch,
+                settings=self._settings,
+                log_callback=lambda msg: logging.info(f"[AUTO-SYNC] {msg}"),
+                get_games_callback=lambda: self._available_games,
+                parent_window=None,
+            )
+
         # Cold-start hydration: seed the library from the last persisted snapshot
         # so the Game Browser is populated immediately — before the retry thread
         # connects, and even if it never does (offline). A successful fetch later
@@ -704,6 +757,12 @@ class Plugin:
                 self._auto_sync.stop_auto_sync()
             except Exception:
                 pass
+        # Save/state toasts are held for a few seconds to merge; anything still
+        # waiting has to be queued now or it dies with the timer thread.
+        try:
+            _flush_pending_game_toasts()
+        except Exception:
+            pass
         if self._collection_sync:
             try:
                 self._collection_sync.stop()
@@ -1029,6 +1088,14 @@ class Plugin:
         self._romm_virtual_collections = None
         self._platform_slug_to_name = {}
         self._server_firmware_cache = None
+        # bios_manager keeps its own short-lived platform cache; a different
+        # server (or account) must not be answered from the old one.
+        try:
+            bm = getattr(self._retroarch, 'bios_manager', None)
+            if bm:
+                bm.invalidate_platforms_cache()
+        except Exception:
+            pass
         self._snapshot_fetched_at = None
         self._library_server_total = None
         self._last_full_fetch_time = None
@@ -1544,7 +1611,10 @@ class Plugin:
 
                 self._init_bios_tracking()
 
-            # AutoSyncManager (save/state sync)
+            # AutoSyncManager (save/state sync). Normally already built by
+            # _start_sync — the local state lookups Home does on the first frame
+            # need it long before connect gets here — so this is the fallback
+            # and the else branch below (attaching the client) is the live path.
             if self._auto_sync is None:
                 self._auto_sync = AutoSyncManager(
                     romm_client=self._romm_client,
@@ -1916,13 +1986,27 @@ class Plugin:
         """Return and clear queued notification events from the sync engine.
 
         The frontend polls this on its status tick and toasts each event
-        verbatim. Events are produced at the exact moment a sync/removal
-        happens (see CollectionSyncManager.push_notification), so there's no
+        verbatim. Events are produced at the exact moment a sync/removal/save
+        upload happens (see sync_core.push_notification), so there's no
         frontend-side diffing or transition inference.
+
+        Drains the module-level queue rather than the collection manager's:
+        save/state uploads raise toasts too, and those happen whether or not
+        collection sync was ever started.
         """
         try:
-            if self._collection_sync:
-                return {'events': self._collection_sync.drain_notifications()}
+            events = _drain_notifications()
+            # A state upload means this game's screenshot just changed. Both
+            # state-thumbnail caches are keyed on rom_id alone, so without this
+            # the Continue-playing row keeps painting the previous picture —
+            # and a rom that had NO state until now stays blank for the whole
+            # _STATE_MISS_TTL. This is the exact moment we know better.
+            for ev in events:
+                rid = ev.get('rom_id')
+                if ev.get('kind') == 'save' and isinstance(rid, int):
+                    self._state_thumb_miss.pop(rid, None)
+                    self._cover_cache.pop(('state', rid), None)
+            return {'events': events}
         except Exception as e:
             logging.debug(f"drain_notifications error: {e}")
         return {'events': []}
@@ -2351,7 +2435,7 @@ class Plugin:
                 if rom_id and rom_id in protected_rom_ids:
                     skipped_count += 1
                     continue
-                rom_path = download_dir / platform_slug / file_name
+                rom_path, _dl = _resolve_download_path(download_dir, platform_slug, file_name)
                 if rom_path.exists():
                     try:
                         if rom_path.is_file():
@@ -3423,15 +3507,18 @@ class Plugin:
                             if fname:
                                 known_bios_files.add(fname)
 
-                    for bios_file in known_bios_files:
-                        bios_path = bios_system_dir / bios_file
-                        if bios_path.exists():
-                            try:
-                                bios_path.unlink()
-                                deleted_bios += 1
-                                logging.info(f"Reset: deleted BIOS file {bios_file}")
-                            except Exception as e:
-                                logging.error(f"Reset: failed to delete BIOS {bios_file}: {e}")
+                    # Recursive: firmware for cores that demand their own folder
+                    # (Dreamcast → system/dc/) is not at the top level, and a
+                    # flat-only sweep would leave it behind on a reset.
+                    for bios_path in bios_system_dir.rglob('*'):
+                        if not bios_path.is_file() or bios_path.name not in known_bios_files:
+                            continue
+                        try:
+                            bios_path.unlink()
+                            deleted_bios += 1
+                            logging.info(f"Reset: deleted BIOS file {bios_path.name}")
+                        except Exception as e:
+                            logging.error(f"Reset: failed to delete BIOS {bios_path.name}: {e}")
 
                     logging.info(f"Reset: deleted {deleted_bios} BIOS file(s)")
                 except ImportError:
@@ -3701,10 +3788,7 @@ class Plugin:
                 root = logging.getLogger()
                 if enabled:
                     if _file_handler is None:
-                        _file_handler = logging.FileHandler(str(log_file))
-                        _file_handler.setLevel(logging.DEBUG)
-                        _file_handler.setFormatter(
-                            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+                        _file_handler = _make_log_handler()
                         root.addHandler(_file_handler)
                     root.setLevel(logging.DEBUG)
                     logging.info("Logging enabled")
@@ -3899,11 +3983,15 @@ class Plugin:
                 pass
             auto = self._auto_sync
             state = None
-            if auto is not None:
-                try:
-                    _, state = auto.latest_state_slot(g, core)
-                except Exception:
-                    state = None
+            if auto is None:
+                # Can't answer the local question yet. Return "unknown" WITHOUT
+                # pinning a miss: caching a null here would hide a perfectly
+                # good local screenshot for the whole _STATE_MISS_TTL.
+                return None
+            try:
+                _, state = auto.latest_state_slot(g, core)
+            except Exception:
+                state = None
             if state is not None and self._retroarch:
                 thumb = self._retroarch.find_thumbnail_for_save_state(state)
                 if thumb:
@@ -5436,7 +5524,8 @@ class Plugin:
                 name = d.get('name')
             if not (platform_slug and file_name):
                 return {'success': False, 'message': 'Could not resolve ROM path'}
-            dest = download_dir / platform_slug / file_name
+            # Existing copies keep their folder; new ones use the ES-DE name.
+            dest, _already = _resolve_download_path(download_dir, platform_slug, file_name)
 
             # Decky serves RPC calls sequentially on one socket, so if this method
             # blocked until the download finished, the frontend's get_download_progress
@@ -5621,7 +5710,7 @@ class Plugin:
                 platform_slug = g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug')
                 file_name = g.get('file_name') or (g.get('romm_data') or {}).get('fs_name')
                 if platform_slug and file_name:
-                    target = download_dir / platform_slug / file_name
+                    target, _dl = _resolve_download_path(download_dir, platform_slug, file_name)
             removed = 0
             for p in variant_paths:
                 try:
@@ -5896,6 +5985,13 @@ class Plugin:
                 logging.info(f"resume: no save state on disk for "
                              f"{game.get('name', 'this game')} — normal launch")
                 return None
+            if slot is None:
+                # A state exists but under a name this launch won't boot under
+                # (made on another device from a differently named dump).
+                # --entryslot can't reach it; Continue playing still shows it.
+                logging.info(f"resume: {path} isn't named after the file being "
+                             f"launched — normal launch")
+                return None
             logging.info(f"resume: booting into slot {slot} ({path})")
             return slot
         except Exception as e:
@@ -6018,6 +6114,9 @@ class Plugin:
             if bios:
                 logging.info(f"{platform_name} core '{bios['core']}' is missing "
                              f"required BIOS: {bios['missing_bios']}")
+                bios, bios_fetched = await self._close_bios_gap(g, platform_name, bios)
+            else:
+                bios_fetched = []
 
             # Pull down the latest saves/states from RomM before launching so the
             # session starts from the most recent progress (no-op if download is off).
@@ -6042,6 +6141,11 @@ class Plugin:
                 # sits on a black screen, so the warning is most useful exactly
                 # when ok is True.
                 out['bios_warning'] = bios
+            elif bios_fetched:
+                # There WAS a gap and we closed it. Worth saying: the launch took
+                # a few seconds longer than usual and something was written to
+                # disk, and silence there reads as a stall.
+                out['bios_fetched'] = bios_fetched
             if not ok:
                 # A missing core is the one launch failure the user can fix on
                 # the spot, so hand the UI what it needs to offer that instead of
@@ -6384,6 +6488,73 @@ class Plugin:
             logging.warning(f"could not describe the BIOS gap: {e}")
             return {}
 
+    # How long a launch will wait for missing firmware. BIOS files are small
+    # (a PSX set is ~2 MB), so this is generous for the intended case and short
+    # enough that a slow or wedged server costs a pause rather than a launch:
+    # on timeout we fall through to the old warn-and-launch, and the download
+    # thread keeps going, so the files are usually there for the next attempt.
+    _BIOS_FETCH_TIMEOUT = 25.0
+
+    def _download_missing_bios_blocking(self, gap: dict) -> list:
+        """Download the firmware named in a _bios_gap result. Returns what
+        landed. Blocking — network plus disk."""
+        bm = self._bios_manager()
+        if not bm or not (self._romm_client and self._romm_client.authenticated):
+            return []
+        slug = (gap.get('platform_slug') or '').lower()
+        entry = self._server_firmware().get(slug) or {}
+        if not entry:
+            return []
+        # download_bios_from_romm matches on the SERVER's platform name, not our
+        # display name — the same reason download_bios passes it through.
+        pname = entry.get('name') or slug
+        done = []
+        for name in gap.get('missing_bios') or []:
+            try:
+                if bm.download_bios_from_romm(pname, name):
+                    done.append(name)
+            except Exception as e:
+                logging.warning(f"[BIOS] pre-launch fetch of {name}: {e}")
+        if done:
+            try:
+                bm.scan_installed_bios()
+            except Exception as e:
+                logging.debug(f"[BIOS] rescan after pre-launch fetch: {e}")
+        return done
+
+    async def _close_bios_gap(self, game: dict, platform_name: str, gap: dict):
+        """Try to fetch missing firmware before launching. Returns (gap, fetched)
+        with gap re-derived from disk — {} when the download closed it.
+
+        Warning alone is not enough when we can just fix it. The files are on
+        RomM (that is how the gap was detected at all), the core will not boot
+        without them, and the user's only alternative is to back out, find the
+        BIOS page and come back. Anything we cannot fetch still warns exactly as
+        before, so the advisory path is intact — this only removes the cases
+        where the advice was 'go and press a button we could have pressed'.
+        """
+        if not gap:
+            return gap, []
+        try:
+            fetched = await asyncio.wait_for(
+                asyncio.to_thread(self._download_missing_bios_blocking, gap),
+                timeout=self._BIOS_FETCH_TIMEOUT)
+        except asyncio.TimeoutError:
+            logging.warning(f"[BIOS] pre-launch fetch for {platform_name} timed "
+                            f"out after {self._BIOS_FETCH_TIMEOUT}s — launching "
+                            f"with the warning instead")
+            return gap, []
+        except Exception as e:
+            logging.warning(f"[BIOS] pre-launch fetch failed: {e}")
+            return gap, []
+        if not fetched:
+            return gap, []
+        logging.info(f"[BIOS] fetched before launch for {platform_name}: {fetched}")
+        # Re-derive rather than assume: a file can arrive under a name that still
+        # doesn't satisfy the check, and claiming a fixed gap we haven't
+        # re-measured is how a black screen gets launched with no warning at all.
+        return self._bios_gap(game, platform_name), fetched
+
     async def get_bios_inventory(self, refresh: bool = False):
         """Per-platform BIOS inventory for the BIOS page.
 
@@ -6550,6 +6721,11 @@ class Plugin:
                 return {'success': False, 'steam_host': False,
                         'message': f'No core installed for {platform_name}', **gap}
             bios = self._bios_gap(g, platform_name)
+            bios_fetched = []
+            if bios:
+                logging.info(f"{platform_name} core '{bios['core']}' is missing "
+                             f"required BIOS: {bios['missing_bios']}")
+                bios, bios_fetched = await self._close_bios_gap(g, platform_name, bios)
             core = await self._pre_launch_sync(g, launch_path)
             entry_slot = self._resume_entry_slot(g, core) if resume else None
             cmd, err = self._retroarch.build_launch_command(
@@ -6578,7 +6754,8 @@ class Plugin:
             logging.info(f"prepare_steam_launch: wrote spec for '{g.get('name')}' "
                          f"argv={cmd}")
             return {'success': True, 'steam_host': True, 'message': 'Spec ready',
-                    **({'bios_warning': bios} if bios else {})}
+                    **({'bios_warning': bios} if bios
+                       else {'bios_fetched': bios_fetched} if bios_fetched else {})}
         except Exception as e:
             logging.error(f"prepare_steam_launch error: {e}", exc_info=True)
             return {'success': False, 'steam_host': False, 'message': str(e)}

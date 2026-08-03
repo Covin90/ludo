@@ -44,6 +44,352 @@ def _record_activity(kind, title, detail=''):
         except Exception:
             pass
 
+
+# Trailing "(...)"/"[...]" groups on a No-Intro style name, for display.
+_DISPLAY_TAG_RE = re.compile(r'\s*[\(\[]([^)\]]*)[\)\]]\s*$')
+_DISPLAY_REGIONS = {
+    'usa', 'europe', 'japan', 'world', 'asia', 'china', 'korea', 'brazil',
+    'australia', 'germany', 'france', 'spain', 'italy', 'netherlands',
+    'sweden', 'uk', 'canada', 'russia', 'taiwan', 'hong kong', 'greece',
+    'norway', 'denmark', 'finland', 'poland', 'portugal', 'austria',
+    'belgium', 'switzerland', 'ireland', 'scandinavia', 'latin america',
+}
+_DISPLAY_FLAGS = {
+    'beta', 'proto', 'prototype', 'demo', 'sample', 'unl', 'unlicensed',
+    'alt', 'aftermarket', 'pirate', 'virtual console', 'gamecube',
+    'switch online', 'wii', 'wii u', 'e-reader', 'kiosk', 'promo',
+    'rerelease', 'classic mini', 'namco museum',
+}
+_DISPLAY_LANG_RE = re.compile(r'^[a-z]{2}$')
+# TOSEC names a dump's year on its own — "(2001)(Sega)(US)[!]".
+_DISPLAY_YEAR_RE = re.compile(r'^(19|20)\d{2}$')
+# GoodTools dump-status codes, always bracketed: [!] [b] [a2] [h1C] [o] [t] [f].
+_DISPLAY_DUMP_RE = re.compile(r'^(!|[abhoftp]\d{0,2}[a-z]?)$', re.I)
+# Groups worth keeping even inside a TOSEC tag run — they tell saves apart.
+_DISPLAY_KEEP_RE = re.compile(r'^(disc|disk|side|part|tape)\b', re.I)
+_DISPLAY_REV_RE = re.compile(r'^(rev|v|version|beta|proto|demo|disc|disk)\b', re.I)
+
+
+def _is_display_noise(group):
+    """True when a parenthetical group is release metadata, not part of the title.
+
+    Conservative on purpose: a group only counts as noise when EVERY
+    comma-separated part is recognisable metadata, so "(Blue Sphere)" or
+    "(Director's Cut)" survive. "(Disc 1)" is deliberately kept — it names
+    which disc a save belongs to, which a user reading a toast still wants.
+    """
+    parts = [p.strip().lower() for p in group.split(',') if p.strip()]
+    if not parts:
+        return False
+    for part in parts:
+        if part in _DISPLAY_REGIONS or part in _DISPLAY_FLAGS:
+            continue
+        if _DISPLAY_LANG_RE.match(part):        # En, Fr, De, Es, It, Nl, Pt
+            continue
+        if re.match(r'^(rev|v)\s*[\d.]+[a-z]?$', part):   # Rev 1, v1.02
+            continue
+        if _DISPLAY_YEAR_RE.match(part):        # TOSEC dump year
+            continue
+        if _DISPLAY_DUMP_RE.match(part):        # [!], [b2], [h1C]
+            continue
+        return False
+    return True
+
+
+def display_game_name(name):
+    """A ROM name with its release tags stripped, for showing to a person.
+
+    RomM carries the full No-Intro name — "SpaceStation Silicon Valley (Europe)
+    (En,Fr,De,Es,It,Nl,Pt)" — which is precise and unreadable in a toast. Strip
+    the trailing metadata groups only; anything unrecognised is left alone, and
+    a name that is nothing BUT tags comes back untouched rather than empty.
+    """
+    if not name:
+        return name
+    out = str(name).strip()
+    # Walk the whole trailing run of groups, dropping the noise and keeping the
+    # rest in order — otherwise "FF VII (Europe) (Disc 1)" stops at Disc 1 and
+    # keeps the region it was meant to lose.
+    keep = []
+    saw_year = False
+    while True:
+        m = _DISPLAY_TAG_RE.search(out)
+        if not m:
+            break
+        head = out[:m.start()].strip()
+        if not head:
+            break
+        body = m.group(1)
+        if _DISPLAY_YEAR_RE.match(body.strip()):
+            saw_year = True
+        if not _is_display_noise(body):
+            keep.append((m.group(0).strip(), body))
+        out = head
+    # A bare year marks the run as TOSEC ("Crazy Taxi 2 (2001)(Sega)(US)[!]"),
+    # where everything after the title is dump metadata — including publishers,
+    # which no word list can recognise. Disc/side markers still survive.
+    if saw_year:
+        keep = [g for g in keep if _DISPLAY_KEEP_RE.match(g[1].strip())]
+    for group, _ in reversed(keep):
+        out = f"{out} {group}"
+    return out or str(name)
+
+
+# Toast queue — events raised at the moment something happens, drained by the
+# frontend on its status tick (see Plugin.drain_notifications).
+#
+# Module-level rather than owned by a manager because two unrelated managers
+# raise toasts: CollectionSyncManager (collection adds/removals) and
+# AutoSyncManager (save/state uploads). The queue used to hang off the
+# collection manager, which meant the save path had nowhere to push and fell
+# back to a RetroArch OSD message — invisible whenever no emulator is running,
+# which is the normal case for a sync that happens on app open.
+#
+# Bounded so a frontend that never drains can't grow it without limit (oldest
+# drop first). Locked because uploads are raised from the auto-sync worker
+# threads while the RPC thread drains.
+_notifications = deque(maxlen=50)
+_notifications_lock = threading.Lock()
+
+
+def push_notification(kind, title, body, rom_id=None, has_cover=False,
+                      activity_kind=None):
+    """Queue a toast for the frontend.
+
+    `kind` is a free-form tag ('sync' | 'removal' | 'save') the frontend uses
+    for styling and routing. `rom_id`/`has_cover`, when given, let the toast
+    render the game's box art and open that game when clicked — so a save toast
+    names and shows which game it was, the way a download toast does.
+
+    `activity_kind` also files the event in the Recent Activity feed. Leave it
+    None when the caller already records its own (richer) activity row, or the
+    feed gets the event twice.
+    """
+    with _notifications_lock:
+        _notifications.append({
+            'kind':       kind,
+            'title':      title,
+            'body':       body,
+            'rom_id':     rom_id,
+            'has_cover':  bool(has_cover),
+            'timestamp':  time.time(),
+        })
+    if activity_kind:
+        _record_activity(activity_kind, title, body)
+
+
+def drain_notifications():
+    """Return all queued toast events and clear the queue."""
+    with _notifications_lock:
+        events = list(_notifications)
+        _notifications.clear()
+    return events
+
+
+# --- Per-game save/state toast coalescing ----------------------------------
+#
+# A single play session usually produces BOTH a save and a save state for one
+# game, and they arrive seconds apart down different paths: the state through
+# process_save_upload, the save through the session-sync summary. Toasting each
+# as it lands gives two notifications for what the user experienced as one
+# event. So hold them briefly and emit one merged toast per game.
+#
+# The activity feed is deliberately NOT merged — each path files its own row, so
+# the log keeps the detail ("State uploaded", "Save sync — …, 1 save uploaded")
+# while the toast stays glanceable.
+#
+# The window is a debounce: each new event for a game restarts it, so a save and
+# a state from one action merge even when they arrive apart. _TOAST_COALESCE_MAX
+# caps the total hold so a steady drip of events can't postpone it forever.
+#
+# 3s is measured, not guessed. Across 189 toast-worthy events the save/state gap
+# is bimodal: pairs from a single action land 0.21–0.54s apart, and the next gap
+# up is 9.35s — those wider ones are separate saves made during a session, which
+# SHOULD toast separately. 3s sits in the empty band between the two clusters:
+# ~6x headroom over the widest real pair, with no risk of welding two distinct
+# actions into one toast.
+_TOAST_COALESCE_SECONDS = 3.0
+_TOAST_COALESCE_MAX = 20.0
+_pending_toasts = {}          # rom_id -> pending entry
+_pending_toasts_lock = threading.Lock()
+
+
+def _toast_title(counts):
+    """Title for a merged toast: what moved, and which way.
+
+    'Save uploaded' / 'State uploaded' / 'Save & state uploaded', with 'synced'
+    standing in when a game moved data in both directions at once.
+    """
+    nouns = []
+    if counts['saves_up'] or counts['saves_down']:
+        nouns.append('Save' if (counts['saves_up'] + counts['saves_down']) == 1 else 'Saves')
+    if counts['states_up'] or counts['states_down']:
+        nouns.append('state' if (counts['states_up'] + counts['states_down']) == 1 else 'states')
+    if not nouns:
+        return 'Synced'
+    # Nouns are written for the trailing slot ("Save & state"); when the state
+    # stands alone it starts the title and has to be capitalised.
+    noun = ' & '.join(nouns)
+    noun = noun[:1].upper() + noun[1:]
+    up = counts['saves_up'] + counts['states_up']
+    down = counts['saves_down'] + counts['states_down']
+    verb = 'uploaded' if up and not down else 'downloaded' if down and not up else 'synced'
+    return f"{noun} {verb}"
+
+
+# One RetroArchInterface for the "is a game on screen right now?" question.
+# Constructing one runs the whole executable/core discovery, which is far too
+# much to redo per toast; the answer it gives is a live process scan either way.
+_osd_ra = None
+_osd_ra_lock = threading.Lock()
+
+# A sweep flushes each game's held message separately, so three games synced in
+# one pass fired three OSD lines milliseconds apart — and since the OSD carries
+# the title alone, all three read "Saves uploaded" and were indistinguishable.
+# Hold them for a moment and send ONE line. The Ludo toast keeps its per-game
+# form: it has box art and opens the game, so separate rows are useful there in
+# a way an OSD line never is.
+_OSD_BATCH_SECONDS = 1.0
+_osd_batch = []
+_osd_batch_timer = None
+_osd_batch_lock = threading.Lock()
+
+
+def _osd_batch_text(titles):
+    """One line for a batch of per-game titles."""
+    unique = set(titles)
+    # "Save uploaded" and "State uploaded" in the same sweep have no shared
+    # wording to fall back on; say the neutral thing rather than pick one.
+    title = titles[0] if len(unique) == 1 else 'Saves synced'
+    if len(titles) == 1:
+        return title
+    return f"{title} — {len(titles)} games"
+
+
+def _queue_osd_line(ra, title):
+    """Hold `title` briefly, then put one merged line on RetroArch's OSD."""
+    global _osd_batch_timer
+
+    def _flush():
+        global _osd_batch, _osd_batch_timer
+        with _osd_batch_lock:
+            titles, _osd_batch = _osd_batch, []
+            _osd_batch_timer = None
+        if titles:
+            try:
+                ra.send_notification(_osd_batch_text(titles))
+            except Exception as e:
+                logging.debug(f"could not send the merged OSD line: {e}")
+
+    with _osd_batch_lock:
+        _osd_batch.append(title)
+        if _osd_batch_timer is None:
+            _osd_batch_timer = threading.Timer(_OSD_BATCH_SECONDS, _flush)
+            _osd_batch_timer.daemon = True   # must never hold up shutdown
+            _osd_batch_timer.start()
+
+
+def _emit_game_sync_toast(title, body, rom_id=None, has_cover=False):
+    """Announce a save/state sync — in RetroArch if a game is up, else in Ludo.
+
+    Mid-session, Ludo's window is behind the emulator: its toast is never seen,
+    only heard, so the whole notification amounts to a sound over the game.
+    RetroArch is the surface the player is actually looking at, so that is where
+    the message goes while it is running. Once it exits (the end-of-session
+    sync, or any sync with no game up) the Ludo toast is the only surface there
+    is, and it behaves as before.
+
+    A standalone emulator has no OSD we can talk to, so it stays on the toast
+    path; the same is true if the message can't be delivered — the send is
+    fire-and-forget UDP and a game running without the network command
+    interface enabled simply shows nothing. That is still what was asked for
+    here: no notification in Ludo while a game is running.
+    """
+    global _osd_ra
+    try:
+        with _osd_ra_lock:
+            if _osd_ra is None:
+                _osd_ra = RetroArchInterface()
+            ra = _osd_ra
+        if ra.emulator_process_running():
+            _queue_osd_line(ra, title)
+            return
+    except Exception as e:
+        logging.debug(f"OSD sync notice failed, falling back to a toast: {e}")
+    push_notification('save', title, body, rom_id=rom_id, has_cover=has_cover)
+
+
+def _flush_game_toast(rom_id):
+    with _pending_toasts_lock:
+        entry = _pending_toasts.pop(rom_id, None)
+    if not entry:
+        return
+    timer = entry.get('timer')
+    if timer is not None:
+        timer.cancel()
+    _emit_game_sync_toast(
+        _toast_title(entry['counts']), display_game_name(entry['name']),
+        rom_id=entry['rom_id'], has_cover=entry['has_cover'],
+    )
+
+
+def queue_game_sync_toast(rom_id, name, has_cover=False, saves_up=0,
+                          saves_down=0, states_up=0, states_down=0):
+    """Merge this game's save/state activity into one delayed toast.
+
+    Callers still record their own activity rows; this only affects the toast.
+    Games with no rom_id can't be merged reliably (nothing stable to key on),
+    so they toast immediately.
+    """
+    if not (saves_up or saves_down or states_up or states_down):
+        return
+    if rom_id is None:
+        _emit_game_sync_toast(_toast_title({
+            'saves_up': saves_up, 'saves_down': saves_down,
+            'states_up': states_up, 'states_down': states_down,
+        }), display_game_name(name), rom_id=None, has_cover=has_cover)
+        return
+
+    now = time.time()
+    with _pending_toasts_lock:
+        entry = _pending_toasts.get(rom_id)
+        if entry is None:
+            entry = {
+                'rom_id': rom_id, 'name': name, 'has_cover': bool(has_cover),
+                'first_at': now, 'timer': None,
+                'counts': {'saves_up': 0, 'saves_down': 0,
+                           'states_up': 0, 'states_down': 0},
+            }
+            _pending_toasts[rom_id] = entry
+        else:
+            # A later event may know the name/cover when the first didn't.
+            entry['name'] = entry['name'] or name
+            entry['has_cover'] = entry['has_cover'] or bool(has_cover)
+        c = entry['counts']
+        c['saves_up'] += saves_up
+        c['saves_down'] += saves_down
+        c['states_up'] += states_up
+        c['states_down'] += states_down
+        if entry['timer'] is not None:
+            entry['timer'].cancel()
+            entry['timer'] = None
+        due_now = (now - entry['first_at']) >= _TOAST_COALESCE_MAX
+        if not due_now:
+            t = threading.Timer(_TOAST_COALESCE_SECONDS, _flush_game_toast, args=(rom_id,))
+            t.daemon = True    # must never hold up plugin shutdown
+            entry['timer'] = t
+            t.start()
+    if due_now:
+        _flush_game_toast(rom_id)
+
+
+def flush_pending_game_toasts():
+    """Emit every held toast now. Called on shutdown so nothing is lost."""
+    with _pending_toasts_lock:
+        rom_ids = list(_pending_toasts)
+    for rom_id in rom_ids:
+        _flush_game_toast(rom_id)
+
 # PIL is optional - used for Steam grid image generation
 try:
     from PIL import Image
@@ -848,6 +1194,151 @@ def find_standalone_executable(key, spec, settings=None):
         if found:
             return found
     return ''
+
+
+# ─── RomM slug → ES-DE / RetroDECK ROM folder ────────────────────────────────
+# RomM names platform folders with IGDB slugs; ES-DE (and therefore RetroDECK)
+# scans a fixed set of folder names of its own, and the two disagree for a good
+# number of systems — most famously Dreamcast, where RomM says 'dc' and ES-DE
+# wants 'dreamcast'. Downloading into the RomM slug leaves the games invisible
+# to RetroDECK's library even though the files are perfectly fine.
+#
+# Only the disagreements are listed; a slug absent from this map is already an
+# ES-DE folder name (69 of the slugs Ludo knows are). Entries were derived by
+# diffing RomM's UniversalPlatformSlug enum against ES-DE's es_systems.xml
+# <name> values, and cover the systems a RetroArch core or standalone emulator
+# can actually run — pure metadata platforms (Stadia, iOS, VR headsets) have no
+# ES-DE folder to map to and are deliberately left alone.
+ES_DE_FOLDER_BY_SLUG = {
+    # Nintendo
+    'sfam': 'sfc',
+    'ngc': 'gc',
+    '3ds': 'n3ds',
+    '64dd': 'n64dd',
+    'nintendo-dsi': 'nds',
+    'g-and-w': 'gameandwatch',
+    'pokemon-mini': 'pokemini',
+    'e-reader-slash-card-e-reader': 'gba',
+    'sufami-turbo': 'sufami',
+    # Sega
+    'dc': 'dreamcast',
+    'sms': 'mastersystem',
+    'sega32': 'sega32x',
+    'sg1000': 'sg-1000',
+    'segacd32': 'segacd',
+    # SNK
+    'neogeoaes': 'neogeo',
+    'neogeomvs': 'neogeo',
+    'neo-geo-cd': 'neogeocd',
+    'neo-geo-pocket': 'ngp',
+    'neo-geo-pocket-color': 'ngpc',
+    # Atari
+    'lynx': 'atarilynx',
+    'jaguar': 'atarijaguar',
+    'atari-jaguar-cd': 'atarijaguarcd',
+    'atari-st': 'atarist',
+    'atari8bit': 'atari800',
+    'atari-xegs': 'atarixe',
+    # NEC
+    'turbografx-cd': 'pcenginecd',
+    'pc-fx': 'pcfx',
+    'pc-8800-series': 'pc88',
+    'pc-9800-series': 'pc98',
+    'pc-6001': 'pc88',
+    # Bandai / Watara / other handhelds
+    'wonderswan-color': 'wonderswancolor',
+    'swancrystal': 'wonderswancolor',
+    'mega-duck-slash-cougar-boy': 'megaduck',
+    'game-dot-com': 'gamecom',
+    # Home computers
+    'acpc': 'amstradcpc',
+    'amstrad-gx4000': 'gx4000',
+    'acorn-electron': 'electron',
+    'acorn-archimedes': 'archimedes',
+    'appleii': 'apple2',
+    'apple-iigs': 'apple2gs',
+    'c-plus-4': 'plus4',
+    'c16': 'plus4',
+    'vic-20': 'vic20',
+    'commodore-cdtv': 'cdtv',
+    'amiga-cd32': 'amigacd32',
+    'zxs': 'zxspectrum',
+    'zx-spectrum-next': 'zxnext',
+    'sharp-x68000': 'x68000',
+    'fm-towns': 'fmtowns',
+    'fm-7': 'fm7',
+    'dragon-32-slash-64': 'dragon32',
+    'trs-80-color-computer': 'coco',
+    'ti-99': 'ti99',
+    'ti-994a': 'ti99',
+    'thomson-mo5': 'moto',
+    'thomson-to': 'moto',
+    'sam-coupe': 'samcoupe',
+    'msx-turbo': 'msxturbor',
+    'colecoadam': 'adam',
+    # Consoles / other
+    'philips-cd-i': 'cdimono1',
+    'fairchild-channel-f': 'channelf',
+    'astrocade': 'astrocde',
+    'creativision': 'crvision',
+    'casio-pv-1000': 'pv1000',
+    'arcadia-2001': 'arcadia',
+    'epoch-super-cassette-vision': 'scv',
+    'odyssey-2': 'odyssey2',
+    'videopac-g7400': 'videopac',
+    'hartung': 'gmaster',
+    'super-acan': 'supracan',
+    'super-nes-cd-rom-system': 'snes',
+    'pocketstation': 'psx',
+    # Engines / fantasy consoles
+    'pico': 'pico8',
+    'tic-80': 'tic80',
+    'wasm-4': 'wasm4',
+    'z-machine': 'zmachine',
+}
+
+
+def platform_folder_name(platform_slug):
+    """The folder name to download this platform's ROMs into.
+
+    ES-DE/RetroDECK's name when it differs from RomM's slug, else the slug. Safe
+    to apply unconditionally: bare RetroArch is handed absolute paths and never
+    cares what the folder is called, so the only thing this changes is whether
+    RetroDECK's scraper finds the games.
+    """
+    slug = (platform_slug or '').strip().lower()
+    # Empty in, empty out — callers chain this into `or` fallbacks, and a
+    # placeholder here would win over the real answer further down the chain.
+    return ES_DE_FOLDER_BY_SLUG.get(slug, platform_slug or '')
+
+
+def platform_folder_candidates(platform_slug):
+    """Folders a ROM for this platform may live in, best first.
+
+    The mapped folder, then the raw slug — because every library downloaded
+    before this mapping existed sits in the slug folder, and re-reporting those
+    games as "not downloaded" (and re-downloading them) would be worse than the
+    naming problem being fixed. Detection reads both; only writes use
+    platform_folder_name.
+    """
+    mapped = platform_folder_name(platform_slug)
+    out = [mapped]
+    if platform_slug and platform_slug not in out:
+        out.append(platform_slug)
+    return out
+
+
+def existing_rom_path(download_dir, platform_slug, file_name):
+    """The path a ROM already occupies, across both folder names, or None.
+
+    Use this for "is it downloaded?"; use platform_folder_name for where to put
+    a new one.
+    """
+    for folder in platform_folder_candidates(platform_slug):
+        candidate = Path(download_dir) / folder / file_name
+        if is_path_validly_downloaded(candidate):
+            return candidate
+    return None
 
 
 def standalone_emulator_for_platform(platform_name, platform_slug=None):
@@ -3679,10 +4170,29 @@ class RomMClient:
         # Battery / memory-card saves (.srm, .sav, .mcr, .eep, ...): the primary
         # per-ROM save. RomM's save-sync engine ignores slot=None rows
         # (slot_not_null filter), so a stable non-null slot is required. Use the
-        # canonical "autosave" slot — the same value RomM's reference clients
-        # (grout, muos-app, etc.) report the primary save under — so a game's
-        # battery save pairs across ALL clients on (rom_id, slot) instead of
-        # fragmenting per-client. Autocleanup matches grout (keep last 10).
+        # canonical "autosave" slot, so a game's battery save pairs across
+        # clients on (rom_id, slot) instead of fragmenting per-client.
+        # Verified in both reference clients (Aug 2026): grout's
+        # ui/slot_helpers.go declares `autosaveSlot = "autosave"` as its default
+        # slot preference, and argosy's SaveSyncApiClient has
+        # AUTOSAVE_SLOT_NAME = "autosave" with null treated as the same channel.
+        # Autocleanup matches grout (keep last 10).
+        # Flycast writes up to eight VMU cards per game and they are DIFFERENT
+        # saves, not copies — reporting them all as "autosave" made the dedupe
+        # below treat three of the four as stale and drop them, and the server's
+        # single autosave row alternated between whichever card was touched
+        # last. Every port gets its own slot, named after the port.
+        #
+        # Port A1 briefly kept "autosave" on the theory that it would pair with
+        # other clients' primary save. It wouldn't: grout and argosy were both
+        # read (Aug 2026) and neither has any concept of a VMU — no flycast
+        # per-content cards, no Dreamcast save handling at all — so there was
+        # nothing on the other side to meet, and the exception only made port A
+        # the odd one out in the slot list.
+        port = _vmu_port(file_path)
+        if port:
+            return f"vmu-{port.lower()}", True, 10
+
         if suffix:
             return "autosave", True, 10
 
@@ -3839,24 +4349,14 @@ class RomMClient:
                 logging.warning(f"Unknown save type: {save_type}")
                 return False
 
-            # Generate RomM-style filename with timestamp
-            import datetime
-            now = datetime.datetime.now()
-            timestamp = now.strftime("%Y-%m-%d %H-%M-%S-%f")[:-3]
-
-            # RetroArch auto-savestate "<content>.state.auto" is a two-part suffix.
-            # The server convention puts the full suffix AFTER the timestamp
-            # ("X [ts].state.auto"); the generic stem/suffix split would instead
-            # emit "X.state [ts].auto", which fails to round-trip on download.
-            if file_path.name.lower().endswith('.state.auto'):
-                base = file_path.name[:-len('.state.auto')]
-                upload_stem = f"{base} [{timestamp}]"
-                romm_filename = f"{upload_stem}.state.auto"
-            else:
-                original_basename = file_path.stem
-                file_extension = file_path.suffix
-                upload_stem = f"{original_basename} [{timestamp}]"
-                romm_filename = f"{upload_stem}{file_extension}"
+            # Send the plain name. RomM stamps every version it accepts, so a
+            # timestamp of ours only produced the double-stamped
+            # "X [2026-08-04 00-20-51-351] [2026-08-03_22-20-51].bin" — ours in
+            # local time, the server's in UTC, for one instant.
+            romm_filename = file_path.name
+            upload_stem = (file_path.name[:-len('.state.auto')]
+                           if file_path.name.lower().endswith('.state.auto')
+                           else file_path.stem)
             logging.debug(f"Upload filename: {romm_filename}")
 
             try:
@@ -3885,9 +4385,21 @@ class RomMClient:
                             # but echoes back that OLD record. Taking that as
                             # success marks the file synced while the server hash
                             # never moves, so the next negotiate orders the exact
-                            # same upload — forever. The server appends its own
-                            # timestamp to the name we sent, so our stem must
-                            # still prefix whatever comes back.
+                            # same upload — forever.
+                            #
+                            # Our stem must still prefix whatever comes back,
+                            # AND the stamp the server appends must be from
+                            # this moment. The prefix alone stopped being proof
+                            # once we stopped sending a timestamp of our own:
+                            # an echoed old record has the same stem as the file
+                            # we just sent, and only its stamp gives it away.
+                            stale = _server_stamp_age(server_filename)
+                            if stale is not None and stale > 120:
+                                logging.warning(
+                                    f"Upload echoed a record stamped {stale:.0f}s ago "
+                                    f"(sent {romm_filename!r}, got id={file_id} "
+                                    f"{server_filename!r}) — treating as a conflict")
+                                return False if overwrite else 'conflict'
                             if not str(server_filename).startswith(upload_stem):
                                 logging.warning(
                                     f"Upload echoed a pre-existing record instead of ours "
@@ -5440,7 +5952,7 @@ class RetroArchInterface:
     )
 
     def stale_emulator_paths(self):
-        """Configured paths that point into a vanished install.
+        """Configured paths that point somewhere the live emulator won't read.
 
         These are the silent failure: a save_directory left over from an
         uninstalled RetroDECK keeps sync running against a tree nothing reads, so
@@ -5459,6 +5971,12 @@ class RetroArchInterface:
         there. Saves and BIOS are the real cases: both have to land in a tree the
         live emulator actually looks in, and the executable override has to point
         at something that exists.
+
+        Two causes, distinguished by 'cause' because the UI has to explain them
+        very differently. 'removed': the install it belonged to is gone.
+        'other_install': the install is perfectly alive, it just isn't the one we
+        launch — the both-installed case, where nothing is broken about the
+        folder itself and the only wrong thing is who reads it.
         """
         stale = []
         for section, key, label, kind in self._PATH_SETTINGS:
@@ -5472,8 +5990,17 @@ class RetroArchInterface:
                 # never been written to, so an existence test just moves the
                 # false positive from "inherited" to "new".
                 continue
+            cause, owner = 'removed', ''
             if self.is_dead_install_path(path):
                 reason = 'the emulator it belonged to is no longer installed'
+            elif kind in ('saves', 'bios') and self.belongs_to_other_install(path):
+                # Not for 'exe': an executable override naming the other
+                # emulator is the user choosing it, and repairing it would
+                # silently switch which emulator they play on.
+                cause = 'other_install'
+                owner = self.install_label(self._install_key_for_path(path))
+                reason = (f'it belongs to {owner}, but games run on '
+                          f'{self.install_label(self._selected_install_key())}')
             elif kind == 'exe' and not path.exists():
                 # Only the executable override has to exist right now. The
                 # folders are created on demand (by the downloader, or by the
@@ -5482,10 +6009,24 @@ class RetroArchInterface:
                 reason = 'that file is gone'
             else:
                 continue
+            suggested = self._suggested_path(kind)
+            # Never report a fix that changes nothing — for any cause. A banner
+            # whose one-tap fix leaves the banner up (while the toast reports
+            # success) is worse than no banner. Reachable both ways: the
+            # 'other_install' suggestion is derived from the live emulator's own
+            # config and can land back on the configured value, and a 'removed'
+            # one can suggest a cached directory belonging to the very emulator
+            # that just went away. '' is exempt — it means "clear it", which is
+            # a real change from any non-empty value.
+            if suggested and str(suggested) == str(value):
+                continue
             stale.append({
                 'section': section, 'key': key, 'label': label, 'kind': kind,
                 'value': value, 'reason': reason,
-                'suggested': self._suggested_path(kind),
+                'cause': cause, 'owner': owner,
+                'active': self.install_label(self._selected_install_key())
+                          if cause == 'other_install' else '',
+                'suggested': suggested,
             })
         return stale
 
@@ -5611,8 +6152,14 @@ class RetroArchInterface:
             # auto-detection would settle on once it exists.
             return self.expected_bios_dir()
         if kind == 'saves':
-            if self.save_dirs.get('saves'):
-                return str(self.save_dirs['saves'])
+            # save_dirs is detected once and cached, so after an uninstall it can
+            # still hold the dead emulator's folder — and suggesting it as the
+            # repair for a path flagged BECAUSE that emulator is gone offers a
+            # fix that changes nothing. Re-test it here rather than trusting the
+            # snapshot; the expected_save_dir() below is derived live.
+            saves = self.save_dirs.get('saves')
+            if saves and not self.is_dead_install_path(saves):
+                return str(saves)
             # Nothing on disk yet — use where the detected emulator WILL write
             # rather than a folder of ours it never reads.
             expected = self.expected_save_dir()
@@ -6508,12 +7055,149 @@ class RetroArchInterface:
         if overlay:
             cmd.extend(['--appendconfig', overlay])
 
+        # Saves land in a per-game folder for EVERY core, which is what lets a
+        # save be matched to its game when the core names the file something
+        # the ROM name can never match; see ensure_content_save_sorting.
+        try:
+            self.ensure_content_save_sorting()
+        except Exception as e:
+            print(f"⚠️  Could not set save sorting: {e}")
+
+        # Dreamcast saves only become syncable if flycast is told to keep them
+        # per game; see _ensure_per_game_vmu.
+        try:
+            self._ensure_per_game_vmu(rom_path, core_path)
+        except Exception as e:
+            print(f"⚠️  Per-game VMU setup skipped: {e}")
+
         # Boot into a state. Appended last so it survives every branch above,
         # and only when a slot was actually resolved — RetroArch fails the
         # launch outright if the entry state file isn't there.
         if entry_slot is not None:
             cmd.extend(['--entryslot', str(int(entry_slot))])
         return cmd, None
+
+    # The flycast core option that decides where Dreamcast saves live. The core
+    # still uses the legacy `reicast_` prefix even though the core is called
+    # flycast — verified against the shipped binary; the libretro docs quote a
+    # `flycast_`-prefixed name the core does not read.
+    VMU_OPTION_KEY = 'reicast_per_content_vmus'
+    # "VMU A1" covers only port A slot 1. A game that saves to any other slot
+    # writes to the SHARED card in the BIOS folder, where nothing can sync it —
+    # so cover all eight. Value strings are the core's own (read out of
+    # flycast_libretro.so); the libretro docs name a key this core ignores.
+    VMU_OPTION_VALUE = 'All VMUs'
+    # The ports flycast can write, as "<name>.<port>.bin" in the save folder.
+    VMU_PORTS = ('A1', 'A2', 'B1', 'B2', 'C1', 'C2', 'D1', 'D2')
+
+    def _ensure_per_game_vmu(self, rom_path, core_path):
+        """Make flycast keep this game's VMU in the save folder, not the BIOS one.
+
+        By default flycast writes Dreamcast saves to <system>/dc/vmu_save_A1.bin
+        — four VMU images shared by every Dreamcast game, in the BIOS tree. They
+        are not per game, are not in the save directory, and so cannot be synced
+        against a ROM. With per-content VMUs on, it writes
+        <save_dir>/<id>.A1.bin instead, which is an ordinary per-game save.
+
+        Written as a per-GAME core-options override rather than by editing the
+        global retroarch-core-options.cfg, which under RetroDECK is a file
+        RetroDECK owns and rewrites — the same reason launch settings go through
+        --appendconfig instead of retroarch.cfg.
+        """
+        if 'flycast' not in Path(core_path).name.lower():
+            return
+        cfg_dir = self.find_retroarch_config_dir()
+        if not cfg_dir:
+            return
+        # RetroArch looks for game-specific options under the core's *display*
+        # name ("Flycast"), not the library filename.
+        opt_dir = Path(cfg_dir) / 'config' / 'Flycast'
+        opt_file = opt_dir / f"{Path(rom_path).stem}.opt"
+        want = f'{self.VMU_OPTION_KEY} = "{self.VMU_OPTION_VALUE}"'
+        try:
+            lines = (opt_file.read_text(encoding='utf-8').splitlines()
+                     if opt_file.exists() else [])
+        except OSError:
+            lines = []
+        # Rewrite our key in place and leave every other line alone: the file is
+        # RetroArch's per-game options, and a user may have set others by hand.
+        # Earlier builds wrote "VMU A1" here, so existing files need upgrading
+        # rather than only newly created ones.
+        out, found = [], False
+        for line in lines:
+            if line.split('=')[0].strip() == self.VMU_OPTION_KEY:
+                out.append(want)
+                found = True
+            else:
+                out.append(line)
+        if not found:
+            out.append(want)
+        if out != lines:
+            try:
+                opt_dir.mkdir(parents=True, exist_ok=True)
+                opt_file.write_text('\n'.join(out) + '\n', encoding='utf-8')
+                print(f"📝 Per-game VMUs enabled for {Path(rom_path).stem}")
+            except OSError as e:
+                print(f"⚠️  Could not write the per-game VMU option: {e}")
+                return
+        self._seed_per_game_vmu(rom_path)
+
+    def _seed_per_game_vmu(self, rom_path):
+        """Copy the shared VMUs into this game's slots the first time round.
+
+        Flipping the option otherwise hands the game blank memory cards: the
+        existing progress stays in the shared vmu_save_<port>.bin files and is
+        simply never read again. Flycast reads "<content name>.<port>.bin" when
+        no id-named file exists yet (its documented legacy path) and writes the
+        id-named one from then on, so seeding under the content name migrates
+        the data on the next boot without us having to know the disc's game id.
+
+        Decided per PORT, not per game. Flycast renames as it migrates — it
+        reads "<content>.A1.bin" once and writes "<game id>.A1.bin" after — so
+        a check for the content name alone stays false forever and every later
+        launch restored a stale shared card beside the live one. A whole-folder
+        "any VMU at all?" check has the opposite flaw: once A1 has migrated it
+        would block B1-D1 from ever being seeded.
+        """
+        bios_dir = getattr(getattr(self, 'bios_manager', None), 'system_dir', None)
+        if not bios_dir:
+            return
+        save_dir = self._vmu_save_dir(rom_path)
+        if not save_dir:
+            return
+        stem = Path(rom_path).stem
+        seeded = []
+        for port in self.VMU_PORTS:
+            shared = Path(bios_dir) / 'dc' / f'vmu_save_{port}.bin'
+            if not shared.is_file():
+                continue  # this port was never used — flycast makes a fresh card
+            try:
+                if any(save_dir.glob(f'*.{port}.bin')):
+                    continue  # this port already migrated
+                save_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(shared, save_dir / f"{stem}.{port}.bin")
+                seeded.append(port)
+            except OSError as e:
+                print(f"⚠️  Could not seed VMU {port}: {e}")
+        if seeded:
+            print(f"💾 Seeded per-game VMUs from the shared cards: {', '.join(seeded)}")
+
+    def _vmu_save_dir(self, rom_path):
+        """The directory flycast will be handed as its save directory.
+
+        RetroArch passes the *effective* save path, so content-sorted setups
+        (RetroDECK's default) put it in a per-game folder.
+        """
+        base = (self.save_dirs or {}).get('saves') or self.expected_save_dir()
+        if not base:
+            return None
+        base = Path(base)
+        mode = self.get_save_subdir_mode('saves')
+        if mode == 'content':
+            return base / Path(rom_path).parent.name
+        if mode == 'core':
+            return base / self.get_retroarch_directory_name('flycast')
+        return base
 
     # RetroArch's input_menu_toggle_gamepad_combo, "L3 + R3" — the second entry
     # after "None" in its own list, and the one RetroDECK settles on.
@@ -6830,6 +7514,62 @@ class RetroArchInterface:
             pass
         return default
 
+    def ensure_content_save_sorting(self):
+        """Make RetroArch sort SAVES into saves/<content name>/, and keep it there.
+
+        The one setting that makes a save attributable to a game no matter what
+        the core called the file: the folder carries the identity, so flycast's
+        "MK-51136.A1.bin" and lrps2's "Mcd001.ps2" (the same name for every PS2
+        game) both resolve without Ludo knowing any core's naming rules.
+
+        Written persistently, the way RetroDECK writes it, rather than through
+        the per-launch overlay. The overlay would only cover launches Ludo
+        starts, while get_save_subdir_mode reads retroarch.cfg — so a game
+        started from RetroDECK's own UI would save flat while Ludo looked in a
+        per-game folder, and a save would go missing with no error anywhere.
+        A persistent setting can't disagree with the reader: if RetroDECK
+        rewrites the file, we read ITS value (still correct, just less capable)
+        and re-apply ours at the next launch.
+
+        Saves only. States are left alone — they are ROM-named, so they match
+        without this, and RetroDECK deliberately sorts them by core.
+
+        Never CREATES the file: an existing retroarch.cfg means RetroArch has
+        run, while writing one before it ever has suppresses its first-run setup
+        (which is how the menu font got broken). Nothing to migrate then anyway.
+        """
+        cfg_dir = self.find_retroarch_config_dir()
+        if not cfg_dir:
+            return False
+        cfg = Path(cfg_dir) / 'retroarch.cfg'
+        if not cfg.exists():
+            return False
+        # Core sorting takes precedence over content sorting in RetroArch, so
+        # it has to be off for the content setting to have any effect.
+        want = {'sort_savefiles_enable': 'false',
+                'sort_savefiles_by_content_enable': 'true'}
+        try:
+            lines = cfg.read_text(encoding='utf-8').splitlines()
+            out, seen = [], set()
+            for line in lines:
+                key = line.split('=')[0].strip()
+                if key in want:
+                    out.append(f'{key} = "{want[key]}"')
+                    seen.add(key)
+                else:
+                    out.append(line)
+            for key, value in want.items():
+                if key not in seen:
+                    out.append(f'{key} = "{value}"')
+            if out == lines:
+                return False
+            cfg.write_text('\n'.join(out) + '\n', encoding='utf-8')
+            print("📂 Saves now sort by content, so every core's saves stay per-game")
+            return True
+        except OSError as e:
+            print(f"⚠️  Could not set save sorting: {e}")
+            return False
+
     def get_save_subdir_mode(self, save_type='saves'):
         """Return the folder-sorting mode RetroArch uses for saves or states.
 
@@ -7053,6 +7793,66 @@ class RetroArchInterface:
                 and not self.flatpak_app_installed('net.retrodeck.retrodeck'):
             return True
         return False
+
+    # Display names for the two installs we can tell apart by path. Keyed by the
+    # app ids in _EMULATOR_APP_IDS, whose exact casing matters: they are passed
+    # to flatpak_app_installed, which matches what `flatpak list` prints.
+    _INSTALL_LABELS = {'net.retrodeck.retrodeck': 'RetroDECK',
+                       'org.libretro.RetroArch': 'RetroArch'}
+
+    def _install_key_for_path(self, path):
+        """Which emulator's tree `path` sits in, as one of _EMULATOR_APP_IDS, or
+        None when it belongs to neither.
+
+        Path-based, deliberately: these are settings values, so there is no
+        process to ask — the tree a folder lives in is the only evidence of who
+        reads it.
+        """
+        s = str(path).lower()
+        for app_id in self._EMULATOR_APP_IDS:
+            if app_id.lower() in s:
+                return app_id
+        retrodeck_home = str(Path.home() / 'retrodeck').lower()
+        if s == retrodeck_home or s.startswith(retrodeck_home + os.sep):
+            return 'net.retrodeck.retrodeck'
+        return None
+
+    def _selected_install_key(self):
+        """Which emulator Ludo actually launches, as one of _EMULATOR_APP_IDS,
+        or None when it is neither flatpak."""
+        exe = (self.retroarch_executable or '').lower()
+        if 'retrodeck' in exe:
+            return 'net.retrodeck.retrodeck'
+        if 'org.libretro.retroarch' in exe:
+            return 'org.libretro.RetroArch'
+        return None
+
+    def belongs_to_other_install(self, path):
+        """True when `path` lives in an emulator tree that IS installed but is
+        not the one Ludo launches.
+
+        The mirror of is_dead_install_path, and the case it misses entirely:
+        with both RetroDECK and bare RetroArch present, nothing is dead, so a
+        BIOS folder aimed at RetroArch's system/ passes every liveness test
+        while every game is launched under RetroDECK — which reads
+        ~/retrodeck/bios and finds nothing. Ludo then reports the BIOS present
+        (it is, in the folder Ludo was told about) and the core refuses to boot.
+        _prefer_selected_install already applies this reasoning to discovery;
+        this applies it to the settings the user carries between installs.
+        """
+        selected = self._selected_install_key()
+        if not selected:
+            return False
+        owner = self._install_key_for_path(path)
+        # Unknown tree = the user's own folder, which is theirs to choose.
+        # Dead trees are is_dead_install_path's to report, with better copy.
+        if not owner or owner == selected or self.is_dead_install_path(path):
+            return False
+        return self.flatpak_app_installed(owner)
+
+    def install_label(self, key):
+        """Human name for an install key, for UI copy."""
+        return self._INSTALL_LABELS.get(key, 'another emulator')
 
     def _prefer_selected_install(self, dirs):
         """Drop dead installs, then float the dirs belonging to the SELECTED
@@ -8135,8 +8935,15 @@ class RetroArchInterface:
 
         if save_type == 'saves':
             # For save files, preserve the original extension for all known save formats
-            known_save_exts = {'.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra'}
+            known_save_exts = {'.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra',
+                               '.ps2', '.mcd', '.raw', '.gci'}
             if original_ext in known_save_exts:
+                target_filename = f"{base_name}{original_ext}"
+            elif _is_vmu_save(f"{base_name}{original_ext}"):
+                # Flycast VMUs are ".bin" and the name is the disc's game id, which
+                # the core derives itself — renaming to .srm both hides the file
+                # from flycast and from our own "does the local save exist?" check,
+                # so every launch re-downloaded it under a name nothing reads.
                 target_filename = f"{base_name}{original_ext}"
             else:
                 # Default to .srm if unknown save extension
@@ -8269,7 +9076,12 @@ class RetroArchInterface:
         save_files = {}
         
         # Define common save and state extensions
-        save_extensions = {'.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra'}
+        # ".ps2"/".mcd" are lrps2 memory cards, ".raw"/".gci" dolphin's. Their
+        # names never match the ROM ("Mcd001.ps2" is the same for every PS2
+        # game), so they only resolve when RetroArch is sorting saves per
+        # content — but they have to be *discovered* either way.
+        save_extensions = {'.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra',
+                           '.ps2', '.mcd', '.raw', '.gci'}
         state_extensions = {'.state', '.state1', '.state2', '.state3', '.state4', '.state5', '.state6', '.state7', '.state8', '.state9'}
         
         for save_type, directory in self.save_dirs.items():
@@ -8296,7 +9108,9 @@ class RetroArchInterface:
                                 retroarch_emulator = emulator_dir  # This is already the RetroArch name
                             
                             # Check file extension
-                            if save_type == 'saves' and file_path.suffix.lower() in save_extensions:
+                            if save_type == 'saves' and (
+                                    file_path.suffix.lower() in save_extensions
+                                    or _is_vmu_save(file_path)):
                                 files.append({
                                     'name': file_path.name,
                                     'path': str(file_path),
@@ -8746,6 +9560,11 @@ class AutoSyncManager:
         self.upload_queue = queue.Queue()
         self.upload_debounce = defaultdict(float)  # file_path -> last_change_time
         self.last_uploaded = {}  # file_path -> (size, mtime) of last successful upload
+        # Paths with an upload in flight right now. Guards the window between
+        # starting an upload and recording its fingerprint — see
+        # process_save_upload.
+        self._uploads_inflight = set()
+        self._uploads_inflight_lock = threading.Lock()
         # Coalesces concurrent session syncs (connect vs RetroArch-close triggers).
         self._session_sync_lock = threading.Lock()
         
@@ -8781,10 +9600,52 @@ class AutoSyncManager:
         # carries that name, so name matching cannot attribute those saves — but
         # we launched the file, so we know. Bounded: only recent launches matter.
         self._launch_aliases = OrderedDict()
+        # rom_id → that same on-disk stem, for the lookups that go the other way.
+        self._launch_stems = OrderedDict()
+        # The launch in progress: (rom_id, started_at). What lets a save whose
+        # name comes from the DISC rather than the file be attributed at all —
+        # see _vmu_owners.
+        self._active_launch = None
+        # Learned "<disc id>" -> rom_id for flycast's VMU images, persisted
+        # because it can only be learned while the game that produced them is
+        # being launched. Without it a Dreamcast game stored as a single file
+        # can never have its VMUs uploaded: flycast names them after the disc
+        # header ("T1401D__50.A1.bin"), and the enclosing folder is the platform
+        # ("saves/dreamcast/"), so neither the name nor the folder identifies
+        # the game. A game in its own folder is matched by folder and never
+        # reaches this.
+        self.vmu_owners_file = cache_dir() / 'vmu_owners.json'
+        self._vmu_owners = {}
+        self._load_vmu_owners()
 
         # Add lock mechanism
         self.lock = AutoSyncLock()
         self.instance_id = f"{'gui' if parent_window else 'daemon'}_{os.getpid()}"
+
+    def _load_vmu_owners(self):
+        """Load the learned VMU-name → rom_id map."""
+        try:
+            if self.vmu_owners_file.exists():
+                with open(self.vmu_owners_file, 'r') as f:
+                    self._vmu_owners = {str(k): int(v) for k, v
+                                        in (json.load(f) or {}).items()}
+                logging.debug(f"Loaded {len(self._vmu_owners)} VMU owners from cache")
+        except Exception as e:
+            logging.debug(f"Could not load VMU owners: {e}")
+            self._vmu_owners = {}
+
+    def _remember_vmu_owner(self, base, rom_id):
+        """Bind a VMU's disc-derived name to the game that produced it."""
+        try:
+            if not base or not rom_id or self._vmu_owners.get(base) == rom_id:
+                return
+            self._vmu_owners[base] = int(rom_id)
+            self.vmu_owners_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.vmu_owners_file, 'w') as f:
+                json.dump(self._vmu_owners, f, indent=2)
+            self.log(f"🔗 VMU '{base}' belongs to rom {rom_id}")
+        except Exception as e:
+            logging.debug(f"Could not persist VMU owner: {e}")
 
     def _load_upload_fingerprints(self):
         """Load upload fingerprints from disk"""
@@ -9666,6 +10527,33 @@ class AutoSyncManager:
         self.upload_debounce[file_path] = current_time
     
     def process_save_upload(self, file_path):
+        """Upload a save file once, even if two triggers race for it.
+
+        The fingerprint check in the inner method only proves "this file hasn't
+        been uploaded *and finished*" — ``last_uploaded`` is written in the
+        success branch, after a round-trip that takes seconds for a 1.4MB state.
+        Two independent triggers reach here (the watcher's upload worker and
+        flush_pending_states on connect), and when the second arrives inside
+        that window it sees a stale fingerprint and uploads the same bytes
+        again: two server records, two screenshots, two revisions burned off the
+        autocleanup limit, two toasts.
+
+        So claim the path for the duration of the upload, not just until the
+        fingerprint lands.
+        """
+        key = str(file_path)
+        with self._uploads_inflight_lock:
+            if key in self._uploads_inflight:
+                logging.debug(f"Upload already in flight for {Path(file_path).name}; skipping duplicate trigger")
+                return
+            self._uploads_inflight.add(key)
+        try:
+            self._process_save_upload(file_path)
+        finally:
+            with self._uploads_inflight_lock:
+                self._uploads_inflight.discard(key)
+
+    def _process_save_upload(self, file_path):
         """Process a queued save file upload — server handles conflict detection via 409"""
         try:
             file_path = Path(file_path)
@@ -9687,7 +10575,11 @@ class AutoSyncManager:
                 return
 
             # Determine save type and slot info
-            if file_path.suffix.lower() in ['.srm', '.sav']:
+            # Every save format, not just .srm/.sav: a VMU or a PS2 memory card
+            # reaching here used to fall through to "unknown save file type"
+            # and be dropped, so the session sweep was its only route up.
+            if (file_path.suffix.lower() in self._SAVE_EXTS
+                    or _is_vmu_save(file_path)):
                 # SAVES: RomM's protocol is session-based ("sync once per session,
                 # not per save"). Rather than negotiate on this single file, mark it
                 # synced (so RetroArch's exit-flush doesn't re-trigger) and kick a
@@ -9762,16 +10654,35 @@ class AutoSyncManager:
                     self.log(f"✅ Server accepted {file_path.name} (200 OK) with screenshot")
                 else:
                     self.log(f"✅ Server accepted {file_path.name} (200 OK)")
-                self.retroarch.send_notification(f"{save_type.rstrip('s').capitalize()} uploaded")
+                _gname, _gcover = None, False
                 try:
-                    _gname = next((g.get('name') for g in (self.get_games() or [])
-                                   if g.get('rom_id') == rom_id), None)
+                    _g = next((g for g in (self.get_games() or [])
+                               if g.get('rom_id') == rom_id), None)
+                    if _g:
+                        _gname = _g.get('name')
+                        _gcover = bool(_g.get('has_cover') or _g.get('path_cover_small')
+                                       or _g.get('cover_path'))
                 except Exception:
-                    _gname = None
+                    pass
                 _kind_label = save_type.rstrip('s').capitalize()
-                _record_activity('save',
-                                 f"{_kind_label} uploaded — {_gname}" if _gname else f"{_kind_label} uploaded",
-                                 file_path.name)
+                _title = (f"{_kind_label} uploaded — {_gname}" if _gname
+                          else f"{_kind_label} uploaded")
+                _record_activity('save', _title, file_path.name)
+                # The ONE announcement for this upload: queue_game_sync_toast
+                # picks the surface (RetroArch's OSD while a game is up, a Ludo
+                # toast otherwise). This used to fire a bare "State uploaded" to
+                # the OSD here as well, from back when the toast couldn't reach
+                # RetroArch — that became a duplicate: the same event announced
+                # twice, three seconds apart, the second one merged and named.
+                # One per game, carrying rom_id so the toast shows that game's
+                # cover and opens it. Held briefly and merged with this game's
+                # save sync, so a session that produced both is one message, not
+                # two. The activity row above is filed immediately and stays
+                # separate.
+                queue_game_sync_toast(
+                    rom_id, _gname or file_path.name, has_cover=_gcover,
+                    states_up=1,
+                )
             else:
                 self.log(f"❌ Server rejected {file_path.name} — upload failed")
                 self.retroarch.send_notification(f"Upload failed: {file_path.name}")
@@ -9906,7 +10817,8 @@ class AutoSyncManager:
         done.wait(timeout=120)
         return choice[0]
 
-    _SAVE_EXTS = ('.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra')
+    _SAVE_EXTS = ('.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra',
+                  '.ps2', '.mcd', '.raw', '.gci')
 
     def reconcile_game_saves(self, game, core_name=None):
         """Put this game's save where RetroArch will actually read it.
@@ -9928,6 +10840,13 @@ class AutoSyncManager:
 
         Returns a short description of what it did, or '' for nothing.
         """
+        # Flip sorting BEFORE deciding where the save belongs: this runs ahead
+        # of build_launch_command, so reading the mode first would file the
+        # save for the old layout and RetroArch would then read the new one.
+        try:
+            self.retroarch.ensure_content_save_sorting()
+        except Exception as e:
+            print(f"⚠️  Could not set save sorting: {e}")
         try:
             base = (getattr(self.retroarch, 'save_dirs', {}) or {}).get('saves')
             if not base:
@@ -9963,7 +10882,7 @@ class AutoSyncManager:
                 # accumulate with nothing to prune them — including the ones a
                 # switch away from core mode strands in the old per-core folders.
                 # The content dir is knowable, so reconcile it like any other.
-                sub = self._content_dir_for_game(game) or game.get('platform_slug')
+                sub = self._content_dir_for_game(game) or platform_folder_name(game.get('platform_slug'))
                 if not sub:
                     return ''
                 target_dir = base / sub
@@ -9997,6 +10916,29 @@ class AutoSyncManager:
     # stores alongside each one.
     _STATE_RE = re.compile(r'^\.state(\d+)?(\.auto)?(\.png)?$', re.IGNORECASE)
 
+    def _state_stems_for_game(self, game):
+        """Every filename stem this game's save states can carry, best first.
+
+        The ROM's own stem is not enough. RetroArch names a state after the file
+        it BOOTED, and for a disc dump that is a track file inside the folder,
+        whose name need not match the folder at all — a Dreamcast GDI carries
+        its revision ("Crazy Taxi 2 v1.004 (2001)(Sega)(US)[!].state" inside
+        "Crazy Taxi 2 (2001)(Sega)(US)[!]/"). Matching on the ROM stem found
+        nothing, so Continue playing launched such a game at the title screen
+        and showed box art instead of the state's screenshot.
+
+        The launched name comes first: it is what the imminent launch will read.
+        """
+        out = []
+        stem = self._launch_stems.get(game.get('rom_id'))
+        if stem:
+            out.append(stem)
+        for candidate in (Path(game.get('local_path') or '').stem if game.get('local_path') else '',
+                          game.get('name') or ''):
+            if candidate and candidate not in out:
+                out.append(candidate)
+        return out
+
     def state_location_for_game(self, game, core_name=None):
         """(states_base, target_dir, stem) for this game, or (None, None, '').
 
@@ -10004,19 +10946,23 @@ class AutoSyncManager:
         this launch — which depends on its savestate-subdir mode and, in core
         mode, on the core about to run. Shared by reconcile_game_states (which
         moves files INTO it) and latest_state_slot (which reads what's there).
+
+        `stem` is the name the NEXT state will be written under; both callers
+        also have to recognise the other names this game's existing states may
+        carry, which is _state_stems_for_game.
         """
         base = (getattr(self.retroarch, 'save_dirs', {}) or {}).get('states')
         if not base:
             return None, None, ''
         base = Path(base)
-        local_path = game.get('local_path') or ''
-        stem = Path(local_path).stem if local_path else (game.get('name') or '')
+        stems = self._state_stems_for_game(game)
+        stem = stems[0] if stems else ''
         if not stem:
             return None, None, ''
 
         mode = self.retroarch.get_save_subdir_mode('states')
         if mode == 'content':
-            sub = self._content_dir_for_game(game) or game.get('platform_slug')
+            sub = self._content_dir_for_game(game) or platform_folder_name(game.get('platform_slug'))
             if not sub:
                 return None, None, ''
             target_dir = base / sub
@@ -10038,20 +10984,40 @@ class AutoSyncManager:
         one itself when autoload is on, and it has no slot number to pass.
         """
         try:
-            _, target_dir, stem = self.state_location_for_game(game, core_name)
+            _, target_dir, _ = self.state_location_for_game(game, core_name)
             if not target_dir or not target_dir.is_dir():
                 return None, None
+            stems = self._state_stems_for_game(game)
+            mode = self.retroarch.get_save_subdir_mode('states')
             newest, newest_mtime, slot = None, -1.0, None
-            for f in target_dir.glob(stem + '.state*'):
+            for f in target_dir.glob('*.state*'):
                 if not f.is_file():
                     continue
-                m = re.match(r'^\.state(\d*)$', f.name[len(stem):], re.IGNORECASE)
+                match = next((s for s in stems if f.name.startswith(s + '.state')), None)
+                if match is not None:
+                    tail = f.name[len(match):]
+                elif mode == 'content':
+                    # A per-content folder holds THIS game's states and nothing
+                    # else, so a name we can't predict is still ours — a state
+                    # made on another device, from a dump of the same game under
+                    # a different file name, is the case that matters.
+                    tail = f.name[f.name.lower().rindex('.state'):]
+                else:
+                    continue
+                m = re.match(r'^\.state(\d*)$', tail, re.IGNORECASE)
                 if not m:
                     continue
                 mtime = f.stat().st_mtime
                 if mtime > newest_mtime:
                     newest, newest_mtime = f, mtime
-                    slot = int(m.group(1)) if m.group(1) else 0
+                    # A slot number is only meaningful for the name the launch
+                    # will boot under: --entryslot makes RetroArch open
+                    # "<booted file>.stateN", so pointing it at a slot whose
+                    # file is named after something else aborts the launch.
+                    # The path is still returned — the Continue-playing
+                    # screenshot only needs the picture, not a slot.
+                    slot = ((int(m.group(1)) if m.group(1) else 0)
+                            if match == stems[0] else None)
             return slot, newest
         except Exception as e:
             print(f"⚠️  Could not resolve the latest save state: {e}")
@@ -10075,9 +11041,13 @@ class AutoSyncManager:
         Returns a short description of what it did, or '' for nothing.
         """
         try:
-            base, target_dir, stem = self.state_location_for_game(game, core_name)
+            base, target_dir, _ = self.state_location_for_game(game, core_name)
             if not target_dir:
                 return ''
+            # Every name this game's states can carry, not just the ROM's: a
+            # disc dump boots a track file whose name differs from the folder,
+            # and states written under THAT name were left behind here.
+            stems = self._state_stems_for_game(game)
 
             # Group every copy by file name, so each slot is reconciled on its
             # own. ".backup" copies are Ludo's own pre-overwrite safety net and
@@ -10085,7 +11055,11 @@ class AutoSyncManager:
             by_name = {}
             for d in [base] + [p for p in base.iterdir() if p.is_dir()]:
                 for f in d.glob('*'):
-                    if not f.is_file() or not f.name.startswith(stem + '.state'):
+                    if not f.is_file():
+                        continue
+                    stem = next((s for s in stems
+                                 if f.name.startswith(s + '.state')), None)
+                    if stem is None:
                         continue
                     if not self._STATE_RE.match(f.name[len(stem):]):
                         continue
@@ -10158,12 +11132,18 @@ class AutoSyncManager:
             self.log(f"⚠️ Could not refresh save directories: {e}")
             return False
 
-    def _notify_sync_result(self, summary):
+    def _notify_sync_result(self, summary, trigger=""):
         """Put the outcome of a save-sync on RetroArch's on-screen display.
 
         Only while RetroArch is actually running — the command is UDP to its
         network-command port, so it would otherwise vanish into a closed socket
         — and only when something moved or failed.
+
+        A sweep triggered BY the emulator closing is the one case where the
+        wait-for-RetroArch fallback can never pay off: the process we would be
+        waiting for is the one whose exit started this. Queuing there just left
+        a 30-second timer to expire into "RetroArch never came up". Ludo's own
+        toast still fires — that is the channel that reaches the player here.
         """
         up, down = summary.get('uploaded', 0), summary.get('downloaded', 0)
         conflicts, errors = len(summary.get('conflicts') or []), summary.get('errors', 0)
@@ -10183,11 +11163,22 @@ class AutoSyncManager:
             if down:
                 parts.append(f"{plural(down, 'save')} downloaded")
             msg = f"RomM: {', '.join(parts)}"
-        # Straight out when the emulator is up (an in-session save), queued for
-        # its arrival otherwise (a sync that ran just before launch).
+        # Only trouble is announced from here. Every upload and download in this
+        # sweep is ALSO announced per game by queue_game_sync_toast, which now
+        # reaches the OSD too, so this summary could only ever repeat it: a
+        # one-save session put "RomM: 1 save uploaded" on screen and then "Save
+        # uploaded" seconds later, and a pre-launch sweep queued its summary to
+        # be delivered two seconds INTO the game, describing work finished
+        # before the game even started. Conflicts and errors have no per-game
+        # channel and are the cases where the player has to do something.
+        if not (errors or conflicts):
+            return
+        # Straight out when the emulator is up, queued for its arrival otherwise
+        # (a sync that ran just before launch). Never queued for a sweep the
+        # emulator's own exit triggered: the process it would wait for is gone.
         if self.retroarch.emulator_process_running():
             self.retroarch.send_notification(msg)
-        else:
+        elif 'closed' not in (trigger or '').lower():
             self.retroarch.send_notification_when_ready(msg)
 
     def build_sync_inventory(self):
@@ -10208,6 +11199,17 @@ class AutoSyncManager:
         # The emulator may have created its save tree since sync started.
         self.refresh_save_dirs()
         save_files = self.retroarch.get_save_files() or {}
+        # Under content sorting the save's folder is the GAME, not an emulator,
+        # so the label below has to come from the ROM instead — see _emulator_label.
+        content_sorted = self.retroarch.get_save_subdir_mode('saves') == 'content'
+        slugs = {}
+        if content_sorted:
+            try:
+                slugs = {g.get('rom_id'): (g.get('platform_slug')
+                                           or (g.get('romm_data') or {}).get('platform_slug'))
+                         for g in (self.get_games() or [])}
+            except Exception as e:
+                logging.debug(f"could not map platforms for the inventory: {e}")
         for entry in save_files.get('saves', []):
             path = Path(entry['path'])
             rom_id = self.find_rom_id_for_save_file(path)
@@ -10228,7 +11230,22 @@ class AutoSyncManager:
             # folder name (e.g. "n64"). get_save_files()' retroarch_emulator is
             # just the directory; the states path already converts via
             # get_emulator_info_from_path, so mirror it here for consistency.
-            emulator = self.retroarch.get_emulator_info_from_path(path).get('romm_emulator') \
+            #
+            # That label is derived from the containing folder, which only names
+            # an emulator while RetroArch sorts saves per core. Under content
+            # sorting the folder is whatever the content sits in — the platform
+            # for a bare file, the game's own directory for a dump — so the same
+            # platform reported "dreamcast" for one game and
+            # "Dino Crisis (2000)(Capcom)(US)[!]" for the next. The ROM's
+            # platform is the one answer that doesn't depend on how the game
+            # happens to be stored.
+            emulator = None
+            if content_sorted:
+                slug = slugs.get(rom_id)
+                if slug:
+                    emulator = self.retroarch.get_core_from_platform_slug(slug)
+            emulator = emulator \
+                or self.retroarch.get_emulator_info_from_path(path).get('romm_emulator') \
                 or entry.get('retroarch_emulator')
 
             inventory.append({
@@ -10334,7 +11351,7 @@ class AutoSyncManager:
                 # BEFORE the negotiate baseline, so they actually reach the
                 # server instead of being marked synced in place.
                 self.flush_pending_states()
-                self.run_negotiated_save_sync()
+                self.run_negotiated_save_sync(trigger=reason)
             except Exception as e:
                 self.log(f"❌ Session save-sync failed: {e}")
             finally:
@@ -10346,7 +11363,7 @@ class AutoSyncManager:
 
         threading.Thread(target=_run, daemon=True, name="romm-session-sync").start()
 
-    def run_negotiated_save_sync(self, conflict_resolver=None):
+    def run_negotiated_save_sync(self, conflict_resolver=None, trigger=""):
         """Run one save-sync cycle via RomM 4.9.0's /negotiate engine (SAVES ONLY).
 
         Builds the local inventory, negotiates with the server, then executes the
@@ -10550,7 +11567,7 @@ class AutoSyncManager:
         # Nothing is said for an all-quiet cycle ("0 up, 0 down, 1 in-sync"):
         # an OSD popup on every session boundary would be noise.
         try:
-            self._notify_sync_result(summary)
+            self._notify_sync_result(summary, trigger=trigger)
         except Exception as e:
             logging.debug(f"could not send the RetroArch notification: {e}")
         # Feed entries only when the cycle actually moved data or hit trouble —
@@ -10558,9 +11575,9 @@ class AutoSyncManager:
         # entry per game so the feed reads "Save sync — Pokémon Emerald".
         if summary['_per_game'] or summary['errors'] or summary['conflicts']:
             try:
-                names = {g.get('rom_id'): g.get('name') for g in (self.get_games() or [])}
+                games = {g.get('rom_id'): g for g in (self.get_games() or [])}
             except Exception:
-                names = {}
+                games = {}
             for rid, c in summary['_per_game'].items():
                 parts = []
                 if c['up']:
@@ -10568,9 +11585,19 @@ class AutoSyncManager:
                 if c['down']:
                     parts.append(f"{c['down']} save{'s' if c['down'] != 1 else ''} downloaded")
                 if parts:
-                    _record_activity('save',
-                                     f"Save sync — {names.get(rid) or f'ROM {rid}'}",
-                                     ', '.join(parts))
+                    g = games.get(rid) or {}
+                    name = g.get('name') or f'ROM {rid}'
+                    _record_activity('save', f"Save sync — {name}", ', '.join(parts))
+                    # Toast it as well. Saves used to get nothing on screen, only
+                    # this feed row — so a save uploaded (or, worse, one pulled
+                    # DOWN over the local file) happened silently. Merged with
+                    # any state this game syncs in the same window.
+                    queue_game_sync_toast(
+                        rid if isinstance(rid, int) else None, name,
+                        has_cover=bool(g.get('has_cover') or g.get('path_cover_small')
+                                       or g.get('cover_path')),
+                        saves_up=c['up'], saves_down=c['down'],
+                    )
             if summary['errors'] or summary['conflicts']:
                 parts = []
                 if summary['conflicts']:
@@ -10611,6 +11638,9 @@ class AutoSyncManager:
             # match fs_name_no_ext. Strip the full suffix for that case.
             if file_path.name.lower().endswith('.state.auto'):
                 save_basename = file_path.name[:-len('.state.auto')]
+            elif _is_vmu_save(file_path):
+                # "<name>.A1.bin" — .stem would leave ".A1" attached.
+                save_basename = _VMU_SAVE_RE.sub('', file_path.name)
             else:
                 save_basename = file_path.stem
 
@@ -10770,6 +11800,54 @@ class AutoSyncManager:
                 if clean_game_name and clean_game_name.lower() == clean_save_name.lower():
                     return game['rom_id']
 
+            # TIER 4: a VMU named after the disc's internal game id ("MK-51184")
+            # matches nothing above — flycast names it from the disc header, not
+            # the file. Under content sorting the enclosing folder IS the game,
+            # so ask again as if the save were named after it. Only for VMUs:
+            # for every other save type the filename is authoritative, and
+            # trusting the folder there would attribute stray files by location.
+            # TIER 4: the containing folder. Under content sorting RetroArch
+            # puts a game's saves in saves/<content name>/, so the FOLDER is the
+            # identity even when the filename is not — and plenty of cores name
+            # saves something the ROM name can never match: flycast writes the
+            # disc id ("MK-51136.A1.bin"), lrps2 writes "Mcd001.ps2" for every
+            # PS2 game alike, dolphin writes "MemoryCardA.USA.raw". Retrying as
+            # "<folder>.srm" reuses the whole matcher above rather than adding a
+            # naming rule per core.
+            folder = file_path.parent.name
+            if folder and folder != save_basename:
+                by_folder = self.find_rom_id_for_save_file(
+                    file_path.parent / f"{folder}.srm")
+                if by_folder:
+                    return by_folder
+
+            # TIER 5: a VMU that neither its name nor its folder identifies.
+            # Flycast names these from the disc header, so a Dreamcast game
+            # stored as a single file writes "T1401D__50.A1.bin" into the
+            # PLATFORM folder (content sorting only gives a per-game folder when
+            # the ROM itself is a folder) — nothing above can match it, and
+            # those VMUs were silently never uploaded.
+            #
+            # The one moment the owner is knowable is the launch: we started
+            # that game, and this file was written during the session. Learn it
+            # then, and remember it, because after a restart even that is gone.
+            if _is_vmu_save(file_path):
+                owner = self._vmu_owners.get(save_basename)
+                if owner:
+                    return owner
+                launch = self._active_launch
+                if launch:
+                    rom_id, started = launch
+                    try:
+                        touched = file_path.stat().st_mtime
+                    except OSError:
+                        touched = 0
+                    # Written after we launched — a stale VMU from some earlier
+                    # session belongs to whatever game made it, not this one.
+                    if touched >= started:
+                        self._remember_vmu_owner(save_basename, rom_id)
+                        return rom_id
+
             return None
 
         except Exception as e:
@@ -10874,6 +11952,14 @@ class AutoSyncManager:
                 return
             self._launch_aliases.pop(stem, None)
             self._launch_aliases[stem] = rom_id
+            # The same fact keyed the other way, for the code that has to
+            # PREDICT a filename rather than recognise one — states are found by
+            # name, and the booted file is what RetroArch names them after.
+            self._launch_stems.pop(rom_id, None)
+            self._launch_stems[rom_id] = stem
+            while len(self._launch_stems) > self._LAUNCH_ALIAS_LIMIT:
+                self._launch_stems.popitem(last=False)
+            self._active_launch = (rom_id, time.time())
             while len(self._launch_aliases) > self._LAUNCH_ALIAS_LIMIT:
                 self._launch_aliases.popitem(last=False)
         except Exception as e:
@@ -10956,8 +12042,17 @@ class AutoSyncManager:
             try:
                 rom_dir = Path(self.settings.get('Download', 'rom_directory',
                                                  str(library_dir() / 'roms'))).expanduser()
-                platform_dir = rom_dir / platform_slug
-                if platform_dir.exists():
+                # Try BOTH folder names and keep looking until the ROM is
+                # actually found. "First one that exists" is not good enough:
+                # RetroDECK pre-creates every one of its ES-DE folders with a
+                # systeminfo.txt inside, so roms/dreamcast exists and is empty
+                # while the game sits in roms/dc — stopping at the first
+                # existing folder finds nothing and silently falls back to the
+                # platform name, sending saves somewhere RetroArch never reads.
+                for folder in platform_folder_candidates(platform_slug):
+                    platform_dir = rom_dir / folder
+                    if not platform_dir.exists():
+                        continue
                     # Case 1: file_name is itself a folder (container ROM like
                     # "Pokémon HeartGold Version") → content dir IS that folder.
                     if (platform_dir / rom_file_name).is_dir():
@@ -10977,6 +12072,8 @@ class AutoSyncManager:
                             if subdir.is_dir() and (subdir / rom_file_name).exists():
                                 content_dir = subdir.name
                                 break
+                    if content_dir:
+                        break
             except Exception:
                 pass
         # If still not found (flat ROM), fall back to local_path's parent.
@@ -10984,7 +12081,7 @@ class AutoSyncManager:
             local_path = game.get('local_path')
             if local_path:
                 candidate = Path(local_path).parent.name
-                if candidate and candidate != platform_slug:
+                if candidate and candidate not in platform_folder_candidates(platform_slug):
                     content_dir = candidate
         return content_dir
 
@@ -11383,9 +12480,11 @@ class AutoSyncManager:
                         elif subdir_mode == 'content':
                             # Use the ROM's actual parent folder name (what RetroArch uses as content dir)
                             # rather than the stored emulator field, which may be from a different device/mode.
-                            # For a flat ROM the content dir IS the platform folder (== platform_slug);
-                            # prefer that over the emulator-derived name so saves land where RetroArch reads.
-                            subdir_name = (_content_dir or _platform_slug
+                            # For a flat ROM the content dir IS the platform folder, which is
+                            # the ES-DE folder name rather than the raw RomM slug when the two
+                            # differ (dreamcast vs dc); prefer that over the emulator-derived
+                            # name so saves land where RetroArch reads.
+                            subdir_name = (_content_dir or platform_folder_name(_platform_slug)
                                            or self.get_platform_slug_from_emulator(romm_emulator))
                             emulator_save_dir = save_base_dir / subdir_name
                         else:
@@ -11511,9 +12610,11 @@ class AutoSyncManager:
                                 state_base_dir, game, romm_emulator, core_name)
                         elif subdir_mode == 'content':
                             # Use the ROM's actual parent folder name (what RetroArch uses as content dir).
-                            # For a flat ROM the content dir IS the platform folder (== platform_slug);
-                            # prefer that over the emulator-derived name so states land where RetroArch reads.
-                            subdir_name = (_content_dir or _platform_slug
+                            # For a flat ROM the content dir IS the platform folder, which is
+                            # the ES-DE folder name rather than the raw RomM slug when the two
+                            # differ; prefer that over the emulator-derived name so states land
+                            # where RetroArch reads.
+                            subdir_name = (_content_dir or platform_folder_name(_platform_slug)
                                            or self.get_platform_slug_from_emulator(romm_emulator))
                             emulator_state_dir = state_base_dir / subdir_name
                         else:
@@ -11657,8 +12758,13 @@ class AutoSyncManager:
                         files += f", {already} already current"
                     # Pre-launch: RetroArch is not up yet, so this has to wait
                     # for it rather than shout into a closed socket.
+                    # RomM's matched title ("Crazy Taxi 2") when the ROM was
+                    # identified; otherwise strip the tags off the filename-
+                    # derived name ourselves. Logs keep the full name — save
+                    # folders and the server's `emulator` field are keyed by it.
+                    shown = game.get('display_name') or display_game_name(game_name)
                     self.retroarch.send_notification_when_ready(
-                        f"Synced: {game_name} ({files})")
+                        f"Synced: {shown} ({files})")
                 elif conflicts_detected > 0:
                     self.log(f"🛡️ {game_name} local saves/states protected from overwrite")
                 else:
@@ -11726,7 +12832,8 @@ class SaveFileHandler(FileSystemEventHandler):
         
         # Define file extensions to monitor
         if save_type == 'saves':
-            self.extensions = {'.srm', '.sav'}
+            self.extensions = {'.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra',
+                               '.ps2', '.mcd', '.raw', '.gci'}
         elif save_type == 'states':
             self.extensions = {'.state', '.state1', '.state2', '.state3', '.state4', 
                              '.state5', '.state6', '.state7', '.state8', '.state9'}
@@ -11744,6 +12851,10 @@ class SaveFileHandler(FileSystemEventHandler):
             path = Path(file_path)
             if path.suffix.lower() in self.extensions:
                 return True
+            # Flycast per-game VMUs are ".bin", so the extension set above misses
+            # them and they only ever reached the server via the session-end sweep.
+            if self.save_type == 'saves' and _is_vmu_save(path):
+                return True
             # RetroArch auto-savestate is "<content>.state.auto"; Path.suffix is
             # ".auto" so it won't match the numbered-slot set above — match by name.
             if self.save_type == 'states' and path.name.lower().endswith('.state.auto'):
@@ -11751,6 +12862,54 @@ class SaveFileHandler(FileSystemEventHandler):
             return False
         except Exception:
             return False
+
+# Flycast's per-game VMU images: "<name>.A1.bin" … "<name>.D2.bin". Matched by
+# shape rather than by a bare ".bin" test, which in a save folder would also
+# sweep up memory-card images and firmware blobs other cores keep there.
+_VMU_SAVE_RE = re.compile(r'\.[A-D][1-2]\.bin$', re.IGNORECASE)
+
+
+# The version stamp RomM appends to every save it accepts: "[2026-08-03_22-20-51]",
+# always UTC and always last in the name.
+# Trailing extensions, plural: RetroArch's auto-savestate really is
+# "X [stamp].state.auto".
+_SERVER_STAMP_RE = re.compile(
+    r'\[(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\](?=(?:\.[^.\s]+)*$)')
+
+
+def _server_stamp_age(server_filename):
+    """Seconds since RomM stamped this filename, or None if it carries no stamp.
+
+    Lets an upload tell "the server stored my bytes" from "the server deduped
+    into an older record and echoed it back" — the latter answers 200 with a
+    name that has the right stem but a stamp from whenever that record was made.
+    None (no stamp at all) is not treated as failure: an older or differently
+    configured server may not stamp, and refusing those would break uploads.
+    """
+    m = None
+    for m in _SERVER_STAMP_RE.finditer(str(server_filename)):
+        pass
+    if not m:
+        return None
+    try:
+        stamped = datetime.datetime.strptime(
+            f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H-%M-%S").replace(
+                tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc) - stamped).total_seconds()
+
+
+def _is_vmu_save(path):
+    """True for a flycast per-game VMU image."""
+    return bool(_VMU_SAVE_RE.search(Path(path).name))
+
+
+def _vmu_port(path):
+    """The VMU port a save belongs to ("A1" … "D2"), or '' if it is not a VMU."""
+    m = _VMU_SAVE_RE.search(Path(path).name)
+    return m.group(0)[1:-4].upper() if m else ''
+
 
 def is_path_validly_downloaded(path):
     """Check if a path (file or folder) is validly downloaded"""
@@ -11944,37 +13103,27 @@ class CollectionSyncManager:
         self.download_progress = {}  # {collection_name: {'downloaded': int, 'downloaded_pct': float, 'total': int, 'speed': float}}
         # Last removal event per collection — for frontend notification
         self.last_removals = {}  # {collection_name: {'removed_count': int, 'deleted_count': int, 'timestamp': float}}
-        # Notification event queue — emitted at the exact moment a sync/removal
-        # happens and drained by the frontend (see drain_notifications). Replaces
-        # the old approach of inferring "something finished" by polling and diffing
-        # collection sync_state on the frontend. Bounded so a frontend that never
-        # drains can't grow it unbounded (oldest events drop first).
-        self.notifications = deque(maxlen=50)
+        # Notification events now live in the module-level queue (see
+        # push_notification) so the save/state path can raise toasts too. Kept as
+        # an alias because callers outside this file reach for it directly.
+        self.notifications = _notifications
         # Steam shortcut manager (optional)
         self.steam_manager = steam_manager
 
     def push_notification(self, kind, title, body):
-        """Queue a notification event for the frontend to drain and toast.
+        """Queue a collection notification. See module-level push_notification.
 
         Called from the actual sync/removal code path so the event reflects
         something that really happened — no inference, no missed/duplicate
-        transitions. `kind` is a free-form tag ('sync' | 'removal') the
-        frontend may use for styling.
+        transitions. Every toast-worthy collection event is also a feed-worthy
+        one, hence the activity_kind.
         """
-        self.notifications.append({
-            'kind':      kind,
-            'title':     title,
-            'body':      body,
-            'timestamp': time.time(),
-        })
-        # Every toast-worthy event is also a feed-worthy event.
-        _record_activity('sync' if kind == 'sync' else 'delete', title, body)
+        push_notification(kind, title, body,
+                          activity_kind='sync' if kind == 'sync' else 'delete')
 
     def drain_notifications(self):
         """Return all queued notification events and clear the queue."""
-        events = list(self.notifications)
-        self.notifications.clear()
-        return events
+        return drain_notifications()
 
     def start(self):
         """Start collection monitoring"""
@@ -12158,16 +13307,14 @@ class CollectionSyncManager:
                 # This ROM is not newly added, but check if it exists locally to count it
                 platform_slug = rom.get('platform_slug', 'Unknown')
                 file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
-                local_path = download_dir / platform_slug / file_name
-                if is_path_validly_downloaded(local_path):
+                if existing_rom_path(download_dir, platform_slug, file_name):
                     existing_roms_count += rom_file_count
                 continue
 
             # This ROM is newly added - check if we need to download it
             platform_slug = rom.get('platform_slug', 'Unknown')
             file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
-            local_path = download_dir / platform_slug / file_name
-            if is_path_validly_downloaded(local_path):
+            if existing_rom_path(download_dir, platform_slug, file_name):
                 existing_roms_count += rom_file_count
             else:
                 roms_to_download.append(rom)
@@ -12194,7 +13341,12 @@ class CollectionSyncManager:
             # Simple game processing for daemon
             platform_slug = rom.get('platform_slug', 'Unknown')
             file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
-            platform_dir = download_dir / platform_slug
+            # Write into the ES-DE/RetroDECK folder name, but keep a game that
+            # already sits in the legacy slug folder exactly where it is —
+            # moving 400 ROMs behind the user's back is not a naming fix.
+            existing = existing_rom_path(download_dir, platform_slug, file_name)
+            platform_dir = (existing.parent if existing
+                            else download_dir / platform_folder_name(platform_slug))
             local_path = platform_dir / file_name
             rom_file_count = len(rom.get('files', [])) if len(rom.get('files', [])) > 1 else 1
 
@@ -13362,8 +14514,10 @@ class SteamShortcutManager:
                     else:
                         disc_name = f'disc_{disc_idx}'
 
-                    local_path = download_dir / platform_slug / rom.get('fs_name', rom_name) / disc_name
-                    if not is_path_validly_downloaded(local_path):
+                    local_path = existing_rom_path(
+                        download_dir, platform_slug,
+                        str(Path(rom.get('fs_name', rom_name)) / disc_name))
+                    if not local_path:
                         continue
                     disc_display = f"{rom_name} (Disc {disc_idx})"
                     entry = self.build_shortcut_entry(
@@ -13376,7 +14530,12 @@ class SteamShortcutManager:
             else:
                 # Single ROM (including regional variants stored in a parent subfolder)
                 file_name = fs_name or f"{rom_name}.rom"
-                platform_dir = download_dir / platform_slug
+                # The folder that actually holds this ROM, not merely the first
+                # folder name that exists - RetroDECK pre-creates all of its
+                # ES-DE folders, so existence proves nothing.
+                found = existing_rom_path(download_dir, platform_slug, file_name)
+                platform_dir = (found.parent if found
+                                else download_dir / platform_folder_name(platform_slug))
                 local_path = platform_dir / file_name
                 self.log(f"[Steam] single ROM flat check: {local_path} exists={local_path.exists()}")
                 if not is_path_validly_downloaded(local_path):
@@ -13588,8 +14747,10 @@ class SteamShortcutManager:
                     else:
                         disc_name = f'disc_{disc_idx}'
 
-                    local_path = download_dir / platform_slug / rom.get('fs_name', rom_name) / disc_name
-                    if not is_path_validly_downloaded(local_path):
+                    local_path = existing_rom_path(
+                        download_dir, platform_slug,
+                        str(Path(rom.get('fs_name', rom_name)) / disc_name))
+                    if not local_path:
                         continue
                     disc_display = f"{rom_name} (Disc {disc_idx})"
                     entry = self.build_shortcut_entry(
@@ -13602,7 +14763,12 @@ class SteamShortcutManager:
             else:
                 # Single ROM (including regional variants stored in a parent subfolder)
                 file_name = fs_name or f"{rom_name}.rom"
-                platform_dir = download_dir / platform_slug
+                # The folder that actually holds this ROM, not merely the first
+                # folder name that exists - RetroDECK pre-creates all of its
+                # ES-DE folders, so existence proves nothing.
+                found = existing_rom_path(download_dir, platform_slug, file_name)
+                platform_dir = (found.parent if found
+                                else download_dir / platform_folder_name(platform_slug))
                 local_path = platform_dir / file_name
                 if not is_path_validly_downloaded(local_path):
                     # Regional variant files land inside a parent-named subdirectory.
