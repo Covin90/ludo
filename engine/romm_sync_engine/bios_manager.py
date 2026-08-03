@@ -7,10 +7,36 @@ Handles BIOS detection, verification, and synchronization
 from pathlib import Path
 import hashlib
 import logging
+import threading
+import time
+
+# ─── Platforms whose firmware belongs in a subfolder of the system dir ───────
+# Most cores read the system directory flat, but a few insist on their own
+# subfolder and report "no BIOS" for a file sitting one level up. Flycast is the
+# well-known case: "all bios files need to be in a directory named 'dc' in
+# RetroArch's system directory" — which is also why RetroDECK ships bios/dc/
+# while its ROM folder is called dreamcast.
+#
+# Keyed by canonical platform name (what this module works in) rather than by
+# core, so only platforms where every core Ludo would pick agrees on the folder
+# belong here. Deliberately absent:
+#   - Saturn: Beetle Saturn reads flat, Kronos wants kronos/ — core-dependent,
+#     and Beetle Saturn is the default, so flat is the better single answer.
+#   - DS: melonDS DS *prefers* melonDS DS/ but reads flat, and DeSmuME/melonDS
+#     only read flat.
+#   - Neo Geo/arcade: FBNeo searches fbneo/ then the flat dir, so flat works.
+# Everything else checked (Beetle PSX, Opera/3DO, Genesis Plus GX, mGBA, Stella,
+# ProSystem, Handy, PUAE) takes firmware flat. Paths verified against the
+# libretro core docs, August 2026 — the omissions are checked facts, not gaps.
+BIOS_SUBDIR_BY_PLATFORM = {
+    'Sega - Dreamcast': 'dc',            # flycast; Naomi/Atomiswave zips too
+    'Sony - PlayStation 2': 'pcsx2/bios',  # lrps2; both components lowercase
+}
+
 
 class BiosManager:
     """Manages BIOS files for RetroArch cores"""
-    
+
     def __init__(self, retroarch_interface, romm_client=None, log_callback=None, settings=None):
         self.retroarch = retroarch_interface
         self.romm_client = romm_client
@@ -23,6 +49,11 @@ class BiosManager:
         # Cache for installed BIOS files
         self.installed_bios = {}
         self.scan_installed_bios()
+
+        # /api/platforms response, cached — see _fetch_platforms.
+        self._platforms_cache = None
+        self._platforms_cache_at = 0.0
+        self._platforms_lock = threading.Lock()
         
         # Platform name normalization map
         self.platform_aliases = {
@@ -186,16 +217,42 @@ class BiosManager:
                         continue
                     
                     relative_path = file_path.relative_to(self.system_dir)
-                    self.installed_bios[str(relative_path)] = {
+                    entry = {
                         'path': str(file_path),
                         'size': file_path.stat().st_size,
                         'modified': file_path.stat().st_mtime,
                         'md5': None  # Calculate on demand to speed up scanning
                     }
+                    self.installed_bios[str(relative_path)] = entry
+                    # Also key by bare filename. The scan is recursive but the
+                    # server only ever names files ("dc_boot.bin"), so keying on
+                    # the relative path alone meant a RetroDECK install that
+                    # already ships bios/dc/dc_boot.bin was reported as missing
+                    # and the file was re-downloaded flat, where flycast does not
+                    # read it. First hit wins: a flat file outranks a nested one
+                    # only by scan order, and either satisfies the requirement.
+                    self.installed_bios.setdefault(file_path.name, entry)
 
         except Exception as e:
             self.log(f"Error scanning BIOS directory: {e}")
     
+    def bios_target_path(self, platform_name, bios_filename):
+        """Where a firmware file for this platform must be written.
+
+        The core's subfolder when it needs one (system/dc/dc_boot.bin), else the
+        system directory itself. Creates the folder — a subfolder that does not
+        exist yet is the normal case on a fresh RetroArch install.
+        """
+        subdir = BIOS_SUBDIR_BY_PLATFORM.get(
+            self.normalize_platform_name(platform_name) or '')
+        target_dir = self.system_dir / subdir if subdir else self.system_dir
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.log(f"⚠️ Could not create BIOS folder {target_dir}: {e}")
+            return self.system_dir / bios_filename
+        return target_dir / bios_filename
+
     def normalize_platform_name(self, platform_name):
         """Normalize platform name using aliases"""
         if not platform_name:
@@ -210,6 +267,52 @@ class BiosManager:
 
         return platform_name  # Return original if no match found
 
+    # The platform list is small, changes only when someone edits the server's
+    # library, and every BIOS question here is answered from the same payload.
+    # A scan asks it once per platform, so without this a 12-platform scan is 12
+    # identical /api/platforms requests — each of which makes RomM build every
+    # platform's firmware list. Long enough to collapse a scan into one request,
+    # short enough that firmware uploaded on the server shows up promptly.
+    _PLATFORMS_TTL = 60.0
+
+    def _fetch_platforms(self, force=False):
+        """The server's platform list (with embedded firmware), or None.
+
+        Cached for _PLATFORMS_TTL. Locked so the platforms in a scan queue on
+        one in-flight request instead of each firing their own.
+        """
+        if not self.romm_client or not self.romm_client.authenticated:
+            logging.debug("[BIOS] No RomM client or not authenticated")
+            return None
+        with self._platforms_lock:
+            if (not force and self._platforms_cache is not None
+                    and (time.time() - self._platforms_cache_at) < self._PLATFORMS_TTL):
+                return self._platforms_cache
+            try:
+                from urllib.parse import urljoin
+                logging.debug("[BIOS] Fetching /api/platforms")
+                response = self.romm_client.session.get(
+                    urljoin(self.romm_client.base_url, '/api/platforms'),
+                    timeout=10
+                )
+                if response.status_code != 200:
+                    logging.debug(f"[BIOS] Server returned status {response.status_code}")
+                    return None
+                platforms = response.json()
+            except Exception as e:
+                logging.warning(f"[BIOS] Error fetching platforms: {e}")
+                return None
+            logging.debug(f"[BIOS] Got {len(platforms)} platforms from server")
+            self._platforms_cache = platforms
+            self._platforms_cache_at = time.time()
+            return platforms
+
+    def invalidate_platforms_cache(self):
+        """Drop the cached platform list — call after changing server firmware."""
+        with self._platforms_lock:
+            self._platforms_cache = None
+            self._platforms_cache_at = 0.0
+
     def get_server_firmware_for_platform(self, platform_name):
         """Query RomM server for available firmware files for a platform
 
@@ -220,26 +323,11 @@ class BiosManager:
             List of firmware file dictionaries with 'file_name' and 'id' fields,
             or None if server unavailable or platform not found
         """
-        if not self.romm_client or not self.romm_client.authenticated:
-            logging.debug("[BIOS] No RomM client or not authenticated")
-            return None
-
         try:
-            from urllib.parse import urljoin
-
-            # Get all platforms from server
-            logging.debug(f"[BIOS] Querying server for platform: {platform_name}")
-            platforms_response = self.romm_client.session.get(
-                urljoin(self.romm_client.base_url, '/api/platforms'),
-                timeout=10
-            )
-
-            if platforms_response.status_code != 200:
-                logging.debug(f"[BIOS] Server returned status {platforms_response.status_code}")
+            logging.debug(f"[BIOS] Resolving firmware for platform: {platform_name}")
+            platforms = self._fetch_platforms()
+            if platforms is None:
                 return None
-
-            platforms = platforms_response.json()
-            logging.debug(f"[BIOS] Got {len(platforms)} platforms from server")
 
             # Platform name variations for matching
             platform_mappings = {
@@ -308,11 +396,24 @@ class BiosManager:
                         'status': 'present'
                     })
                 else:
-                    # Mark as required so auto-download will fetch them
+                    # Anything the server holds for the platform is treated as
+                    # required: it was uploaded deliberately, and we have no
+                    # per-file opt flag from RomM to say otherwise.
+                    #
+                    # BOTH keys, because callers disagree about which one to
+                    # read. auto_download_missing_bios filters on `optional`
+                    # while BiosTrackingManager filters on `required` — and for
+                    # as long as only `optional` was written, every
+                    # BiosTrackingManager filter matched nothing, so the
+                    # post-download BIOS fetch and the library scan both decided
+                    # there was nothing to do and quietly downloaded no firmware
+                    # at all. Writing one key and reading another fails silently
+                    # in exactly the direction that looks like success.
                     missing.append({
                         'file': file_name,
                         'status': 'missing',
-                        'optional': False  # Treat as required for downloading
+                        'optional': False,
+                        'required': True,
                     })
 
         return present, missing
@@ -325,18 +426,9 @@ class BiosManager:
             return status
 
         try:
-            from urllib.parse import urljoin
-
-            # Get all platforms from server
-            platforms_response = self.romm_client.session.get(
-                urljoin(self.romm_client.base_url, '/api/platforms'),
-                timeout=10
-            )
-
-            if platforms_response.status_code != 200:
+            platforms = self._fetch_platforms()
+            if platforms is None:
                 return status
-
-            platforms = platforms_response.json()
 
             # Check BIOS status for each platform that has firmware
             for platform in platforms:
@@ -374,19 +466,12 @@ class BiosManager:
             
             try:
                 from urllib.parse import urljoin
-                
-                # This part of your code is correct
-                platforms_response = self.romm_client.session.get(
-                    urljoin(self.romm_client.base_url, '/api/platforms'),
-                    timeout=10
-                )
-                
-                if platforms_response.status_code != 200:
+
+                platforms = self._fetch_platforms()
+                if platforms is None:
                     self.log("❌ Failed to get platforms list from RomM.")
                     return False
-                
-                platforms = platforms_response.json()
-                
+
                 platform_mappings = {
                     'Sony - PlayStation': ['PlayStation', 'Sony PlayStation', 'PS1', 'PSX'],
                     'Sony - PlayStation 2': ['PlayStation 2', 'Sony PlayStation 2', 'PS2'],
@@ -433,7 +518,8 @@ class BiosManager:
 
                                 # STEP 2: Check for a successful response and write the file
                                 if file_response.status_code == 200:
-                                    download_path = self.system_dir / bios_filename
+                                    download_path = self.bios_target_path(
+                                        platform_name, bios_filename)
 
                                     with open(download_path, 'wb') as f:
                                         for chunk in file_response.iter_content(chunk_size=8192):
@@ -562,9 +648,10 @@ class BiosManager:
         for bios_info in required_missing:
             bios_file = bios_info['file']
             
-            # Double-check if file exists before downloading
-            bios_path = self.system_dir / bios_file
-            if bios_path.exists():
+            # Double-check if file exists before downloading — in the core's
+            # subfolder, flat, or anywhere else under the system dir (the scan
+            # indexes bare filenames for exactly this).
+            if bios_file in self.installed_bios:
                 self.log(f"⏭️ {bios_file} already exists, skipping")
                 success_count += 1
                 continue
