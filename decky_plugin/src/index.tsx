@@ -25,7 +25,9 @@ import { MdVerified } from "react-icons/md";
 const getServiceStatus = callable<[], any>("get_service_status");
 const ackLibraryAnnouncement = callable<[], any>("ack_library_announcement");
 const notifyNetworkState = callable<[boolean], any>("notify_network_state");
-const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number }> }>("drain_notifications");
+// rom_id/has_cover are set on events about one specific game (save/state
+// uploads) and absent on collection-wide ones.
+const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean }> }>("drain_notifications");
 const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
 // `rom_id` is present only on entries that name a single rom (downloads), and
 // only on entries written since it was added — older persisted logs lack it.
@@ -568,7 +570,12 @@ function ToastCover({ romId, hasCover }: { romId: number; hasCover: boolean }) {
   if (!uri) return null;
   return (
     <img src={uri} style={{
-      width: '32px', aspectRatio: '3 / 4', objectFit: 'cover', display: 'block',
+      // Box art is the fastest way to recognise which game a toast is about,
+      // and at 32px it read as an icon rather than a cover. Height-capped as
+      // well as width-set: the toast is only so tall, and a 3:4 portrait is the
+      // dimension that runs out first.
+      width: '56px', maxHeight: '76px', aspectRatio: '3 / 4',
+      objectFit: 'cover', display: 'block',
       borderRadius: V2.radiusSm, border: '1px solid rgba(255,255,255,0.12)',
     }} />
   );
@@ -1140,6 +1147,15 @@ function _gpFocusEl(): Element | null {
 // the post-emulator-session focus restore aims here so the first game/group is
 // highlighted, matching what a normal tab switch lands on.
 let _autoFocusFirstRef: React.MutableRefObject<any> | null = null;
+
+// Live game tiles by rom_id, and the rom_id of the last game launched. Coming
+// back from a session, restoring focus to the FIRST tile lost the user's place
+// — on a long list the game they just played could be scrolled far off screen.
+// Aiming at the tile they launched keeps the selection where they left it.
+// A plain Map (not WeakMap): the value IS the key's only strong ref here, and
+// entries are removed on unmount.
+const _tileElsByRomId = new Map<number, any>();
+let _rommLastLaunchedRomId: number | null = null;
 function useAutoFocus(ready: boolean, dep?: any) {
   const ref = useRef<any>(null);
   useEffect(() => {
@@ -1423,7 +1439,20 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
   // still honoring the parent's object-or-callback focusRef.
   const selfRef = useRef<any>(null);
   const setRefs = (el: any) => {
+    const prev = selfRef.current;
     selfRef.current = el;
+    // Register by rom_id so the post-session focus restore can aim at the tile
+    // the user actually launched instead of the first one in the grid. Cleared
+    // on unmount (el === null) so detached nodes are not held or focused.
+    // Unregister only if the entry is still OUR node: the same game is on Home
+    // twice (Continue playing + Recently Downloaded) and again in the library,
+    // and React runs the new tile's ref BEFORE the old one's null cleanup — a
+    // blind delete here dropped the entry that had just been registered, so
+    // after a session the map was empty and focus fell back to the first tile.
+    try {
+      if (el) _tileElsByRomId.set(game.rom_id, el);
+      else if (prev && _tileElsByRomId.get(game.rom_id) === prev) _tileElsByRomId.delete(game.rom_id);
+    } catch { /* ignore */ }
     if (typeof focusRef === 'function') focusRef(el);
     else if (focusRef) (focusRef as any).current = el;
   };
@@ -1760,6 +1789,11 @@ function useServiceStatus(): any {
 type EmuStalePath = {
   section: string; key: string; label: string; kind: string;
   value: string; reason: string; suggested: string;
+  // Why it's wrong. 'removed': the install it belonged to is gone.
+  // 'other_install': that install is alive, it just isn't the one we launch —
+  // then `owner` and `active` name the two, which the copy needs to be
+  // comprehensible ("going to RetroArch, but games run on RetroDECK").
+  cause?: 'removed' | 'other_install'; owner?: string; active?: string;
 };
 type EmuStandalone = {
   key: string; name: string; installed: boolean; executable: string;
@@ -1881,6 +1915,32 @@ function staleCopy(stale: EmuStalePath[]): { title: string; body: string } {
   const rest = stale.length < 2 ? ''
     : stale.length === 2 ? ' One other folder needs the same fix.'
       : ` ${stale.length - 1} other folders need the same fix.`;
+  // Both emulators installed, folders pointing at the one we don't launch. The
+  // 'removed' copy below is a plain falsehood here — nothing was uninstalled,
+  // and a user who reads "an emulator that was removed" while both are in their
+  // library will distrust the banner rather than tap it. Naming the two is also
+  // the whole explanation: it's the only version of this that tells someone why
+  // a BIOS they can see in one folder isn't found by the game.
+  if (worst?.cause === 'other_install') {
+    const owner = worst.owner || 'another emulator';
+    const active = worst.active || 'your emulator';
+    const both = stale.length > 1
+      && stale.every((p) => p.cause === 'other_install');
+    if (both) {
+      return { title: `Your folders point at ${owner}, but games run on ${active}`,
+        body: `Saves and BIOS files are going to ${owner}’s folders, so `
+          + `${active} never sees them — games that need a BIOS will not start, `
+          + 'and your saves are being written where nothing reads them.' };
+    }
+    return worst.kind === 'bios'
+      ? { title: `${active} cannot see your BIOS files`,
+        body: `Your BIOS folder points at ${owner}, but games run on ${active}. `
+          + `The files are downloaded — ${active} just looks somewhere else, so `
+          + 'the games that need them will not start.' + rest }
+      : { title: `Your saves are going to ${owner}`,
+        body: `Games run on ${active}, so it writes its saves elsewhere and `
+          + 'nothing here is syncing the ones you actually make.' + rest };
+  }
   switch (worst?.kind) {
     case 'saves':
       return { title: 'Saves are going to the wrong place',
@@ -4301,11 +4361,32 @@ const checkForNotifications = async () => {
 
     const { events } = await drainNotifications();
     if (!events?.length) return;
+    // A save/state upload replaces that game's state screenshot. The row's own
+    // invalidation only arms after a launch started from Ludo, so a session
+    // played elsewhere (RetroDECK, another device) would otherwise keep showing
+    // box art until the next app start. The backend drops its matching caches
+    // in the same call, so the refetch below sees the new picture.
+    if (events.some((e: any) => e?.kind === 'save')) invalidateStateThumbs();
     for (let i = 0; i < events.length; i++) {
       // Slight stagger so the toaster doesn't dedupe a burst into one.
       if (i > 0) await new Promise(resolve => setTimeout(resolve, 300));
       const ev = events[i];
-      toaster.toast({ title: ev.title, body: ev.body, duration: 5000 });
+      // Events carrying a rom_id are about one specific game (a save/state
+      // upload). Give those the download toast's treatment — that game's box
+      // art as the logo, and a click that opens it — so a burst of them is
+      // still readable as "these games synced" rather than N identical rows.
+      const romId = typeof ev.rom_id === 'number' ? ev.rom_id : null;
+      toaster.toast({
+        title: ev.title,
+        body: ev.body,
+        duration: 5000,
+        ...(romId !== null ? {
+          logo: <ToastCover romId={romId} hasCover={!!ev.has_cover} />,
+          // Library root as origin: the toast can outlive the page that was
+          // open when the sync fired (same reasoning as the download toast).
+          onClick: () => openGameById(romId, ev.body || '', "/romm-sync-library"),
+        } : {}),
+      });
     }
   } catch (error) {
     console.error('[BACKGROUND NOTIFICATION] Error draining notifications:', error);
@@ -5331,9 +5412,10 @@ function GroupGridSkeleton() {
 // Home dashboard — faithful to RomM v2 Home.vue: horizontal CardRows
 // (Continue playing / Recently added / Platforms / Collections).
 // Home banner for the two emulator states that change what the app can do:
-// nothing installed (games download but can't launch), and a save folder left
-// pointing into an emulator that was uninstalled (sync writes where nothing
-// reads, while still reporting success). Every other stale path is a quiet
+// nothing installed (games download but can't launch), and a folder pointing at
+// an emulator we don't launch — whether because it was uninstalled or because
+// the user has both and we run the other one (sync writes where nothing reads,
+// while still reporting success). Every other stale path is a quiet
 // warning row in Settings ▸ Folders instead — see FoldersSection.
 // Install progress. Determinate once flatpak reports a percentage, and a moving
 // indeterminate sweep before that — resolving refs and verifying take a while
@@ -6275,9 +6357,15 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   // on a slower schedule than a plain tab switch — the page renders with no
   // visible selection and the dpad does nothing predictable. Pull focus onto
   // the persistent nav pill with a longer retry tail than useAutoFocus.
-  useEffect(() => {
+  //
+  // Armed as an EVENT, not only on mount: launching from a tile never leaves
+  // this route, so on the way back the page is still mounted and a mount-only
+  // effect never runs. It still fires on mount too, for the remount case.
+  const returnFocusIv = useRef<any>(null);
+  const runReturnFocusRestore = () => {
     if (!_rommReturnFocusPending) return;
     _rommReturnFocusPending = false;
+    if (returnFocusIv.current) clearInterval(returnFocusIv.current);
     // Steam's input pipeline swallows the first button press after a session
     // to wake itself back up (the "press twice" bug: LB/RB, dpad, anything).
     // Feed it a sacrificial virtual press of an unbound button (INVALID=0) so
@@ -6296,8 +6384,21 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
     const iv = setInterval(() => {
       try {
         if (Date.now() - started > 8000) { clearInterval(iv); return; }
+        // Prefer the tile of the game just played, so returning lands where the
+        // user left off rather than at the top of the list. It may legitimately
+        // be absent — the grid re-renders on the way back, and a filtered or
+        // paged list may not include it — so fall through to the old targets.
+        //
+        // "Usable" is stricter than connected: the panels stay MOUNTED when
+        // hidden (display:none) and opt out of gamepad nav, so a tile from a
+        // tab or a covered panel is still in the map and still connected while
+        // being impossible to focus — forcing focus onto one lands nowhere.
+        const usable = (el: any) => el && el.isConnected && el.offsetParent !== null;
+        const played = _rommLastLaunchedRomId != null
+          ? _tileElsByRomId.get(_rommLastLaunchedRomId) : null;
         const first = _autoFocusFirstRef?.current;
-        const target = (first && first.isConnected) ? first : navPillRef.current;
+        const target = usable(played) ? played
+          : usable(first) ? first : navPillRef.current;
         const cur = _gpFocusEl();
         // Done: focus reached a REAL target tile (not the nav-pill fallback,
         // which is invisible — keep polling for the real first item then).
@@ -6313,7 +6414,23 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
         if (target) _forceGamepadFocus(target);
       } catch { /* ignore */ }
     }, 250);
-    return () => clearInterval(iv);
+    returnFocusIv.current = iv;
+  };
+  // Keep the callback the subscription sees current (it closes over navPillRef,
+  // which is stable, but not over anything a stale render would get wrong).
+  const returnFocusRef = useRef(runReturnFocusRestore);
+  returnFocusRef.current = runReturnFocusRestore;
+  useEffect(() => {
+    const fire = () => returnFocusRef.current();
+    _returnFocusSubs.add(fire);
+    // Mount path: a session that DID unmount this route (launched from the game
+    // detail page, or Steam navigated away) arms the flag while nobody is
+    // subscribed, so the pending flag has to be checked here as well.
+    fire();
+    return () => {
+      _returnFocusSubs.delete(fire);
+      if (returnFocusIv.current) clearInterval(returnFocusIv.current);
+    };
   }, []);
 
   const cycle = (dir: -1 | 1) => {
@@ -7879,6 +7996,10 @@ async function launchGameSmart(romId: number, disc: string | null = null,
   // picker, region picker, resume — gets its rows refreshed when it ends. A
   // launch that never starts is harmless: the watcher gives up on its own.
   watchForSessionEnd();
+  // Every route into a game funnels through here (tile, disc picker, region
+  // picker, resume), so this is the one place that always knows what was
+  // launched — the post-session focus restore reads it.
+  _rommLastLaunchedRomId = romId;
   try {
     // Re-resolve the live tile appid: SetShortcutExe renumbers it (appid is a
     // hash of exe+name), so a cached _rommAppId can be stale.
@@ -7901,7 +8022,12 @@ async function launchGameSmart(romId: number, disc: string | null = null,
           const gid = ((BigInt(appId) << 32n) | 0x2000000n).toString();
           await _sc()?.Apps?.RunGame?.(gid, "", -1, 100);
           touchRommRecency();
-          return { success: true, message: 'Launching' };
+          // Carry the prep's BIOS verdict through: this path returns a synthetic
+          // success, so anything prepare_steam_launch resolved (the warning, or
+          // the files it fetched to avoid one) is lost unless it is forwarded.
+          return { success: true, message: 'Launching',
+            ...(prep.bios_warning ? { bios_warning: prep.bios_warning } : {}),
+            ...(prep.bios_fetched ? { bios_fetched: prep.bios_fetched } : {}) };
         } catch (e) {
           _rommLaunchPending = false;
           _rommSessionActive = false;
@@ -7997,6 +8123,18 @@ async function runLaunch(romId: number, gameName: string, disc: string | null,
         // remove from the launch, often with RetroArch already up, and a modal
         // over whatever is on screen by then is the wrong shape of interruption.
         onClick: () => libNavigate('/romm-sync-bios'),
+      });
+    }
+    // The gap existed and the launch closed it by downloading. Said plainly
+    // because the launch visibly took longer than usual and something was
+    // written to disk — an unexplained pause reads as a stall, and "we fetched
+    // your BIOS" is also the answer to why it works now when it didn't before.
+    else if (r?.success && r?.bios_fetched?.length) {
+      const got: string[] = r.bios_fetched;
+      toaster.toast({
+        title: `Launching ${label || gameName}`,
+        body: `Downloaded ${got.length} missing BIOS file${got.length > 1 ? 's' : ''} first: `
+          + `${got.slice(0, 3).join(', ')}${got.length > 3 ? '…' : ''}`,
       });
     }
     else if (r?.success) toaster.toast({ title: 'Launching', body: label || gameName });
@@ -11886,10 +12024,20 @@ let _rommLaunchPending = false;
 // Browser, not leave the user dropped on the Steam/Big-Picture library.
 let _rommSessionActive = false;
 // Set when the session-end watch navigates back to the Game Browser: the route
-// remounts without gamepad focus (Steam parks it on its own chrome after a game
-// exits), leaving the user unable to see or move a selection. The library root
-// consumes this on mount and pulls focus onto the nav pill.
+// comes back without gamepad focus (Steam parks it on its own chrome after a
+// game exits), leaving the user unable to see or move a selection. The library
+// root consumes this and pulls focus onto the tile that was played.
 let _rommReturnFocusPending = false;
+// Notified when the flag is armed. Consuming it on mount alone was not enough:
+// a game launched from a TILE never leaves the Game Browser route, so the page
+// is still mounted when the session ends and the mount effect — which is where
+// the whole restore lived — simply never ran again. That is the "launch from
+// Home, come back to no selection" case.
+const _returnFocusSubs = new Set<() => void>();
+function armReturnFocus() {
+  _rommReturnFocusPending = true;
+  _returnFocusSubs.forEach((f) => { try { f(); } catch { /* ignore */ } });
+}
 let _rommLifetimeReg: { unregister: () => void } | null = null;
 // Guards the startup setup-wizard auto-open so it fires at most once per session.
 let _setupAutoOpened = false;
@@ -12233,7 +12381,7 @@ function registerRommSessionEndWatch() {
         // events for ~5.5s after an app exits (measured on-device); the
         // forced-focus + gpfocus mirror machinery bridges that gap.
         const nav = () => {
-          _rommReturnFocusPending = true;
+          armReturnFocus();
           try { Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus(); } catch (e) { console.error('[RomM] nav', e); }
         };
         _rommNavTimer = setTimeout(() => {
