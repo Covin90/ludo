@@ -2090,9 +2090,11 @@ class Plugin:
 
             # Fetch ROMs
             if use_incremental:
-                # Incremental fetch - only get updated ROMs
+                # Incremental fetch - only get updated ROMs. No limit: get_roms
+                # pages this like any other full walk. It used to pass 10000,
+                # asking for the whole changed set in one response, which on a
+                # large library is hundreds of MB and stalls the server.
                 new_roms_data = self._romm_client.get_roms(
-                    limit=10000,  # High limit for incremental updates
                     offset=0,
                     updated_after=updated_after,
                     trim_fields=ROM_TRIM_FIELDS

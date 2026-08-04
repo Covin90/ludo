@@ -2244,6 +2244,34 @@ def _extract_7z_cli(exe, archive_path, dest_dir, emit):
 # measuring contention from an unrelated stuck query, not offset cost.
 LIBRARY_PAGE_SIZE = 100
 
+# Hard ceiling on any single /api/roms request, wherever it comes from.
+#
+# Three call sites independently picked oversized limits — 1000 for the full
+# fetch, 10000 for the incremental one, 500 for a "specific page" — and every
+# one of them looked reasonable when written. What they had in common is that
+# nobody was counting bytes: the numbers were chosen as row counts, and the
+# constraint is response SIZE (see LIBRARY_PAGE_SIZE). So the ceiling lives
+# here, at the one place a limit turns into a request, rather than in each
+# caller's judgement.
+#
+# 250 is above LIBRARY_PAGE_SIZE (so it never interferes with the paged walk)
+# and still under the measured cliff at ~3.3MB. It is a backstop, not a
+# recommendation: code that wants many rows should page, not raise this.
+MAX_ROMS_REQUEST_LIMIT = 250
+
+
+def _safe_page_limit(limit):
+    """Clamp a caller-supplied /api/roms limit to something a server survives."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return LIBRARY_PAGE_SIZE
+    if limit > MAX_ROMS_REQUEST_LIMIT:
+        print(f"⚠️ Clamping /api/roms limit {limit} -> {MAX_ROMS_REQUEST_LIMIT} "
+              f"(oversized responses stall RomM; page instead)")
+        return MAX_ROMS_REQUEST_LIMIT
+    return max(1, limit)
+
 
 # Fields a ROM row is trimmed to when get_roms(trim_fields=...) is used.
 #
@@ -2743,14 +2771,21 @@ class RomMClient:
             return [], 0
 
         try:
-            # For backward compatibility, if no specific limit is requested, fetch ALL games
-            if limit == 500 and offset == 0 and updated_after is None:
+            # For backward compatibility, if no specific limit is requested, fetch ALL games.
+            # An updated_after fetch goes here too: it is a filtered walk of the
+            # library, so it needs the same paging as an unfiltered one. It used
+            # to fall through to the single request below with limit=10000 —
+            # see _fetch_all_games_chunked for why that was the worst request
+            # Ludo made. `limit` is deliberately ignored on this branch; the
+            # page size is ours to choose, not the caller's.
+            if offset == 0 and (limit == 500 or updated_after is not None):
                 return self._fetch_all_games_chunked(progress_callback, trim_fields,
-                                                    resumed_pages, page_sink)
+                                                    resumed_pages, page_sink,
+                                                    updated_after)
             else:
-                # Specific pagination request or filtered by updated_after
+                # Specific pagination request: one explicit slice of the library.
                 params = {
-                    'limit': limit,
+                    'limit': _safe_page_limit(limit),
                     'offset': offset,
                     # RomM 4.9.0 made file expansion opt-in (with_files defaults to
                     # False); without this the `files` field comes back empty.
@@ -2836,7 +2871,7 @@ class RomMClient:
                 urljoin(self.base_url, '/api/roms'),
                 params={
                     'search_term': term,
-                    'limit': limit,
+                    'limit': _safe_page_limit(limit),
                     'with_files': 'true',
                     'with_total': 'false',
                     'with_rom_id_index': 'false',
@@ -3128,8 +3163,20 @@ class RomMClient:
         return result_roms
 
     def _fetch_all_games_chunked(self, progress_callback, trim_fields=None,
-                                 resumed_pages=None, page_sink=None):
-        """Fetch all games using parallel requests"""
+                                 resumed_pages=None, page_sink=None,
+                                 updated_after=None):
+        """Fetch all games using parallel requests.
+
+        updated_after: optional ISO 8601 string, narrowing the fetch to rows
+            changed since then. It is a filter on the same paged walk, not a
+            separate path — the incremental fetch used to be one unpaginated
+            limit=10000 request, which is RomM's maximum and, at the 13-16KB
+            rows measured on a real instance, a ~130MB response: twenty times
+            past the size cliff described at LIBRARY_PAGE_SIZE. It also only
+            looked small. `updated_at` churns (2,530 of 3,083 rows reported
+            updated within 24h on one instance), so "incremental" regularly
+            asked for most of the library in a single request.
+        """
         try:
             with PerformanceTimer("API fetch - full sync") as timer:
                 # First, get total count (optimized with shorter timeout and caching)
@@ -3140,14 +3187,20 @@ class RomMClient:
                 cache_time = getattr(self, '_cached_game_count_time', 0)
                 current_time = time.time()
 
-                if cached_count and (current_time - cache_time) < 30:
+                # The cache holds the count of the WHOLE library, so it can only
+                # answer an unfiltered fetch. A filtered one must probe for its
+                # own total, and must not overwrite the cache with it.
+                if cached_count and (current_time - cache_time) < 30 and not updated_after:
                     total_games = cached_count
                     timer.checkpoint(f"Initial count request: {time.time() - count_start:.2f}s (from cache)")
                 else:
+                    count_params = {'limit': 1, 'offset': 0, 'fields': 'id'}
+                    if updated_after:
+                        count_params['updated_after'] = updated_after
                     # Fetch count with optimized timeout
                     response = self.session.get(
                         urljoin(self.base_url, '/api/roms'),
-                        params={'limit': 1, 'offset': 0, 'fields': 'id'},
+                        params=count_params,
                         timeout=10  # Reduced from 30s to 10s
                     )
                     timer.checkpoint(f"Initial count request: {time.time() - count_start:.2f}s")
@@ -3159,9 +3212,11 @@ class RomMClient:
                     data = response.json()
                     total_games = data.get('total', 0)
 
-                    # Cache the count for future requests
-                    self._cached_game_count = total_games
-                    self._cached_game_count_time = current_time
+                    # Cache the count for future requests — only when it really
+                    # is the library total; a filtered count would poison it.
+                    if not updated_after:
+                        self._cached_game_count = total_games
+                        self._cached_game_count_time = current_time
 
                 if total_games == 0:
                     self.last_fetch_incomplete = False
@@ -3173,13 +3228,15 @@ class RomMClient:
                 chunk_size = LIBRARY_PAGE_SIZE
                 total_chunks = (total_games + chunk_size - 1) // chunk_size
 
-                print(f"📚 Fetching {total_games:,} games in {total_chunks} chunks of {chunk_size:,} (parallel)...")
+                scope = "changed games" if updated_after else "games"
+                print(f"📚 Fetching {total_games:,} {scope} in {total_chunks} chunks of {chunk_size:,}...")
 
                 # Use existing parallel fetching
                 fetch_start = time.time()
                 all_games = self._fetch_pages_parallel(total_games, chunk_size, total_chunks,
                                                        progress_callback, trim_fields,
-                                                       resumed_pages, page_sink)
+                                                       resumed_pages, page_sink,
+                                                       updated_after)
                 timer.checkpoint(f"Parallel fetch complete: {time.time() - fetch_start:.2f}s")
                 timer.checkpoint(f"Total fetch time: {time.time() - count_start:.2f}s")
 
@@ -3191,7 +3248,8 @@ class RomMClient:
             return [], 0
         
     def _fetch_pages_parallel(self, total_items, page_size, pages_needed, progress_callback,
-                              trim_fields=None, resumed_pages=None, page_sink=None):
+                              trim_fields=None, resumed_pages=None, page_sink=None,
+                              updated_after=None):
         """Fetch every page, in parallel, streaming rows into one list.
 
         resumed_pages: {offset: rows} already fetched by an interrupted run, used
@@ -3254,11 +3312,18 @@ class RomMClient:
                 # and not re-sunk: it is already on disk.
                 return page_num, resumed_pages[offset], True
 
+            page_params = {}
+            if updated_after:
+                # Applied per page so the filter and the pagination agree; the
+                # count probe used the same filter, so offsets line up.
+                page_params['updated_after'] = updated_after
+
             for attempt in (1, 2):
                 try:
                     response = self.session.get(
                         urljoin(self.base_url, '/api/roms'),
                         params={
+                            **page_params,
                             'limit': page_size,
                             'offset': offset,
                             # RomM 4.9.0: file expansion is opt-in (with_files default False).
