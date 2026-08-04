@@ -2213,7 +2213,36 @@ def _extract_7z_cli(exe, archive_path, dest_dir, emit):
 # measured on a 3,083-ROM instance, limit=100 costs 15ms/row and limit=1000 costs
 # 4.8ms/row. Exported because a resume checkpoint is only valid for the page size
 # that produced it — see main.py's _resume_begin.
-LIBRARY_PAGE_SIZE = 1000
+#
+# That per-row figure is why this was 1000, and it is why 1000 was wrong.
+#
+# Response time is not linear in page size: it is flat until the response
+# reaches ~5MB and then falls off a cliff. Measured against a 16.5k-ROM RomM
+# 5.1.1-beta.1 instance, offset 0, medians of repeated samples:
+#
+#     limit=250  3.3MB   2.06s        limit=400  6.1MB  23.39s
+#     limit=300  4.3MB   2.16s        limit=450  7.1MB  21.78s
+#     limit=350  5.2MB   2.49s        limit=500  8.1MB  31.50s
+#
+# 14% more rows for 10x the time, tracking response SIZE rather than row count —
+# the signature of a buffering threshold (nginx spilling to a temp file, or the
+# body being buffered whole) rather than query cost. The old 1000-row page is
+# ~16MB here, three times past the cliff, and took over 90s: past our own read
+# timeout, so the client hung up (logged as a 499) while RomM went on building a
+# response nobody would read and the retry below queued a second one.
+#
+# 100 rows is ~1.3MB, a 4-5x margin under the cliff. The margin is the point:
+# rows are 13-16KB on that instance but /api/roms has no row projection in RomM
+# 5.1.1 (`fields` is not a parameter — see ROM_TRIM_FIELDS), so every row carries
+# all 73 columns including metadata blobs, and a library with richer metadata has
+# fatter rows that hit the ceiling at fewer of them. Sizing to the measured cliff
+# would leave those instances broken. This also matches argosy-launcher, the
+# RomM-org Android client, which pages at 100.
+#
+# Deep offsets were investigated and are NOT a factor: limit=100 costs 1.07s at
+# offset 0 and 1.69s at offset 4000. An earlier run showing 20s+ at depth was
+# measuring contention from an unrelated stuck query, not offset cost.
+LIBRARY_PAGE_SIZE = 100
 
 
 # Fields a ROM row is trimmed to when get_roms(trim_fields=...) is used.
@@ -3159,15 +3188,23 @@ class RomMClient:
         import concurrent.futures
         import threading
         
-        # Measured against a real instance: RomM serves concurrent /api/roms
-        # requests almost serially. One 500-row page alone is 2.9s; two issued
-        # together are 5.4s EACH; four are ~8s each. So four workers buy only
-        # ~1.36x wall-clock while inflating every individual request ~2.3x —
-        # and it is the individual request that hits the timeout, shows up in
-        # the server's access log as an alarming 23s, and competes with
-        # everything else the user's RomM is serving. Two keeps most of the
-        # speedup at half the latency cost.
-        max_workers = 2
+        # Sequential, deliberately. RomM serves concurrent /api/roms requests
+        # almost serially, so parallelism mostly converts itself into latency:
+        # measured on a 16.5k-ROM instance, two 250-row pages took 4.47s wall
+        # sequentially and 3.82s in parallel — a 1.17x speedup bought with a
+        # 1.65x increase in every individual request (2.2s each -> 3.6s each).
+        # An earlier round at four workers measured the same shape more starkly,
+        # ~1.36x wall-clock for ~2.3x per-request latency.
+        #
+        # That trade was defensible while we only paid it ourselves. We don't:
+        # it is the individual request that hits our read timeout, that appears
+        # in the operator's access log as an alarming multi-second entry, and
+        # that competes with everything else their RomM is serving. A ~15%
+        # wall-clock win is not worth doubling the load we put on someone's
+        # server. argosy-launcher (the RomM-org Android client) is sequential
+        # for the same reason. Kept as a named constant rather than inlined so
+        # the pool below still reads as deliberate.
+        max_workers = 1
         completed_pages = 0
         failed_pages = []
         lock = threading.Lock()
@@ -3188,7 +3225,14 @@ class RomMClient:
             # on a fast instance and nothing else — a 15k library on a modest box
             # was logging 23s per page already. Connect stays short: an
             # unreachable server should still fail fast.
-            timeout = (10, 60 + page_size // 10)
+            #
+            # The read budget is deliberately generous rather than tight. Giving
+            # up early does not save the server any work: RomM builds the whole
+            # response before sending, so hanging up leaves the query running to
+            # completion with nobody to receive it (it shows up in the access log
+            # as a 499) and buys us nothing but a retry. Waiting is strictly
+            # cheaper for both ends than timing out.
+            timeout = (10, 120 + page_size // 5)
 
             if resumed_pages and offset in resumed_pages:
                 # Already fetched by a run that was interrupted. Not re-requested
@@ -3247,6 +3291,17 @@ class RomMClient:
                         return page_num, items, True
                     print(f"❌ Page {page_num}: HTTP {response.status_code}"
                           f"{' (retrying)' if attempt == 1 else ''}")
+                except requests.exceptions.ReadTimeout:
+                    # Never retried. A read timeout means the server is still
+                    # building this exact response — it just has not finished.
+                    # Asking again does not replace that work, it duplicates it:
+                    # the abandoned query runs to completion regardless, so the
+                    # retry lands on a server now serving two copies of the
+                    # heaviest request we make. That is how one slow page turns
+                    # into a spiral. Fail the page and let the caller decide.
+                    print(f"❌ Page {page_num}: read timed out after {timeout[1]}s "
+                          f"(not retried — the server is still building it)")
+                    break
                 except Exception as e:
                     print(f"❌ Page {page_num} error: {e}"
                           f"{' (retrying)' if attempt == 1 else ''}")
@@ -3267,7 +3322,14 @@ class RomMClient:
         # Memory is unaffected: peak in-flight was always bounded by the worker
         # count, never by the batch, and the chunked accumulation below is
         # unchanged. The per-batch gc.collect() is kept on the same cadence.
-        batch_size = max_workers   # retained: reported in the 'batch' callback
+        #
+        # This cadence used to be `max_workers`, which coupled two unrelated
+        # things: dropping to a single worker would have meant a full gc.collect()
+        # and a progress callback after every page — 165 collections on a 16.5k
+        # library, ~500 on a 50k one. Pages are also 10x smaller than they were,
+        # so there is less to reclaim per page and less reason to do it often.
+        # Fixed cadence instead, independent of the worker count.
+        batch_size = 10   # pages per gc/progress tick; reported in the 'batch' callback
         total_batches = (pages_needed + batch_size - 1) // batch_size
 
         if progress_callback:
@@ -3307,9 +3369,11 @@ class RomMClient:
                             'loaded': loaded,
                             'total': total_items,
                         })
-                        # Unchanged shape and cadence: emitted every max_workers
-                        # pages, as the batch loop did. Consumers outside this
-                        # repo depend on it.
+                        # Unchanged shape; cadence is now the fixed batch_size
+                        # above rather than max_workers. Consumers outside this
+                        # repo depend on the shape, not the interval — 'loaded'
+                        # above still fires per page, so the UI's proof of life
+                        # is unaffected.
                         if completed_pages % batch_size == 0 or completed_pages == pages_needed:
                             progress_callback('batch', {
                                 'items': [],
