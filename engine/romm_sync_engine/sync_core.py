@@ -2306,10 +2306,25 @@ class RomMClient:
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
 
+        # read=False is load-bearing, not tuning. urllib3 treats a read timeout
+        # on a GET as retryable, so a plain Retry(total=2) silently re-issued
+        # every timed-out request twice more — inside requests, before any of
+        # our own error handling saw it. On /api/roms that is three copies of
+        # the most expensive query we make, and RomM does not cancel the
+        # abandoned ones (see LIBRARY_PAGE_SIZE). Worse, the retries collapse
+        # into a MaxRetryError that requests reports as ConnectionError, not
+        # ReadTimeout — so the "never retry a read timeout" handler in
+        # _fetch_pages_parallel was bypassed and its generic branch retried on
+        # top, turning one slow page into six concurrent full-library queries.
+        # Verified with a stalling socket server: total=2 issues 3 requests,
+        # read=False issues 1 and raises ReadTimeout as intended.
+        #
+        # Connect retries are kept: a refused connection costs the server
+        # nothing, so retrying it is free. A read timeout is the opposite.
         adapter = HTTPAdapter(
             pool_connections=10,
             pool_maxsize=10,
-            max_retries=Retry(total=2)
+            max_retries=Retry(total=2, read=False)
         )
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
@@ -3397,7 +3412,7 @@ class RomMClient:
         self.last_fetch_incomplete = bool(failed_pages)
         if failed_pages:
             print(f"⚠️ Fetch INCOMPLETE: {len(failed_pages)} of {pages_needed} pages "
-                  f"failed after a retry each (pages {sorted(failed_pages)}) — "
+                  f"failed (pages {sorted(failed_pages)}) — "
                   f"{len(final_games):,} games returned, which is not the whole library")
         else:
             print(f"✓ Fetch complete: {len(final_games):,} games loaded with optimized memory usage")
