@@ -2260,6 +2260,43 @@ LIBRARY_PAGE_SIZE = 100
 MAX_ROMS_REQUEST_LIMIT = 250
 
 
+def _server_did_the_work(exc):
+    """Did this failure happen AFTER the server started answering us?
+
+    Retrying a request is only free if the server never began work on it.
+    `requests` collapses both cases into ConnectionError, so the two have to be
+    told apart by what it wraps:
+
+      - a connect-side failure (NewConnectionError / ConnectTimeoutError, which
+        arrive wrapped in MaxRetryError) means nothing reached RomM — retrying
+        costs it nothing;
+      - a ProtocolError (RemoteDisconnected, ECONNRESET) means the connection
+        died with a response in flight. RomM built that response, and it does
+        not stop building when we go away, so a retry adds a second copy of a
+        request the server is already paying for. That is the amplification
+        this module keeps having to unlearn — see LIBRARY_PAGE_SIZE and the
+        Retry(read=False) note in __init__.
+
+    Unknown shapes return True: refusing to retry costs one page, and the
+    caller reports the fetch as incomplete rather than silently short.
+    """
+    import urllib3
+    seen, node = set(), exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if isinstance(node, urllib3.exceptions.ProtocolError):
+            return True
+        if isinstance(node, (urllib3.exceptions.NewConnectionError,
+                             urllib3.exceptions.ConnectTimeoutError)):
+            return False
+        nxt = node.args[0] if (getattr(node, 'args', None)
+                               and isinstance(node.args[0], BaseException)) else None
+        if nxt is None and isinstance(node, urllib3.exceptions.MaxRetryError):
+            nxt = node.reason
+        node = nxt or node.__cause__ or node.__context__
+    return True
+
+
 def _safe_page_limit(limit):
     """Clamp a caller-supplied /api/roms limit to something a server survives."""
     try:
@@ -3382,6 +3419,21 @@ class RomMClient:
                     print(f"❌ Page {page_num}: read timed out after {timeout[1]}s "
                           f"(not retried — the server is still building it)")
                     break
+                except requests.exceptions.RequestException as e:
+                    # Same rule as the timeout above, applied to every transport
+                    # failure. Caught at RequestException rather than
+                    # ConnectionError on purpose: a connection that dies with a
+                    # response in flight surfaces as ChunkedEncodingError, which
+                    # is NOT a ConnectionError subclass, so a narrower except
+                    # here silently let the worst case through to the retry
+                    # below. Only a failure that never reached RomM is safe to
+                    # repeat.
+                    if _server_did_the_work(e):
+                        print(f"❌ Page {page_num}: connection lost mid-response ({e}) "
+                              f"— not retried, the server is still building it")
+                        break
+                    print(f"❌ Page {page_num}: could not connect ({e})"
+                          f"{' (retrying)' if attempt == 1 else ''}")
                 except Exception as e:
                     print(f"❌ Page {page_num} error: {e}"
                           f"{' (retrying)' if attempt == 1 else ''}")
