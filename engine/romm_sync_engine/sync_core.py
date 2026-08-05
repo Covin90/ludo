@@ -2824,6 +2824,10 @@ class RomMClient:
                 params = {
                     'limit': _safe_page_limit(limit),
                     'offset': offset,
+                    # Any offset needs a deterministic sort or the slice is
+                    # meaningless — see the paged walk in _fetch_pages_parallel.
+                    'order_by': 'id',
+                    'order_dir': 'asc',
                     # RomM 4.9.0 made file expansion opt-in (with_files defaults to
                     # False); without this the `files` field comes back empty.
                     'with_files': 'true',
@@ -3363,6 +3367,28 @@ class RomMClient:
                             **page_params,
                             'limit': page_size,
                             'offset': offset,
+                            # Paginating without an explicit sort is not safe.
+                            # We walk this library in ~166 offset slices and we
+                            # were sending no order_by at all, taking whatever
+                            # the server defaulted to. OFFSET only means
+                            # anything against a stable, total order: if the
+                            # ordering isn't deterministic, or shifts mid-walk
+                            # (a scan touching rows we haven't reached yet), a
+                            # ROM can land in two pages or in none, and nothing
+                            # downstream would notice — the count check only
+                            # sees that we got the right NUMBER of rows.
+                            #
+                            # `id` because it is the primary key: stable,
+                            # unique, never rewritten by a metadata refresh,
+                            # and index-ordered so deep offsets skip along an
+                            # index the query is already walking rather than
+                            # forcing the server to sort the matching set
+                            # before discarding the first N rows — work it
+                            # redoes on every page. argosy-launcher, the
+                            # RomM-org client, orders by id asc for its sync
+                            # for the same reason.
+                            'order_by': 'id',
+                            'order_dir': 'asc',
                             # RomM 4.9.0: file expansion is opt-in (with_files default False).
                             'with_files': 'true',
                             # /api/roms computes four things per request — the

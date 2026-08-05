@@ -143,7 +143,12 @@ SNAPSHOT_SCHEMA = 1
 # First line is a manifest; each later line is {"offset": N, "rows": [...]}.
 # Deleted on success, so its presence means the last attempt did not finish.
 resume_file = CONFIG_DIR / 'library_resume.ndjson'
-RESUME_SCHEMA = 1
+# Bumped to 2 when the library walk started sending order_by=id&order_dir=asc.
+# The offsets in a v1 checkpoint were taken under the server's default ordering,
+# so replaying them under the new one would mix two orderings — the exact case
+# _resume_begin's docstring warns about, which the total/page_size checks cannot
+# catch because neither of those moved.
+RESUME_SCHEMA = 2
 # Same 24h bound Argosy puts on its sync-resume generation: past that, the
 # library has probably moved on and replaying stale pages is worse than refetching.
 RESUME_TTL_SECONDS = 24 * 3600
