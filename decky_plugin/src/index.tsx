@@ -25,6 +25,21 @@ import { MdVerified } from "react-icons/md";
 const getServiceStatus = callable<[], any>("get_service_status");
 const timeColdFetch = callable<[], any>("time_cold_fetch");
 const getFetchBenchmark = callable<[], any>("get_fetch_benchmark");
+
+// "2m 29s", not "149.3s" — this number gets read aloud in bug reports, and
+// minutes are how people describe a fetch. Sub-minute keeps one decimal,
+// because the difference between 3.2s and 3.8s is the whole story on a small
+// library; past a minute that precision is noise, so seconds are rounded.
+function fmtFetchDuration(seconds: number | null | undefined): string {
+  if (typeof seconds !== 'number' || !isFinite(seconds) || seconds < 0) return '?';
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const total = Math.round(seconds);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  // Drop the seconds only when they round to exactly zero, so "5m" stays
+  // readable but "5m 1s" never silently becomes "5m".
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
 const ackLibraryAnnouncement = callable<[], any>("ack_library_announcement");
 const notifyNetworkState = callable<[boolean], any>("notify_network_state");
 // rom_id/has_cover are set on events about one specific game (save/state
@@ -4296,6 +4311,74 @@ let _offSamples = 0;
 // announcement toasts two or three times before the backend clears it.
 let _annShown = false;
 
+// Cold-fetch timer poll, module-level rather than owned by the Settings page.
+// Starting the timer navigates back to the library — watching a settings row
+// for two minutes is not the point — so the poll has to outlive that page's
+// unmount or the result it was started for would never be reported.
+let _benchPoll: any = null;
+// Set while a timed fetch is in flight, so re-entering Settings shows the row
+// still busy instead of an idle button that would start a second run.
+let _benchRunning = false;
+// Notified when the result lands, so a Settings page that IS open updates its
+// row without re-fetching. Also serves as the "in flight" signal for a page
+// mounted after the run started.
+const _benchListeners = new Set<(b: any) => void>();
+
+function _startBenchPoll(before: string | null) {
+  if (_benchPoll) return;
+  _benchRunning = true;
+  // No timeout: a 50k library over a slow server legitimately takes a very long
+  // time, and cutting the poll off would report failure for a fetch that is
+  // still running fine.
+  _benchPoll = setInterval(async () => {
+    try {
+      const b = (await getFetchBenchmark())?.result;
+      // Compare `at` rather than "a record exists", or a previous run's result
+      // would read as this one's.
+      if (b && b.at !== before) {
+        clearInterval(_benchPoll); _benchPoll = null;
+        _benchRunning = false;
+        _benchListeners.forEach((l) => { try { l(b); } catch { /* ignore */ } });
+        toaster.toast({
+          title: 'Cold fetch timed',
+          body: `${fmtFetchDuration(b.seconds)} for ${b.roms ?? '?'} ROMs`,
+          onClick: () => { try { Navigation.Navigate('/romm-sync-settings'); } catch { /* ignore */ } },
+        });
+      }
+    } catch { /* keep polling; a transient RPC failure is not an answer */ }
+  }, 2000);
+}
+
+// Live handle on the library-fetch toast, and the count of consecutive polls
+// that have seen a fetch in flight. The toast exists because OfflineBanner is
+// scoped to the library root page: navigate into a game or Settings mid-fetch
+// and the only sign the sync is still running disappears. A toast host is
+// global, so this follows the user wherever they go.
+let _fetchToast: { dismiss: () => void } | null = null;
+let _fetchSamples = 0;
+// Not an expected lifetime — the toast is dismissed the moment progress clears.
+// This is the leak guard for a sync that hangs without ever clearing it, so the
+// user isn't left with a permanent notification they can't get rid of.
+const FETCH_TOAST_MAX_MS = 30 * 60 * 1000;
+
+// Body of that toast. A component rather than a string because NEITHER toaster
+// can update a toast that's already on screen — Decky's returns only
+// {data, dismiss}, and the shim snapshots opts at push time. But `body` is a
+// ReactNode rendered inside the host's own tree, so a node that subscribes to
+// the shared status poll re-renders itself in place. That's what lets the count
+// move while the toast stays put.
+function LibraryFetchToastBody() {
+  const st = useServiceStatus();
+  const prog = st?.library_progress;
+  if (prog?.total > 0) {
+    return <>{`${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} games`}</>;
+  }
+  // Before the first page lands there's no total to divide by, and the fetch is
+  // dismissed the instant progress clears — so this covers the opening seconds
+  // and the single frame between the last page and the dismiss.
+  return <>Fetching from RomM…</>;
+}
+
 const checkForNotifications = async () => {
   try {
     // Connection-lost / restored toast — runs here (not in a component) so it
@@ -4330,6 +4413,35 @@ const checkForNotifications = async () => {
           _prevConn = conn;
         }
       }
+      // Library-fetch toast: raised while a fetch is in flight, dismissed when
+      // it clears. Deliberately outside the connection block above — a fetch
+      // runs during 'connecting' too, and that's exactly the first-run case
+      // where the wait is longest.
+      const fetching = st?.library_progress;
+      if (fetching) {
+        _fetchSamples++;
+        // Two samples (~4s) before raising. An incremental refresh is usually
+        // done inside a single tick, and a toast that appears and vanishes is
+        // pure noise — only a fetch long enough to be worth narrating gets one.
+        if (!_fetchToast && _fetchSamples >= 2) {
+          _fetchToast = toaster.toast({
+            title: 'Loading your library…',
+            body: <LibraryFetchToastBody />,
+            duration: FETCH_TOAST_MAX_MS,
+            // Silent: this one announces a wait the user didn't ask about, and
+            // it can fire on any cold start. The completion toast keeps its chime.
+            playSound: false,
+            onClick: () => { try { Navigation.Navigate('/romm-sync-library'); } catch { /* ignore */ } },
+          });
+        }
+      } else {
+        _fetchSamples = 0;
+        if (_fetchToast) {
+          try { _fetchToast.dismiss(); } catch { /* already gone */ }
+          _fetchToast = null;
+        }
+      }
+
       // First-library-load toast. Fires from here rather than a component
       // because the whole point is the user who wandered off to Steam during
       // the ~12s first fetch. The backend only ever raises this once per
@@ -5996,7 +6108,14 @@ function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
     // refresh shows up immediately instead of waiting for a tab switch.
     _libRefreshListeners.add(load);
     return () => { clearTimeout(retry); _libRefreshListeners.delete(load); };
-  }, [visible, offline]);
+    // library_ready is in here so a fetch FINISHING re-loads the panel. Without
+    // it the only triggers were a visibility flip, a connectivity flip, and the
+    // 3s self-retry the not-ready answer schedules — so a panel that was handed
+    // an empty pre-fetch answer and then lost its retry chain (any effect
+    // re-run cancels the pending timer) sat on "No games found." until the app
+    // was restarted, with a full library behind it. This makes the transition
+    // itself the trigger, which is what it should always have been.
+  }, [visible, offline, svcStatus?.library_ready]);
 
   // visible in the ready flag so the focus grab refires on each return to the
   // tab (the panel no longer remounts). Backing out of a group should land on
@@ -6069,6 +6188,18 @@ function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
 
   if (loading) return <GroupGridSkeleton />;
   if (groups.length === 0) {
+    // "No games found." is a verdict, and during a fetch it's a wrong one — the
+    // library is on its way, not absent. Show the same shimmering grid a first
+    // load shows, so an empty Platforms tab mid-fetch reads as work in progress
+    // rather than an empty server.
+    //
+    // Skeleton only, no caption. The banner directly above is already
+    // saying "Loading your library… 2,300 of 14,112 games", and a second copy
+    // of the same sentence under the grid reads as two different things
+    // happening. The shimmer's job here is only to show the tab isn't empty.
+    if (svcStatus?.library_progress || svcStatus?.library_ready === false) {
+      return <GroupGridSkeleton />;
+    }
     return (
       <div style={{ padding: '16px', color: V2.fgMuted, fontSize: '13px' }}>
         {offline
@@ -10834,12 +10965,16 @@ function SettingsPage() {
   // newer than the one that was there before — comparing `at` rather than just
   // "a record exists", or a previous run's result would read as this one's.
   const [benchmark, setBenchmark] = useState<any>(null);
-  const [timingFetch, setTimingFetch] = useState(false);
-  const benchPoll = useRef<any>(null);
+  // Seeded from the module-level flag, not false: coming back to Settings while
+  // a timed fetch is still running has to show the row busy.
+  const [timingFetch, setTimingFetch] = useState(_benchRunning);
 
   useEffect(() => {
     getFetchBenchmark().then((r) => setBenchmark(r?.result || null)).catch(() => {});
-    return () => { if (benchPoll.current) clearInterval(benchPoll.current); };
+    const onDone = (b: any) => { setBenchmark(b); setTimingFetch(false); };
+    _benchListeners.add(onDone);
+    // Only the listener is dropped on unmount — the poll itself keeps running.
+    return () => { _benchListeners.delete(onDone); };
   }, []);
 
   const handleTimeColdFetch = async () => {
@@ -10852,23 +10987,13 @@ function SettingsPage() {
         toaster.toast({ title: 'Cold fetch', body: r?.message || 'Could not start' });
         return;
       }
-      const before = r.previous_at || null;
-      // No timeout: a 50k library over a slow server legitimately takes a very
-      // long time, and cutting the poll off would report failure for a fetch
-      // that is still running fine. The row stays busy until a result lands or
-      // the user leaves the page.
-      benchPoll.current = setInterval(async () => {
-        try {
-          const b = (await getFetchBenchmark())?.result;
-          if (b && b.at !== before) {
-            clearInterval(benchPoll.current); benchPoll.current = null;
-            setBenchmark(b);
-            setTimingFetch(false);
-            toaster.toast({ title: 'Cold fetch timed',
-              body: `${b.seconds}s for ${b.roms ?? '?'} ROMs` });
-          }
-        } catch { /* keep polling; a transient RPC failure is not an answer */ }
-      }, 2000);
+      _startBenchPoll(r.previous_at || null);
+      // Back to the library: the whole run is a cold start, so this lands the
+      // user exactly where a cold start does — watching the library refill,
+      // with the fetch toast narrating it — instead of on a settings row with
+      // nothing to show for two minutes. The result still arrives (the poll is
+      // module-level now) and its toast comes back here on click.
+      libBack('/romm-sync-library');
     } catch (e) {
       setTimingFetch(false);
       console.error('time cold fetch failed:', e);
@@ -11136,7 +11261,7 @@ function SettingsPage() {
             timingFetch
               ? 'Clearing caches and refetching — this can take minutes'
               : benchmark
-                ? `Last: ${benchmark.seconds}s for ${benchmark.roms ?? '?'} ROMs`
+                ? `Last: ${fmtFetchDuration(benchmark.seconds)} for ${benchmark.roms ?? '?'} ROMs`
                   + (benchmark.pages ? ` (${benchmark.pages} pages` : '')
                   + (benchmark.pages && benchmark.seconds_per_page
                       ? `, ${benchmark.seconds_per_page}s each)` : benchmark.pages ? ')' : '')

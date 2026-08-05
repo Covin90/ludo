@@ -103,6 +103,9 @@ export type ToastOpts = {
   duration?: number;
   critical?: boolean;
   onClick?: () => void;
+  // Accepted for parity with Decky's ToastData so shared callers typecheck.
+  // The shim's own chime is unconditional; opting out isn't wired up here.
+  playSound?: boolean;
 };
 
 type ToastEntry = ToastOpts & { id: number };
@@ -112,16 +115,25 @@ let toasts: ToastEntry[] = [];
 const toastSubs = new Set<() => void>();
 const notifyToasts = () => toastSubs.forEach((f) => f());
 
+// Mirrors Decky's toaster.toast return value: a handle whose dismiss() takes the
+// toast down early. Needed for the long-lived ones (the library fetch strip),
+// which have no meaningful duration up front — they end when the work ends.
 export function pushToast(opts: ToastOpts) {
   const id = ++toastSeq;
   toasts = [...toasts, { ...opts, id }];
   playSound("toast");
   notifyToasts();
-  const ms = opts.duration ?? 5000;
-  window.setTimeout(() => {
+  const dismiss = () => {
+    if (!toasts.some((t) => t.id === id)) return;
     toasts = toasts.filter((t) => t.id !== id);
     notifyToasts();
-  }, ms);
+  };
+  const ms = opts.duration ?? 5000;
+  // A non-finite duration means "until dismissed". Passing it to setTimeout
+  // would be worse than useless: a non-finite delay is coerced to 0, so the
+  // toast meant to stay longest would be the one that vanished instantly.
+  if (Number.isFinite(ms)) window.setTimeout(dismiss, ms);
+  return { data: opts, dismiss };
 }
 
 // Notification-overlay corner, chosen in Settings (desktop-only). Persisted in
