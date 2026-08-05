@@ -1586,7 +1586,15 @@ class Plugin:
                     logging.warning("Library fetch was incomplete — not caching the "
                                     "server count, so the next connect refetches")
                 self._library_server_total = None if incomplete else server_total
-                self._available_games.clear()
+                # Built into a local list and swapped in at the end rather than
+                # cleared and refilled in place. Clearing first leaves the
+                # library observably EMPTY for the whole rebuild, and readers
+                # don't know to wait: get_library_groups reports
+                # library_ready from _last_full_fetch_time, which still holds
+                # its previous value here, so the Platforms tab was handed a
+                # confident "0 platforms" and cached it. The rebind is atomic,
+                # so no reader ever sees a partial library.
+                games = []
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                         _default_roms_dir())).expanduser()
                 for rom in raw_games:
@@ -1602,7 +1610,7 @@ class Plugin:
                         else:
                             local_size = local_path.stat().st_size
                     is_md = _detect_multi_disc(local_path, is_downloaded)
-                    self._available_games.append({
+                    games.append({
                         'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
                         # RomM's metadata title (e.g. "Mario Party 7") — used for
                         # display; 'name' stays the filename stem because the
@@ -1645,6 +1653,11 @@ class Plugin:
                             'files':           rom.get('files', []),
                         },
                     })
+                # The swap. Everything downstream — the snapshot, BIOS
+                # tracking, the auto-sync get_games_callback — reads the
+                # attribute, so rebinding is enough (the incremental branch in
+                # refresh_from_romm already rebinds the same way).
+                self._available_games = games
                 logging.info(f"Loaded {len(self._available_games)} games")
 
                 # First successful library load ever gets a toast, because the
@@ -2297,7 +2310,12 @@ class Plugin:
                     self._library_server_total = (
                         None if getattr(self._romm_client, 'last_fetch_incomplete', False)
                         else server_total)
-                    self._available_games.clear()
+                    # Local list + swap, not clear-in-place — see the same
+                    # change in _connect_to_romm. This path is the worse of the
+                    # two: _last_full_fetch_time is only updated at the very
+                    # end, so a clear here publishes an empty library that
+                    # still claims to be ready for the whole refresh.
+                    games = []
                     download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                             _default_roms_dir())).expanduser()
 
@@ -2317,7 +2335,7 @@ class Plugin:
 
                         is_md = _detect_multi_disc(local_path, is_downloaded)
 
-                        self._available_games.append({
+                        games.append({
                             'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
                             'display_name':    rom.get('name'),
                             'rom_id':          rom.get('id'),
@@ -2345,6 +2363,7 @@ class Plugin:
                                 'files': rom.get('files', []),
                             },
                         })
+                    self._available_games = games
                     logging.info(f"Full refresh: loaded {len(self._available_games)} games")
 
             if use_incremental:
