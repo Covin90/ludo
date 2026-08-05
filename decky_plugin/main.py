@@ -131,6 +131,14 @@ settings_file = CONFIG_DIR / 'decky_settings.json'
 snapshot_file = CONFIG_DIR / 'library_snapshot.json'
 SNAPSHOT_SCHEMA = 1
 
+# How long the last library fetch took, so a user can report it without having
+# to reproduce it while someone watches. Diagnosing the RomM fetch has meant
+# guessing at other people's servers from the outside, and "it's slow" is not a
+# number — this makes it one. Written after every fetch, cold or not; Settings ▸
+# Debug forces a cold one and reads this back. Deliberately NOT in settings.ini:
+# it is a measurement, not a preference, and it must survive a restart.
+benchmark_file = CONFIG_DIR / 'fetch_benchmark.json'
+
 # Partial-fetch checkpoint. A full library fetch is ~6 minutes at 80k ROMs, and
 # anything that interrupts it — suspend, a network blip, a Decky reload — used to
 # throw away every page already paid for. Pages are appended here as they arrive
@@ -1073,6 +1081,44 @@ class Plugin:
         except Exception as e:
             logging.warning(f"Couldn't remove resume checkpoint: {e}")
 
+    def _record_fetch_benchmark(self, seconds, total, resumed_pages=0):
+        """Persist how long the library fetch just took.
+
+        `resumed_pages` matters more than it looks: a fetch that replayed a
+        checkpoint did less network work than the wall time suggests, so a
+        record with resumed > 0 is not comparable to a cold one and says so
+        rather than quietly reporting a flattering number.
+
+        Never raises — a fetch must not fail because a diagnostic file could
+        not be written.
+        """
+        try:
+            page_size = LIBRARY_PAGE_SIZE
+            pages = -(-total // page_size) if total else None
+            record = {
+                'seconds': round(seconds, 2),
+                'roms': total,
+                'pages': pages,
+                'page_size': page_size,
+                'resumed_pages': resumed_pages,
+                'cold': resumed_pages == 0,
+                'incomplete': bool(getattr(self._romm_client, 'last_fetch_incomplete', False)),
+                'server_url': (self._settings.get('RomM', 'url', '') if self._settings else ''),
+                'at': datetime.now(timezone.utc).isoformat(),
+            }
+            if pages and seconds > 0:
+                record['seconds_per_page'] = round(seconds / pages, 2)
+            tmp = benchmark_file.with_suffix('.tmp')
+            benchmark_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(record, f)
+            tmp.rename(benchmark_file)
+            logging.info(f"Library fetch took {record['seconds']}s for "
+                         f"{total} ROMs ({pages} pages, cold={record['cold']}, "
+                         f"incomplete={record['incomplete']})")
+        except Exception as e:
+            logging.debug(f"Couldn't record fetch benchmark: {e}")
+
     def _clear_library_cache(self):
         """Drop every trace of the previous account's library, on disk and in
         memory, so the next login refetches from scratch.
@@ -1486,6 +1532,11 @@ class Plugin:
             if skip_fetch:
                 roms_result = None
             else:
+                fetch_started = time.time()
+                # Bound before the try so the finally below can always read
+                # them: if the count probe raises, an unbound local there would
+                # replace the real exception with a NameError.
+                known_total, resumed = None, {}
                 try:
                     # Seed the total BEFORE fetching. Pages arrive whole and in
                     # parallel, so the count itself barely moves until they land
@@ -1514,6 +1565,14 @@ class Plugin:
                     # than no count, since the banner would claim progress that
                     # stopped happening.
                     self._library_progress = None
+                    # Timed unconditionally, not just under the Debug action.
+                    # The number we actually want is from a real user's real
+                    # server, and asking them to reproduce it on demand is how
+                    # you never get it — every fetch now leaves a record, and
+                    # the Debug button just forces a cold one on request.
+                    self._record_fetch_benchmark(
+                        time.time() - fetch_started, known_total,
+                        resumed_pages=len(resumed or {}))
             if roms_result and len(roms_result) == 2:
                 raw_games, server_total = roms_result
                 # Ungrouped server count — see _library_server_total. A fetch
@@ -2043,6 +2102,70 @@ class Plugin:
         except Exception as e:
             logging.debug(f"clear_recent_activity error: {e}")
             return {'success': False}
+
+    async def get_fetch_benchmark(self):
+        """Last recorded library-fetch timing, or {} if none yet."""
+        try:
+            if not benchmark_file.exists():
+                return {'success': True, 'result': None}
+            with open(benchmark_file, 'r', encoding='utf-8') as f:
+                return {'success': True, 'result': json.load(f)}
+        except Exception as e:
+            logging.debug(f"get_fetch_benchmark: {e}")
+            return {'success': True, 'result': None}
+
+    async def time_cold_fetch(self):
+        """Settings ▸ Debug: drop every cache and refetch the library, timed.
+
+        Returns immediately; the caller polls get_fetch_benchmark() and watches
+        for `at` to change. The fetch itself runs for minutes on a big library,
+        which is far longer than any RPC should block.
+
+        This restarts sync rather than the process. A Decky plugin cannot
+        relaunch Steam, and a process restart would only matter if it cleared
+        state that _clear_library_cache misses — it doesn't: that method already
+        drops the snapshot, the resume checkpoint, the in-memory games, and all
+        three fields the skip check reads. What comes back is a genuinely cold
+        fetch, which is the thing being measured.
+        """
+        try:
+            if not (self._romm_client and self._romm_client.authenticated):
+                return {'success': False, 'message': 'Not connected to RomM'}
+
+            previous = None
+            try:
+                if benchmark_file.exists():
+                    with open(benchmark_file, 'r', encoding='utf-8') as f:
+                        previous = json.load(f).get('at')
+            except Exception:
+                pass
+
+            logging.info("Debug: timing a cold library fetch (user action)")
+            announced = (self._settings.get('UI', 'library_announced', '')
+                         if self._settings else '')
+            self._clear_library_cache()
+            # _clear_library_cache re-arms the first-fetch toast, which is right
+            # for a real logout but is a surprise side effect of a debug action.
+            try:
+                if self._settings:
+                    self._settings.set('UI', 'library_announced', announced)
+            except Exception:
+                pass
+
+            def _run():
+                try:
+                    self._stop_sync()
+                    time.sleep(0.5)
+                    self._start_sync()
+                except Exception as e:
+                    logging.error(f"time_cold_fetch: {e}", exc_info=True)
+
+            threading.Thread(target=_run, daemon=True,
+                             name="ludo-fetch-benchmark").start()
+            return {'success': True, 'started': True, 'previous_at': previous}
+        except Exception as e:
+            logging.error(f"time_cold_fetch error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
 
     async def refresh_from_romm(self, force_full_refresh: bool = False):
         """Refresh data from RomM server (collections and games).

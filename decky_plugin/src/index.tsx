@@ -17,12 +17,14 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, toaster, routerHook, openFilePicker, FileSelectionType } from "@decky/api";
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, forwardRef, memo, cloneElement, type Ref, type ChangeEvent } from "react";
-import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip } from "react-icons/fa";
+import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip, FaStopwatch } from "react-icons/fa";
 import { BsGearFill } from "react-icons/bs";
 import { MdVerified } from "react-icons/md";
 
 // Call backend methods
 const getServiceStatus = callable<[], any>("get_service_status");
+const timeColdFetch = callable<[], any>("time_cold_fetch");
+const getFetchBenchmark = callable<[], any>("get_fetch_benchmark");
 const ackLibraryAnnouncement = callable<[], any>("ack_library_announcement");
 const notifyNetworkState = callable<[boolean], any>("notify_network_state");
 // rom_id/has_cover are set on events about one specific game (save/state
@@ -10827,6 +10829,52 @@ function SettingsPage() {
     }
   };
 
+  // Cold-fetch timer (Settings ▸ Debug). The fetch runs for minutes on a large
+  // library, so the RPC returns as soon as it starts and we poll for a record
+  // newer than the one that was there before — comparing `at` rather than just
+  // "a record exists", or a previous run's result would read as this one's.
+  const [benchmark, setBenchmark] = useState<any>(null);
+  const [timingFetch, setTimingFetch] = useState(false);
+  const benchPoll = useRef<any>(null);
+
+  useEffect(() => {
+    getFetchBenchmark().then((r) => setBenchmark(r?.result || null)).catch(() => {});
+    return () => { if (benchPoll.current) clearInterval(benchPoll.current); };
+  }, []);
+
+  const handleTimeColdFetch = async () => {
+    if (timingFetch) return;
+    setTimingFetch(true);
+    try {
+      const r = await timeColdFetch();
+      if (!r?.success) {
+        setTimingFetch(false);
+        toaster.toast({ title: 'Cold fetch', body: r?.message || 'Could not start' });
+        return;
+      }
+      const before = r.previous_at || null;
+      // No timeout: a 50k library over a slow server legitimately takes a very
+      // long time, and cutting the poll off would report failure for a fetch
+      // that is still running fine. The row stays busy until a result lands or
+      // the user leaves the page.
+      benchPoll.current = setInterval(async () => {
+        try {
+          const b = (await getFetchBenchmark())?.result;
+          if (b && b.at !== before) {
+            clearInterval(benchPoll.current); benchPoll.current = null;
+            setBenchmark(b);
+            setTimingFetch(false);
+            toaster.toast({ title: 'Cold fetch timed',
+              body: `${b.seconds}s for ${b.roms ?? '?'} ROMs` });
+          }
+        } catch { /* keep polling; a transient RPC failure is not an answer */ }
+      }, 2000);
+    } catch (e) {
+      setTimingFetch(false);
+      console.error('time cold fetch failed:', e);
+    }
+  };
+
   const handleLogout = async (wipeData: boolean) => {
     setLoggingOut(true);
     try {
@@ -11080,6 +11128,24 @@ function SettingsPage() {
           onClick={loading ? undefined : () => handleLoggingToggle(!loggingEnabled)}
           right={<V2Switch checked={loggingEnabled} />}
           disabled={loading}
+        />
+        <V2SettingsRow
+          icon={<FaStopwatch size={16} />}
+          title={timingFetch ? 'Timing a cold fetch…' : 'Time a cold library fetch'}
+          subtitle={
+            timingFetch
+              ? 'Clearing caches and refetching — this can take minutes'
+              : benchmark
+                ? `Last: ${benchmark.seconds}s for ${benchmark.roms ?? '?'} ROMs`
+                  + (benchmark.pages ? ` (${benchmark.pages} pages` : '')
+                  + (benchmark.pages && benchmark.seconds_per_page
+                      ? `, ${benchmark.seconds_per_page}s each)` : benchmark.pages ? ')' : '')
+                  + (benchmark.incomplete ? ' — INCOMPLETE' : '')
+                  + (benchmark.cold === false ? ' — resumed, not cold' : '')
+                : 'Clears the cache, refetches everything, reports how long it took'
+          }
+          onClick={timingFetch ? undefined : handleTimeColdFetch}
+          disabled={timingFetch}
         />
       </V2SettingsSection>
 
