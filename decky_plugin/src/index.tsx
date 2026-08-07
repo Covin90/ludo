@@ -381,7 +381,95 @@ interface LibGroup {
   slug?: string | null; fs_slug?: string | null;
   synced?: boolean; virtual?: boolean;
 }
-interface LibGame { rom_id: number; name: string; platform: string | null; is_downloaded: boolean; has_cover: boolean; screenshot?: string | null; platform_slug?: string | null; is_multi_disc?: boolean; disc_count?: number; sibling_roms?: { rom_id: number; name: string }[]; region_count?: number; is_orphan?: boolean; }
+interface LibGame { rom_id: number; name: string; platform: string | null; is_downloaded: boolean; has_cover: boolean; screenshot?: string | null; platform_slug?: string | null; is_multi_disc?: boolean; disc_count?: number; sibling_roms?: { rom_id: number; name: string }[]; region_count?: number; is_orphan?: boolean; regions?: string[]; languages?: string[]; }
+
+// Region/language code -> flag emoji, ported from RomM's
+// frontend/src/utils/index.ts (regionToEmoji / languageToEmoji). RomM accepts
+// both the short ROM-tag code ("u", "j", "e") and the spelled-out name, since
+// which one a row carries depends on the naming convention the file came from.
+// An unrecognised value falls through to itself, so it still shows as text
+// rather than vanishing — same as RomM.
+const REGION_EMOJI: Record<string, string> = {
+  as: '🇦🇺', australia: '🇦🇺',
+  a: '🌏', asia: '🌏',
+  b: '🇧🇷', bra: '🇧🇷', brazil: '🇧🇷',
+  c: '🇨🇦', canada: '🇨🇦',
+  ch: '🇨🇳', chn: '🇨🇳', china: '🇨🇳',
+  e: '🇪🇺', eu: '🇪🇺', eur: '🇪🇺', europe: '🇪🇺',
+  f: '🇫🇷', france: '🇫🇷',
+  fn: '🇫🇮', finland: '🇫🇮',
+  g: '🇩🇪', germany: '🇩🇪',
+  gr: '🇬🇷', greece: '🇬🇷',
+  h: '🇳🇱', holland: '🇳🇱',
+  hk: '🇭🇰', 'hong kong': '🇭🇰',
+  i: '🇮🇹', italy: '🇮🇹',
+  j: '🇯🇵', jp: '🇯🇵', japan: '🇯🇵',
+  k: '🇰🇷', korea: '🇰🇷',
+  nl: '🇳🇱', netherlands: '🇳🇱',
+  no: '🇳🇴', norway: '🇳🇴',
+  r: '🇷🇺', russia: '🇷🇺',
+  s: '🇪🇸', spain: '🇪🇸',
+  sw: '🇸🇪', sweden: '🇸🇪',
+  t: '🇹🇼', taiwan: '🇹🇼',
+  u: '🇺🇸', us: '🇺🇸', usa: '🇺🇸',
+  uk: '🇬🇧', england: '🇬🇧',
+  unk: '🌎', unknown: '🌎',
+  unl: '🌎', unlicensed: '🌎',
+  w: '🌎', global: '🌎', world: '🌎',
+};
+const LANGUAGE_EMOJI: Record<string, string> = {
+  af: '🇿🇦', afrikaans: '🇿🇦',
+  ar: '🇦🇪', arabic: '🇦🇪',
+  be: '🇧🇾', belarusian: '🇧🇾',
+  bg: '🇧🇬', bulgarian: '🇧🇬',
+  ca: '🇦🇩', catalan: '🇦🇩',
+  cs: '🇨🇿', czech: '🇨🇿',
+  da: '🇩🇰', danish: '🇩🇰',
+  de: '🇩🇪', german: '🇩🇪',
+  el: '🇬🇷', greek: '🇬🇷',
+  en: '🇬🇧', english: '🇬🇧',
+  es: '🇪🇸', spanish: '🇪🇸',
+  et: '🇪🇪', estonian: '🇪🇪',
+  fi: '🇫🇮', finnish: '🇫🇮',
+  fr: '🇫🇷', french: '🇫🇷',
+  he: '🇮🇱', hebrew: '🇮🇱',
+  hi: '🇮🇳', hindi: '🇮🇳',
+  hr: '🇭🇷', croatian: '🇭🇷',
+  hu: '🇭🇺', hungarian: '🇭🇺',
+  hy: '🇦🇲', armenian: '🇦🇲',
+  id: '🇮🇩', indonesian: '🇮🇩',
+  is: '🇮🇸', icelandic: '🇮🇸',
+  it: '🇮🇹', italian: '🇮🇹',
+  ja: '🇯🇵', japanese: '🇯🇵',
+  ko: '🇰🇷', korean: '🇰🇷',
+  la: '🇻🇦', latin: '🇻🇦',
+  lt: '🇱🇹', lithuanian: '🇱🇹',
+  lv: '🇱🇻', latvian: '🇱🇻',
+  mk: '🇲🇰', macedonian: '🇲🇰',
+  nl: '🇳🇱', dutch: '🇳🇱',
+  no: '🇳🇴', norwegian: '🇳🇴',
+  pl: '🇵🇱', polish: '🇵🇱',
+  pt: '🇵🇹', portuguese: '🇵🇹',
+  ro: '🇷🇴', romanian: '🇷🇴',
+  ru: '🇷🇺', russian: '🇷🇺',
+  sk: '🇸🇰', slovak: '🇸🇰',
+  sl: '🇸🇮', slovenian: '🇸🇮',
+  sq: '🇦🇱', albanian: '🇦🇱',
+  sr: '🇷🇸', serbian: '🇷🇸',
+  sv: '🇸🇪', swedish: '🇸🇪',
+  th: '🇹🇭', thai: '🇹🇭',
+  tr: '🇹🇷', turkish: '🇹🇷',
+  uk: '🇺🇦', ukrainian: '🇺🇦',
+  vi: '🇻🇳', vietnamese: '🇻🇳',
+  zh: '🇨🇳', chinese: '🇨🇳',
+  nolang: '🌎', 'no language': '🌎',
+};
+function regionToEmoji(region: string): string {
+  return REGION_EMOJI[(region || '').toLowerCase()] || region;
+}
+function languageToEmoji(language: string): string {
+  return LANGUAGE_EMOJI[(language || '').toLowerCase()] || language;
+}
 
 function fmtBytes(n: number | null | undefined): string {
   if (!n || isNaN(n as any)) return '';
@@ -1664,6 +1752,39 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             {discsAreRegion
               ? <><FaGlobe size={9} />{discs.length || game.disc_count || ''}</>
               : <><FaClone size={9} />{game.disc_count || pickableDiscs.length || ''}</>}
+          </div>
+        )}
+
+        {/* Region + language flag chips — bottom-right, the one corner the
+            other badges don't use (platform icon top-right, downloaded dot /
+            region / orphan top-left, disc count bottom-left).
+
+            This is RomM's Card Flags.vue: one translucent chip per axis, at
+            most three emoji each, titled with the full list. Like the rest of
+            the corner badges they fade out on focus so the action overlay is
+            unobstructed. */}
+        {((game.regions?.length || 0) > 0 || (game.languages?.length || 0) > 0) && (
+          <div style={{
+            position: 'absolute', right: '7px', bottom: '7px', zIndex: 2,
+            display: 'flex', alignItems: 'center', gap: '4px',
+            maxWidth: 'calc(100% - 14px)', overflow: 'hidden',
+            opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
+          }}>
+            {([['regions', game.regions, regionToEmoji],
+               ['languages', game.languages, languageToEmoji]] as const)
+              .filter(([, vals]) => (vals?.length || 0) > 0)
+              .map(([kind, vals, toEmoji]) => (
+                <div key={kind} title={`${kind === 'regions' ? 'Regions' : 'Languages'}: ${vals!.join(', ')}`}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '2px',
+                    padding: '2px 5px', borderRadius: V2.radiusPill,
+                    fontSize: '10px', lineHeight: 1.2, whiteSpace: 'nowrap',
+                    background: 'rgba(0,0,0,0.78)',
+                    border: '1px solid rgba(255,255,255,0.12)', color: V2.fg,
+                  }}>
+                  {vals!.slice(0, 3).map((v) => <span key={v}>{toEmoji(v)}</span>)}
+                </div>
+              ))}
           </div>
         )}
 

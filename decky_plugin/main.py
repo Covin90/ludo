@@ -129,7 +129,11 @@ settings_file = CONFIG_DIR / 'decky_settings.json'
 # tagged with the server_url so a server switch invalidates it. See _persist_snapshot /
 # _load_snapshot. SCHEMA bumps when the persisted game/collection shape changes.
 snapshot_file = CONFIG_DIR / 'library_snapshot.json'
-SNAPSHOT_SCHEMA = 1
+# 2: entries carry `regions`/`languages` for the tile's flag chips. A schema-1
+# snapshot has no flags on any row, and an incremental refresh only re-reads
+# rows RomM reports as changed — so without this bump the flags would trickle
+# in one game at a time, forever. Discarding the snapshot costs one full fetch.
+SNAPSHOT_SCHEMA = 2
 
 # How long the last library fetch took, so a user can report it without having
 # to reproduce it while someone watches. Diagnosing the RomM fetch has meant
@@ -4916,7 +4920,16 @@ class Plugin:
             else:
                 local_size = local_path.stat().st_size
         is_md = _detect_multi_disc(local_path, is_downloaded)
+        # Region/language flags for the tile (RomM Card Flags.vue). Only kept
+        # when non-empty: most rows have neither, and an always-present pair of
+        # empty lists is dead weight on every entry in a 50k snapshot.
+        flags = {}
+        for k in ('regions', 'languages'):
+            v = [x for x in (rom.get(k) or []) if x]
+            if v:
+                flags[k] = v
         return {
+            **flags,
             'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
             # RomM's metadata title (e.g. "Mario Party 7") — used for display;
             # 'name' stays the filename stem because the save-sync/local
@@ -5533,6 +5546,13 @@ class Plugin:
         # across a library this size.
         if g.get('is_orphan'):
             s['is_orphan'] = True
+        # Region/language flag chips. Capped at 3 each — the tile only ever
+        # draws three (RomM's Card Flags.vue does the same), so shipping more
+        # would only fatten the localStorage cache.
+        for k in ('regions', 'languages'):
+            v = g.get(k)
+            if v:
+                s[k] = v[:3]
         if g.get('is_multi_disc'):
             s['is_multi_disc'] = True
             s['disc_count'] = g.get('disc_count', 0)
@@ -5588,6 +5608,12 @@ class Plugin:
                         'has_cover': bool(r.get('path_cover_small') or (local or {}).get('cover_path')),
                         'platform_slug': (local or {}).get('platform_slug') or r.get('platform_slug'),
                     }
+                    # Flag chips come off the raw row here, falling back to the
+                    # cached entry for a game the library walk already saw.
+                    for fk in ('regions', 'languages'):
+                        fv = [x for x in (r.get(fk) or (local or {}).get(fk) or []) if x]
+                        if fv:
+                            entry[fk] = fv[:3]
                     if local and local.get('is_downloaded') and local.get('local_path'):
                         is_md, dc = _detect_multi_disc(local['local_path'], True)
                         entry['is_multi_disc'] = is_md
@@ -5697,6 +5723,12 @@ class Plugin:
                         'has_cover': bool(r.get('path_cover_small') or (local or {}).get('cover_path')),
                         'platform_slug': (local or {}).get('platform_slug') or r.get('platform_slug'),
                     }
+                    # Flag chips come off the raw row here, falling back to the
+                    # cached entry for a game the library walk already saw.
+                    for fk in ('regions', 'languages'):
+                        fv = [x for x in (r.get(fk) or (local or {}).get(fk) or []) if x]
+                        if fv:
+                            entry[fk] = fv[:3]
                     if local and local.get('is_downloaded') and local.get('local_path'):
                         is_md, dc = _detect_multi_disc(local['local_path'], True)
                         entry['is_multi_disc'] = is_md

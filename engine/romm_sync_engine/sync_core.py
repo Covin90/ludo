@@ -2337,6 +2337,9 @@ ROM_TRIM_FIELDS = (
     'platform_fs_slug',
     'path_cover_large', 'path_cover_small', 'sibling_roms', 'rom_user',
     'created_at', 'updated_at',
+    # Region/language flags on the game tile (RomM's Card Flags.vue). Two short
+    # string lists per row — cheap next to what the trim already keeps.
+    'regions', 'languages',
 )
 
 
@@ -2944,7 +2947,7 @@ class RomMClient:
                     'with_rom_id_index': 'false',
                     'with_char_index': 'false',
                     'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
-                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
+                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
                 },
                 timeout=30
             )
@@ -3057,7 +3060,7 @@ class RomMClient:
                     'with_rom_id_index': 'false',
                     'with_char_index': 'false',
                     'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
-                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
+                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
                 },
                 timeout=30
             )
@@ -3092,7 +3095,7 @@ class RomMClient:
                     'with_rom_id_index': 'false',
                     'with_char_index': 'false',
                     'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
-                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
+                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
                 },
                 timeout=30
             )
@@ -3684,7 +3687,7 @@ class RomMClient:
                             'with_rom_id_index': 'false',
                             'with_char_index': 'false',
                             'with_filter_values': 'false',
-                            'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user'
+                            'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
                         },
                         timeout=timeout
                     )
