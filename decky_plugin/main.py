@@ -2192,14 +2192,31 @@ class Plugin:
         Returns:
             dict with status and updated game/collection info
         """
-        try:
-            if not (self._romm_client and self._romm_client.authenticated):
-                return {
-                    'success': False,
-                    'message': 'Not connected to RomM',
-                    'status': await self.get_service_status()
-                }
+        if not (self._romm_client and self._romm_client.authenticated):
+            return {
+                'success': False,
+                'message': 'Not connected to RomM',
+                'status': await self.get_service_status()
+            }
 
+        # One refresh at a time. Two buttons could already start concurrent
+        # refreshes — the header one and the account-menu one each tracked only
+        # their own busy state — and two merges racing on _available_games means
+        # the slower one rebinds the attribute over the faster one's result,
+        # losing it. The automatic trigger makes that collision routine, and a
+        # reconciliation sweeping against a library another walk is rewriting is
+        # the worst version of it. Turned away rather than queued: the caller
+        # wanted the library current, and it is about to be.
+        if self._library_busy:
+            logging.info("Refresh skipped — a library fetch is already running")
+            return {
+                'success': False,
+                'busy': True,
+                'message': 'A library refresh is already running',
+                'status': await self.get_service_status()
+            }
+        self._library_busy = True
+        try:
             # Get current timestamp in ISO 8601 format with timezone
             current_time = datetime.now(timezone.utc).isoformat()
 
@@ -2210,6 +2227,22 @@ class Plugin:
             )
 
             updated_after = self._last_full_fetch_time if use_incremental else None
+            # Set when an incremental refresh discovers server-side changes it
+            # cannot merge and re-reads instead; reported back so the caller can
+            # say so.
+            escalated = False
+            # Per-platform reconciliation result, when one ran. Bound out here
+            # because the summary at the bottom reports it and the full-refresh
+            # path never sets it.
+            reconcile = None
+            # Bound here, not only in the full-refresh branch: the summary below
+            # reads it on every path.
+            refresh_incomplete = False
+            # Rows the server sent on this refresh, whichever path fetched them.
+            # The next watermark is derived from their updated_at — the server's
+            # own clock — rather than ours; see _server_watermark.
+            fetched_rows = []
+            pending_baselines = None
 
             logging.info(f"Refreshing from RomM (incremental={use_incremental}, "
                         f"updated_after={updated_after})")
@@ -2231,6 +2264,14 @@ class Plugin:
 
             # Fetch ROMs
             if use_incremental:
+                # Rows the merge genuinely adds, as opposed to updates in place.
+                # Bound out here because the reconciliation below runs even when
+                # nothing changed — a pure deletion is precisely the case where
+                # the changed slice comes back empty.
+                added_ids = 0
+                # Platforms proven to have moved, whatever their count says.
+                # See the reconcile call below.
+                new_row_platforms = set()
                 # Incremental fetch - only get updated ROMs. No limit: get_roms
                 # pages this like any other full walk. It used to pass 10000,
                 # asking for the whole changed set in one response, which on a
@@ -2243,6 +2284,7 @@ class Plugin:
 
                 if new_roms_data and len(new_roms_data) == 2:
                     new_roms, _ = new_roms_data
+                    fetched_rows = new_roms or []
 
                     if new_roms:
                         # Update existing games list
@@ -2254,42 +2296,18 @@ class Plugin:
 
                         for rom in new_roms:
                             rom_id = rom.get('id')
-                            platform_slug = rom.get('platform_slug', 'Unknown')
-                            file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
-                            local_path, is_downloaded = _resolve_download_path(
-                                download_dir, platform_slug, file_name)
-                            local_size = 0
-
-                            if is_downloaded and local_path.exists():
-                                if local_path.is_dir():
-                                    local_size = sum(f.stat().st_size
-                                                   for f in local_path.rglob('*') if f.is_file())
-                                else:
-                                    local_size = local_path.stat().st_size
-
-                            game_data = {
-                                'name': Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
-                                'display_name': rom.get('name'),
-                                'rom_id': rom_id,
-                                'platform': _platform_label(rom),
-                                'platform_slug': platform_slug,
-                                'file_name': file_name,
-                                'is_downloaded': is_downloaded,
-                                'local_path': str(local_path) if is_downloaded else None,
-                                'local_size': local_size,
-                                'cover_path': rom.get('path_cover_small'),
-                                'cover_path_large': rom.get('path_cover_large'),
-                                'romm_data': {
-                                    'fs_name': rom.get('fs_name'),
-                                    'fs_name_no_ext': rom.get('fs_name_no_ext'),
-                                    'fs_size_bytes': rom.get('fs_size_bytes', 0),
-                                    'platform_id': rom.get('platform_id'),
-                                    'platform_slug': rom.get('platform_slug'),
-                                    'files': rom.get('files', []),
-                                },
-                            }
-
+                            game_data = self._game_entry(rom, download_dir)
                             # Update or add the game
+                            if rom_id not in existing_games_map:
+                                added_ids += 1
+                                # Only genuinely-new ids, never mere edits.
+                                # `updated_after` also fires on a rename or a
+                                # new cover, and forcing a walk for those would
+                                # cost 17k rows on the largest platform to
+                                # discover nothing structural changed.
+                                pid = rom.get('platform_id')
+                                if pid is not None:
+                                    new_row_platforms.add(pid)
                             existing_games_map[rom_id] = game_data
 
                         self._available_games = list(existing_games_map.values())
@@ -2297,19 +2315,119 @@ class Plugin:
                                    f"total games: {len(self._available_games)}")
                     else:
                         logging.info("Incremental: no new/updated ROMs found")
-            else:
-                # Full refresh - fetch all games
-                roms_result = self._romm_client.get_roms(trim_fields=ROM_TRIM_FIELDS)
+
+                # Reconcile before trusting the merge. `updated_after` only ever
+                # returns rows that still exist, and the merge only ever writes
+                # keys — so a game deleted on RomM survives an incremental
+                # refresh untouched. Worse, the total probe below used to adopt
+                # the server's new (smaller) count anyway and stamp the
+                # timestamps, which made the stale library look consistent: the
+                # next cold start's probes both passed and skipped the fetch, so
+                # the ghost entry became permanent until a manual full refresh.
+                #
+                # So: ask each platform whether it still holds what it held when
+                # we last walked it, and re-walk only the ones that say no.
+                #
+                # This replaces an escalation to a full library walk. The old
+                # check compared one global total against
+                # `_library_server_total + added_ids` and, on any shortfall,
+                # re-read the entire library — minutes, to find one deleted
+                # game. It also had to reason in inequalities, because grouping
+                # makes an added multi-disc game count as one entry against
+                # several server rows, so only a shortfall could be trusted;
+                # per-platform set difference needs none of that.
+                #
+                # Adds get the same treatment as deletes now, which matters more
+                # than it looks: `updated_after` is the fast path, not the
+                # correctness guarantee, so an add the watermark misses is
+                # caught here on the next refresh rather than persisting until
+                # someone forces a full refresh by hand.
+                # Plus any platform that just handed us a ROM id we had never
+                # seen. Counts can only ever report NET, so an add and a delete
+                # of equal size in one platform leaves rom_count identical and
+                # the comparison above sees nothing — the added game merges in
+                # and the deleted one lingers as an entry that fails to launch.
+                # That case always contains an add, though, and we are holding
+                # it right here. Passing its platform in closes the blind spot
+                # completely rather than partially.
+                reconcile = self._reconcile_platforms(
+                    force_platforms=new_row_platforms or None)
+                if reconcile['checked'] is None:
+                    # The platform list was unusable. Fall back to the global
+                    # probe: it is weaker (it cannot see an add and a delete that
+                    # net out) but it is what we have, and silently declaring the
+                    # library reconciled is the one thing that must not happen.
+                    probed = self._romm_client.count_roms()
+                    if probed is not None and self._library_server_total is not None:
+                        if probed < self._library_server_total + added_ids:
+                            logging.info(
+                                "Incremental: platform list unavailable and the "
+                                "global count fell short — rebuilding the library")
+                            use_incremental = False
+                            escalated = True
+                        else:
+                            self._library_server_total = probed
+                    elif probed is not None:
+                        self._library_server_total = probed
+                else:
+                    if reconcile['walked']:
+                        escalated = True   # reported to the caller; scoped, not a rebuild
+                    # Re-probe so the cold-start check has a total consistent
+                    # with what the walks just wrote. Skipped when a platform
+                    # walk came up short: pinning a total the library does not
+                    # actually contain is exactly what made a stale library look
+                    # self-consistent and permanent.
+                    if not reconcile['incomplete']:
+                        probed = self._romm_client.count_roms()
+                        if probed is not None:
+                            self._library_server_total = probed
+                    else:
+                        self._library_server_total = None
+
+                    # Same completion notice the automatic connect reconcile
+                    # raises. Pressing Update is a request to be TOLD what
+                    # changed — the walk is the means, not the answer — and
+                    # before this the toast just vanished and the banner
+                    # cleared, leaving the user to guess.
+                    if reconcile['added'] or reconcile['removed']:
+                        self._announce_library = {
+                            'kind': 'updated',
+                            'added': reconcile['added'],
+                            'removed': reconcile['removed'],
+                            'platforms': reconcile['walked'],
+                        }
+
+            if not use_incremental:
+                # Full refresh - fetch all games. Narrated: this is minutes on a
+                # large library, and on the escalation path the user only asked
+                # for a refresh, so an unexplained stall is the likely reading.
+                # _library_progress feeds the same global sticky toast the cold
+                # fetch raises; the finally below always clears it.
+                def _on_refresh_progress(kind, payload):
+                    if kind == 'loaded' and isinstance(payload, dict):
+                        self._library_progress = payload
+                # Before the walk — see _probe_platform_baselines.
+                pending_baselines = self._probe_platform_baselines()
+                try:
+                    known = self._romm_client.count_roms()
+                    self._library_progress = {'loaded': 0, 'total': known or 0}
+                    roms_result = self._romm_client.get_roms(
+                        trim_fields=ROM_TRIM_FIELDS,
+                        progress_callback=_on_refresh_progress)
+                finally:
+                    self._library_progress = None
                 if roms_result and len(roms_result) == 2:
                     raw_games, server_total = roms_result
+                    fetched_rows = raw_games or []
                     # Keep the count probe's baseline in step with what we just
                     # loaded, or the next connect compares against a stale total.
                     # None on an incomplete fetch, for the same reason as in
                     # _connect_to_romm: a cached count that matches the server
                     # while the library is short pins the short one forever.
+                    refresh_incomplete = getattr(
+                        self._romm_client, 'last_fetch_incomplete', False)
                     self._library_server_total = (
-                        None if getattr(self._romm_client, 'last_fetch_incomplete', False)
-                        else server_total)
+                        None if refresh_incomplete else server_total)
                     # Local list + swap, not clear-in-place — see the same
                     # change in _connect_to_romm. This path is the worse of the
                     # two: _last_full_fetch_time is only updated at the very
@@ -2320,63 +2438,33 @@ class Plugin:
                                                             _default_roms_dir())).expanduser()
 
                     for rom in raw_games:
-                        platform_slug = rom.get('platform_slug', 'Unknown')
-                        file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
-                        local_path, is_downloaded = _resolve_download_path(
-                            download_dir, platform_slug, file_name)
-                        local_size = 0
-
-                        if is_downloaded and local_path.exists():
-                            if local_path.is_dir():
-                                local_size = sum(f.stat().st_size
-                                               for f in local_path.rglob('*') if f.is_file())
-                            else:
-                                local_size = local_path.stat().st_size
-
-                        is_md = _detect_multi_disc(local_path, is_downloaded)
-
-                        games.append({
-                            'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
-                            'display_name':    rom.get('name'),
-                            'rom_id':          rom.get('id'),
-                            'platform':        _platform_label(rom),
-                            'platform_slug':   platform_slug,
-                            'file_name':       file_name,
-                            'is_downloaded':   is_downloaded,
-                            'is_multi_disc':   is_md[0],
-                            'disc_count':      is_md[1],
-                            'local_path':      str(local_path) if is_downloaded else None,
-                            'local_size':      local_size,
-                            'cover_path': rom.get('path_cover_small'),
-                            'cover_path_large': rom.get('path_cover_large'),
-                            '_sibling_files':  rom.get('_sibling_files', []),
-                            'sibling_roms':    rom.get('sibling_roms', []),
-                            '_region_variant_ids': [s.get('id') for s
-                                                    in (rom.get('_region_save_siblings') or [])
-                                                    if s.get('id')],
-                            'romm_data': {
-                                'fs_name': rom.get('fs_name'),
-                                'fs_name_no_ext': rom.get('fs_name_no_ext'),
-                                'fs_size_bytes': rom.get('fs_size_bytes', 0),
-                                'platform_id': rom.get('platform_id'),
-                                'platform_slug': rom.get('platform_slug'),
-                                'files': rom.get('files', []),
-                            },
-                        })
+                        games.append(self._game_entry(rom, download_dir))
+                    # Same guard as _connect_to_romm: absence only means deleted
+                    # if the walk that failed to return it actually finished.
+                    if not refresh_incomplete:
+                        orphans = self._preserve_orphaned_downloads(
+                            games, self._available_games)
+                        if orphans:
+                            logging.info(
+                                f"Kept {orphans} downloaded game(s) no longer on RomM")
                     self._available_games = games
                     logging.info(f"Full refresh: loaded {len(self._available_games)} games")
 
-            if use_incremental:
-                # An incremental merge never learns the server's total (the
-                # response's `total` counts only the updated slice), and a stale
-                # baseline would stop the next connect's probe from ever matching.
-                # One extra probe is ~0.05s.
-                probed = self._romm_client.count_roms()
-                if probed is not None:
-                    self._library_server_total = probed
+            # The baseline the incremental path leaves behind is set by the
+            # reconciliation above, not here: an incremental merge never learns
+            # the server's total on its own (the response's `total` counts only
+            # the updated slice), and a stale baseline would stop the next
+            # connect's probe from ever matching — but adopting one the merge
+            # cannot account for is what hid deletions in the first place.
 
-            self._last_full_fetch_time = current_time
-            self._snapshot_fetched_at = current_time
+            # A full walk re-establishes every platform baseline; it is the only
+            # thing that has seen every row.
+            if (not use_incremental and fetched_rows and not refresh_incomplete
+                    and pending_baselines):
+                self._library_platform_totals = pending_baselines
+
+            self._last_full_fetch_time = self._server_watermark(fetched_rows, current_time)
+            self._snapshot_fetched_at = self._last_full_fetch_time
             # Write-through the freshly merged library so a later cold start /
             # offline session sees this data.
             self._persist_snapshot()
@@ -2384,10 +2472,25 @@ class Plugin:
             # Get updated status
             status = await self.get_service_status()
 
+            # Say what changed, not just that something did. "Up to date." is
+            # the message that makes a missed add indistinguishable from a
+            # working refresh, and these counts are how a reconciliation that
+            # silently stops finding things becomes visible in the field.
+            changed = self._describe_changes(reconcile)
+            if not use_incremental:
+                message = ("Games were removed on RomM — rebuilt the library. "
+                           f"{status.get('message', '')}")
+            elif changed:
+                message = f"{changed}. {status.get('message', '')}"
+            else:
+                message = f"Refreshed: {status.get('message', '')}"
+
             return {
                 'success': True,
-                'message': f"Refreshed: {status.get('message', '')}",
+                'message': message,
                 'incremental': use_incremental,
+                'escalated': escalated,
+                'reconciled': reconcile,
                 'status': status
             }
 
@@ -2402,6 +2505,166 @@ class Plugin:
                 'message': f'Refresh failed: {str(e)[:100]}',
                 'status': await self.get_service_status()
             }
+        finally:
+            # Always cleared, including on the failure paths above: a stuck flag
+            # would lock the user out of refreshing for the rest of the session.
+            self._library_busy = False
+            self._library_progress = None
+
+    def _library_auto_update(self) -> bool:
+        """Whether connect may apply a library change on its own.
+
+        Defaults ON: the common case is a library that changed while the app was
+        closed, and making everyone press a button for that is worse than the
+        occasional unasked-for walk. Off turns the connect path into detect-only
+        — the staleness banner still appears, it just waits to be told.
+        """
+        try:
+            return (self._settings.get('Library', 'auto_update', 'true') or 'true') != 'false'
+        except Exception:
+            return True
+
+    async def get_library_auto_update(self):
+        return {'success': True, 'enabled': self._library_auto_update()}
+
+    async def set_library_auto_update(self, enabled: bool):
+        try:
+            self._settings.set('Library', 'auto_update', 'true' if enabled else 'false')
+            logging.info(f"Library auto-update set to {bool(enabled)}")
+            return {'success': True, 'enabled': bool(enabled)}
+        except Exception as e:
+            logging.error(f"set_library_auto_update error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def check_library_stale(self):
+        """Ask whether the server's library moved, WITHOUT changing anything.
+
+        Detection is deliberately split from application. The check is a single
+        /api/platforms call — 0.04s measured against a 20k-ROM instance, and
+        flat in library size because no ROM is read. Applying what it finds is
+        a walk of every platform that moved, which is seconds to minutes. So
+        the cheap half can run often and unasked; the expensive half needs a
+        person, because swapping the library out from under someone mid-browse
+        is the thing an automatic refresh does that nobody wants.
+
+        Reports NET row deltas per platform, which is all counts can say: an
+        add and a delete of equal size inside one platform is invisible here
+        (see `resync_platform`, the manual repair for exactly that). Row counts
+        are also pre-grouping, so they can exceed the number of library entries
+        that will actually appear — the copy calls them "changes on RomM", not
+        "new games in your library".
+        """
+        idle = {'success': True, 'stale': False, 'added': 0, 'removed': 0,
+                'platforms': []}
+        if not (self._romm_client and self._romm_client.authenticated):
+            return idle
+        # A fetch in flight is about to rewrite the very baselines this compares
+        # against, so any answer now is about to be wrong.
+        if self._library_busy or self._library_progress:
+            return idle
+        baselines = self._library_platform_totals
+        if not baselines:
+            # Never walked per-platform, so there is nothing to compare. The
+            # first reconcile adopts baselines; until then, silence.
+            return idle
+
+        try:
+            platforms = self._romm_client.get_platforms() or []
+        except Exception as e:
+            logging.debug(f"Staleness check failed: {e}")
+            return idle
+        if not platforms:
+            return idle
+
+        added = removed = 0
+        names = []
+        for p in platforms:
+            pid = p.get('id')
+            if pid is None:
+                continue
+            base = baselines.get(pid)
+            count = p.get('rom_count') or 0
+            if base is None:
+                # A platform that appeared since the last walk. Its whole
+                # contents are new to us, even though nothing "changed size".
+                if not count:
+                    continue
+                delta = count
+            else:
+                delta = count - base
+                if not delta:
+                    continue
+            if delta > 0:
+                added += delta
+            else:
+                removed += -delta
+            names.append(str(p.get('display_name') or p.get('name')
+                             or p.get('slug') or 'Unknown'))
+
+        return {'success': True, 'stale': bool(names), 'added': added,
+                'removed': removed, 'platforms': names}
+
+    async def resync_platform(self, platform: str):
+        """Re-read one platform from RomM and reconcile just that slice.
+
+        The unit reconciliation already works in, exposed as something the user
+        can ask for. It exists because the automatic check can only react to a
+        count changing, and someone who just added forty ROMs to one platform
+        should not have to wait for that — they know which platform, and reading
+        one is seconds where reading the library is minutes.
+
+        Unconditional: unlike the automatic pass this walks the platform whether
+        or not its count moved, because "I know something changed" is the reason
+        the user pressed it. That also makes it the manual repair for the one
+        case counts cannot see — an add and a delete inside the same platform
+        that net to the same total.
+        """
+        if not (self._romm_client and self._romm_client.authenticated):
+            return {'success': False, 'message': 'Not connected to RomM'}
+
+        if self._library_busy:
+            return {'success': False, 'busy': True,
+                    'message': 'A library refresh is already running'}
+        self._library_busy = True
+        try:
+            reconcile = self._reconcile_platforms(only_platform=platform)
+            if reconcile['checked'] is None:
+                return {'success': False,
+                        'message': 'Could not read the platform list from RomM'}
+            if not reconcile['checked']:
+                # The name matched nothing the server offers. Distinct from
+                # "nothing changed", and a different bug to chase.
+                return {'success': False,
+                        'message': f'RomM has no platform matching {platform}'}
+            if reconcile['incomplete']:
+                # Nothing was swept — see _reconcile_platforms. Reported as a
+                # failure because the library is unchanged and the user asked
+                # for it to be current.
+                return {'success': False,
+                        'message': 'The platform fetch was incomplete — nothing changed'}
+
+            # The library just changed size, so the cached server total is stale
+            # — and the cold-start skip check trusts it. Left alone, a resync
+            # that removed games would leave a total matching the pre-resync
+            # library, and the next start would skip the fetch on the strength
+            # of it. None if the probe fails, which forces a real fetch instead.
+            self._library_server_total = self._romm_client.count_roms()
+
+            self._persist_snapshot()
+            changed = self._describe_changes(reconcile)
+            return {
+                'success': True,
+                'message': changed or 'No changes',
+                'reconciled': reconcile,
+                'status': await self.get_service_status(),
+            }
+        except Exception as e:
+            self._online = False
+            logging.error(f"resync_platform error: {e}", exc_info=True)
+            return {'success': False, 'message': f'Resync failed: {str(e)[:100]}'}
+        finally:
+            self._library_busy = False
+            self._library_progress = None
 
     async def toggle_collection_sync(self, collection_name: str, enabled: bool):
         """Enable or disable auto-sync for a specific collection."""
