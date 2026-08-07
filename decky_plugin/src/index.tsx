@@ -17,7 +17,7 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, toaster, routerHook, openFilePicker, FileSelectionType } from "@decky/api";
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, forwardRef, memo, cloneElement, type Ref, type ChangeEvent } from "react";
-import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip, FaStopwatch } from "react-icons/fa";
+import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip, FaStopwatch, FaUnlink } from "react-icons/fa";
 import { BsGearFill } from "react-icons/bs";
 import { MdVerified } from "react-icons/md";
 
@@ -381,7 +381,7 @@ interface LibGroup {
   slug?: string | null; fs_slug?: string | null;
   synced?: boolean; virtual?: boolean;
 }
-interface LibGame { rom_id: number; name: string; platform: string | null; is_downloaded: boolean; has_cover: boolean; screenshot?: string | null; platform_slug?: string | null; is_multi_disc?: boolean; disc_count?: number; sibling_roms?: { rom_id: number; name: string }[]; region_count?: number; }
+interface LibGame { rom_id: number; name: string; platform: string | null; is_downloaded: boolean; has_cover: boolean; screenshot?: string | null; platform_slug?: string | null; is_multi_disc?: boolean; disc_count?: number; sibling_roms?: { rom_id: number; name: string }[]; region_count?: number; is_orphan?: boolean; }
 
 function fmtBytes(n: number | null | undefined): string {
   if (!n || isNaN(n as any)) return '';
@@ -1259,7 +1259,11 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
   // succeed — so block + visually dim download on not-yet-downloaded tiles
   // rather than letting the user trigger a guaranteed failure.
   const offline = useOffline();
-  const downloadBlocked = offline && !dl;
+  // An orphan blocks the same way: the server has no row to serve. This only
+  // becomes reachable after its file is deleted (dl flips false while the entry
+  // survives until the next walk), and without it the tile would offer a
+  // download that is certain to 404.
+  const downloadBlocked = (offline || !!game.is_orphan) && !dl;
   const [confirmDelete, setConfirmDelete] = useState(false);
   const confirmTimer = useRef<any>(null);
   const activate = () => { onActiveCover(uriRef.current); };
@@ -1462,6 +1466,14 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
   // press arms it (button turns into a check), the second within 3s commits.
   const requestDelete = () => {
     if (busy) return;
+    // An orphan's local copy is the only one left, and a two-press gesture on a
+    // cover tile is too easy to fire by accident for something unrecoverable.
+    // Send it to the details page, which has room to say why.
+    if (game.is_orphan) {
+      toaster.toast({ title: 'No longer on RomM', body: 'Open the game to delete your only copy.' });
+      onOpen(game);
+      return;
+    }
     if (confirmDelete) { doDelete(); return; }
     setConfirmDelete(true);
     if (confirmTimer.current) clearTimeout(confirmTimer.current);
@@ -1574,7 +1586,7 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
         {/* Downloaded status dot — top-left corner, opposite the platform
             icon so the two affordances don't collide. Hidden for multi-region
             games (the region badge replaces it). */}
-        {dl && !isMultiRegion && (
+        {dl && !isMultiRegion && !game.is_orphan && (
           <div style={{
             position: 'absolute', top: '7px', left: '7px', zIndex: 2,
             width: '10px', height: '10px', borderRadius: '50%',
@@ -1593,6 +1605,37 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
           }}>
             <FaGlobe size={9} />{game.region_count}
+          </div>
+        )}
+
+        {/* Orphan badge — this game is on disk but no longer exists on RomM, so
+            the copy in front of the user is the only one left. Warning-toned
+            rather than danger: nothing is broken, the game just stands alone now.
+
+            Top-left, and it REPLACES the downloaded dot rather than sitting over
+            it — same corner, same coordinates, and an orphan is downloaded by
+            construction, so stacking them was a guaranteed overlap. The dot is
+            absorbed into the pill instead (still conditional on dl, which can
+            turn false if the user deletes the file before the next walk drops
+            the entry), so one element carries both facts.
+
+            Cannot co-occur with the region badge: a removed game has no server
+            rows left to have regions with. */}
+        {game.is_orphan && (
+          <div style={{
+            position: 'absolute', left: '7px', top: '7px', zIndex: 2,
+            display: 'inline-flex', alignItems: 'center', gap: '5px',
+            padding: '2px 6px', borderRadius: V2.radiusPill, fontSize: '10px', fontWeight: 600,
+            background: 'rgba(0,0,0,0.78)', border: `1px solid ${V2.warning}`, color: V2.warning,
+            opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
+          }}>
+            {dl && (
+              <span style={{
+                width: '7px', height: '7px', borderRadius: '50%',
+                background: V2.success, flexShrink: 0,
+              }} />
+            )}
+            <FaUnlink size={9} />
           </div>
         )}
 
@@ -2954,8 +2997,15 @@ function UserMenuModal({ username, role, avatar, closeModal }:
     try {
       const res = await refreshFromRomm(false); // incremental
       if (res?.success) {
-        toaster.toast({ title: 'RomM library refreshed', body: res.message || 'Up to date.' });
+        toaster.toast({ title: 'Library refreshed', body: _refreshSummary(res) });
+        // A manual refresh IS the update the stale banner was offering, so it
+        // dismisses it — otherwise the banner survives the very thing that
+        // resolved it and reads as a failure.
+        _clearStale();
         _broadcastLibRefresh();
+      } else if (res?.busy) {
+        // Not a failure — a fetch is already doing exactly what was asked.
+        toaster.toast({ title: 'Already refreshing', body: 'A library fetch is in progress.' });
       } else {
         toaster.toast({ title: 'Refresh failed', body: res?.message ?? 'Unknown error' });
       }
@@ -6361,6 +6411,112 @@ function ScrubOverlay({ letter }: { letter: string | null }) {
   );
 }
 
+// ── Staleness detection ─────────────────────────────────────────────────────
+// Games appear and disappear on RomM while the app is open, and until now
+// nothing asked unless the user pressed a button — the library was fetched on
+// connect and never again.
+//
+// Detect automatically, apply on consent. This started as a silent automatic
+// reconcile and that was the wrong shape: applying costs a walk of every
+// platform that moved (seconds to minutes), it renders a sticky fetch toast and
+// a loading banner, and it reorders the grid — all of it landing on someone who
+// is mid-browse and asked for none of it. Detection, by contrast, is one
+// /api/platforms call: 0.04s on a 20k-ROM instance, flat in library size,
+// touching nothing. So the cheap half runs unasked and the expensive half waits
+// for a press.
+//
+// Fires on the library tab becoming visible, at most once per interval —
+// event-driven rather than a timer, because a poll running while the user is in
+// a game can change nothing they are looking at, whereas arriving at the library
+// is exactly when a stale grid is about to be seen. argosy-launcher checks at
+// app start on a 7-day bound; it can only afford that because every sync it runs
+// is a full walk.
+//
+// No setting. There is no cost to trade away, and an interval nobody can predict
+// the value of is not a choice, it is a guess with a slider.
+const _STALE_CHECK_MS = 15 * 60 * 1000;
+let _lastStaleCheck = 0;
+
+type StaleInfo = { added: number; removed: number; platforms: string[] };
+let _staleInfo: StaleInfo | null = null;
+const _staleSubs = new Set<(s: StaleInfo | null) => void>();
+function _setStale(s: StaleInfo | null) {
+  _staleInfo = s;
+  _staleSubs.forEach((fn) => { try { fn(s); } catch { /* ignore */ } });
+}
+// Any path that brings the library back in step retires the banner and restarts
+// the interval — a manual refresh resolves it just as the banner's own button
+// does, and one left on screen after the fact reads as a failure.
+function _clearStale() { _setStale(null); _lastStaleCheck = Date.now(); }
+function useStaleLibrary(): StaleInfo | null {
+  const [s, setS] = useState<StaleInfo | null>(_staleInfo);
+  useEffect(() => {
+    const fn = (v: StaleInfo | null) => setS(v);
+    _staleSubs.add(fn);
+    setS(_staleInfo);
+    return () => { _staleSubs.delete(fn); };
+  }, []);
+  return s;
+}
+
+async function _maybeCheckStale(svcStatus: any) {
+  if (!svcStatus || svcStatus.connection === 'offline_cached'
+      || svcStatus.connection === 'disconnected') return;
+  // Nothing to compare against until the first fetch has landed, and a fetch in
+  // flight is about to rewrite the baselines — the backend refuses either way,
+  // but asking it to is a pointless round trip.
+  if (svcStatus.library_ready === false || svcStatus.library_progress) return;
+  // Already announced and not yet acted on. Re-asking would only redraw the
+  // same banner, and the numbers it shows came from the same source.
+  if (_staleInfo) return;
+  const now = Date.now();
+  if (now - _lastStaleCheck < _STALE_CHECK_MS) return;
+  // Stamped before the await, not after: two visibility flips in quick
+  // succession would otherwise both pass the check.
+  _lastStaleCheck = now;
+  try {
+    const res = await checkLibraryStale();
+    if (res?.stale) {
+      _setStale({ added: res.added || 0, removed: res.removed || 0,
+        platforms: res.platforms || [] });
+    }
+  } catch {
+    // Offline, server down, mid-reconnect — all reasons to try again later, and
+    // none worth interrupting someone who never asked for this.
+  }
+}
+
+// Apply what the check found. This is the expensive half, and the only path
+// that reaches it is a person pressing Update.
+async function _applyStaleUpdate(): Promise<boolean> {
+  try {
+    const res = await refreshFromRomm(false);
+    if (res?.busy) {
+      toaster.toast({ title: 'Already refreshing', body: 'A library fetch is in progress.' });
+      return false;
+    }
+    if (!res?.success) {
+      toaster.toast({ title: 'Update failed', body: res?.message ?? 'Unknown error' });
+      return false;
+    }
+    // Clear only on success. A failed update leaves the library genuinely
+    // stale, and the banner is the accurate thing to keep showing.
+    _clearStale();
+    // Both caches: the per-group game lists AND the group list itself, whose
+    // per-platform counts just moved. Without the second, the grid keeps
+    // showing the pre-update numbers until the tab is left and re-entered.
+    _libGamesCache.clear();
+    delete _groupsCache['platform'];
+    delete _groupsCache['collection'];
+    _broadcastLibRefresh();
+    toaster.toast({ title: 'Library updated', body: res.message || 'Synced with RomM.' });
+    return true;
+  } catch (e) {
+    toaster.toast({ title: 'Update failed', body: String(e) });
+    return false;
+  }
+}
+
 function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
   { mode: 'platform' | 'collection'; visible: boolean; onOpenGroup: (mode: string, g: LibGroup, gs: LibGroup[]) => void; svcStatus: any }) {
   const c0 = _groupsCache[mode];
@@ -8549,7 +8705,7 @@ function regionDisplayLabel(fname: string): string {
 }
 
 // Launch a game. Under gamescope (Steam Deck Gaming Mode) this routes through
-// the RomM tile's session-host so the Steam overlay works: prepare_steam_launch
+// the Ludo tile's session-host so the Steam overlay works: prepare_steam_launch
 // writes the emulator argv, then we RunGame the tile and the host execs it as a
 // Steam-tracked child. Anywhere that fails (not gamescope, no tile, RunGame
 // unavailable) it falls back to the direct daemon launch.
@@ -8871,6 +9027,9 @@ function GameDetailPage() {
   // Per-game, not global: a Switch ROM is playable on a machine with only Eden,
   // and unplayable on one with only RetroArch — no core can run it either way.
   const gameStandalone = standaloneFor(emu, game?.platform, game?.platform_slug);
+  // Removed from RomM but kept because it is on disk. The server has nothing to
+  // serve for it, so anything that would re-fetch it is a guaranteed failure.
+  const orphan = !!game?.is_orphan;
   const noEmulator = cannotLaunch(emu, game?.platform, game?.platform_slug);
   const [ctaFocused, setCtaFocused] = useState(false);
   // Land gamepad focus on the primary CTA (Play / Download) when the page
@@ -9157,6 +9316,22 @@ function GameDetailPage() {
             </div>
           </div>
 
+          {/* Removed-from-RomM notice. Stated once, up front, rather than only
+              at the delete step: it changes what the whole page means — no
+              re-download, no save sync target, and this copy is the last one. */}
+          {orphan && (
+            <div style={{
+              display: 'flex', alignItems: 'flex-start', gap: '8px', margin: '0 0 14px',
+              padding: '8px 12px', borderRadius: V2.radiusMd,
+              background: 'rgba(251,191,36,0.10)', border: `1px solid rgba(251,191,36,0.30)`,
+              color: V2.warning, fontSize: '12px', lineHeight: 1.4, maxWidth: '560px',
+            }}>
+              <FaUnlink size={12} style={{ marginTop: '2px', flexShrink: 0 }} />
+              <span>This game was removed from RomM. Your downloaded copy still plays, but
+                it can't be downloaded again — keep a backup if you want to be sure of it.</span>
+            </div>
+          )}
+
           {/* Actions — RomM GameActions ribbon: an emphasized white pill for the
               primary CTA (Download when absent, Play when present) + circular
               surface icon buttons for the secondary actions (Delete). */}
@@ -9196,12 +9371,20 @@ function GameDetailPage() {
             ) : (
               <>
                 <GameActionButton variant="danger" disabled={!!busy} onClick={doDelete}
-                  label={busy === 'delete' ? 'Deleting…' : 'Confirm delete'}
+                  label={busy === 'delete' ? 'Deleting…' : orphan ? 'Delete for good' : 'Confirm delete'}
                   icon={busy === 'delete'
                     ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite' }} />
                     : <FaTrash size={15} />} />
                 <GameActionButton variant="surface" onClick={() => setConfirmDelete(false)}
                   icon={<FaTimes size={16} />} />
+                {/* Deleting a normal game is undoable — it is still on RomM. For
+                    an orphan this local copy is the last one, so the confirm
+                    step has to say that rather than reading as routine. */}
+                {orphan && (
+                  <span style={{ fontSize: '12px', color: V2.warning, maxWidth: '260px', lineHeight: 1.35 }}>
+                    This game is no longer on RomM — deleting it here cannot be undone.
+                  </span>
+                )}
               </>
             )}
             {/* Live transfer readout — speed · ETA, shown beside the button only
@@ -11507,6 +11690,16 @@ function SettingsPage() {
         opacity: shapeReady ? 1 : 0,
         transition: 'opacity 140ms ease-out',
       }}>
+      <V2SettingsSection title="Library">
+        <V2SettingsRow
+          icon={<FaSync size={16} />}
+          title="Update your library automatically"
+          subtitle="When RomM has changed, Ludo re-reads only the platforms that changed and tells you what it found. Turn this off to be asked first — you'll still see a notice when your library is out of date, with a button to update it."
+          onClick={() => handleAutoUpdateLibToggle(!autoUpdateLib)}
+          right={<V2Switch checked={autoUpdateLib} />}
+        />
+      </V2SettingsSection>
+
       <V2SettingsSection title="Gameplay">
         <V2SettingsRow
           icon={<FaPlay size={16} />}
@@ -11535,7 +11728,7 @@ function SettingsPage() {
             icon={<FaExternalLinkAlt size={16} />}
             title="Add to Steam library"
             subtitle={tileNote
-              || 'Creates a "RomM" tile that opens this app. Steam must be restarted for it to appear.'}
+              || 'Creates a "Ludo" tile that opens this app. Steam must be restarted for it to appear.'}
             onClick={() => handleSteamTileToggle(!tileState.installed)}
             right={<V2Switch checked={tileState.installed} />}
           />
@@ -11897,6 +12090,17 @@ function TitleView() {
       const result = await refreshFromRomm(false); // false = incremental refresh
       if (result?.success) {
         console.log('[REFRESH] Successfully refreshed from RomM:', result.message);
+        // This button had no completion feedback at all — the icon stopped
+        // spinning and that was it, so a refresh that added games looked the
+        // same as one that did nothing. Only speak up when something changed;
+        // the quiet case is common and a toast every time is noise.
+        if (result.reconciled?.added || result.reconciled?.removed) {
+          toaster.toast({ title: 'Library refreshed', body: _refreshSummary(result) });
+        }
+        _clearStale();
+        _broadcastLibRefresh();
+      } else if (result?.busy) {
+        console.log('[REFRESH] Skipped — a library fetch is already running');
       } else {
         console.warn('[REFRESH] Refresh returned non-success:', result?.message);
       }
@@ -12036,7 +12240,7 @@ function SetupWizard() {
   // error lands on the field that caused it.
   const [paired, setPaired] = useState(false);
   const [pairing, setPairing] = useState(false);
-  // Desktop-only opt-in on the final step: write a "RomM" tile into Steam's
+  // Desktop-only opt-in on the final step: write a "Ludo" tile into Steam's
   // shortcuts.vdf. Offered here rather than as its own step because it's
   // optional system integration, not something sync needs — and it mirrors what
   // doFinish already does unconditionally on the Deck (addRommShortcut, where
@@ -12261,7 +12465,7 @@ function SetupWizard() {
   const doFinish = async () => {
     setBusy(true);
     try {
-      // The "RomM" Steam library tile is mandatory — ensure it exists before
+      // The "Ludo" Steam library tile is mandatory — ensure it exists before
       // navigating away (create if missing; reconcile repairs an existing one).
       try {
         // force=true: this is user-initiated (store is long since loaded),
@@ -12603,7 +12807,7 @@ function SetupWizard() {
                   <V2SettingsRow
                     icon={<FaExternalLinkAlt size={16} />}
                     title="Add to Steam library"
-                    subtitle='Creates a "RomM" tile that opens this app. Steam must be restarted for it to appear.'
+                    subtitle='Creates a "Ludo" tile that opens this app. Steam must be restarted for it to appear.'
                     onClick={() => setWantTile((v) => !v)}
                     right={<V2Switch checked={wantTile} />}
                   />
@@ -12623,14 +12827,17 @@ function SetupWizard() {
   );
 }
 
-// ─── Steam library "RomM" shortcut (mandatory) ───────────────────────────────
-// A non-Steam shortcut named "RomM" is auto-created at plugin load (once RomM is
+// ─── Steam library "Ludo" shortcut (mandatory) ───────────────────────────────
+// A non-Steam shortcut named "Ludo" is auto-created at plugin load (once RomM is
 // configured) and is required: launching it from the library opens the Game
 // Browser, and picking a game RunGame's this same tile so the emulator runs as a
 // Steam-tracked child (working overlay). All SteamClient calls are undocumented +
 // version-fragile, so every call is feature-detected and wrapped — failures
 // degrade to a toast, never a crash.
-const ROMM_SHORTCUT_NAME = "RomM";
+const ROMM_SHORTCUT_NAME = "Ludo";
+// Tiles created before the rename still carry "RomM" on disk. They're matched
+// (and renamed on the next reconcile) rather than left behind as a duplicate.
+const ROMM_SHORTCUT_LEGACY_NAMES = ["RomM"];
 // Fallback exe when the session-host script can't be resolved. With /bin/true the
 // tile still opens the browser (via the launch intercept) but the Steam-overlay
 // session-host launch path is unavailable, so Play falls back to a direct launch.
@@ -12700,7 +12907,7 @@ function _shortcutAppIds(): number[] {
 // True once Steam's shortcut store is actually populated. Early in Steam
 // startup deckDesktopApps.apps can be missing or still empty; creating a
 // shortcut then duplicates a tile that already exists on disk but isn't
-// visible yet — the root cause of multiple "RomM" entries piling up.
+// visible yet — the root cause of multiple "Ludo" entries piling up.
 function _shortcutStoreReady(): boolean {
   try {
     const m = (window as any).collectionStore?.deckDesktopApps?.apps;
@@ -12712,10 +12919,12 @@ function _appName(appid: number): string {
   try { return String((window as any).appStore?.GetAppOverviewByAppID?.(appid)?.display_name ?? ''); } catch { return ''; }
 }
 
-// All our tiles carry the name "RomM"; also accept the exe-derived fallback
-// names Steam uses when a name didn't persist. Real games carry their own names.
+// All our tiles carry the name "Ludo" (or "RomM", pre-rename); also accept the
+// exe-derived fallback names Steam uses when a name didn't persist. Real games
+// carry their own names.
 function _isRommName(nm: string): boolean {
-  return nm === ROMM_SHORTCUT_NAME || nm === 'true' || nm === '/bin/true'
+  return nm === ROMM_SHORTCUT_NAME || ROMM_SHORTCUT_LEGACY_NAMES.includes(nm)
+    || nm === 'true' || nm === '/bin/true'
     || nm === 'romm-session-host';
 }
 
@@ -12723,7 +12932,7 @@ function _rommAppIds(): number[] {
   return _shortcutAppIds().filter((aid) => _isRommName(_appName(aid)));
 }
 
-// Stamp "played just now" onto the RomM tile's overview so it surfaces in the
+// Stamp "played just now" onto the Ludo tile's overview so it surfaces in the
 // home row's Recent Games. Steam only records last-played for sessions it ran
 // to completion — bare tile clicks are terminated by the intercept before that
 // happens, and opening the browser from the Decky panel never touches the tile
@@ -12802,7 +13011,7 @@ async function findRommShortcut(): Promise<number | null> {
   return null;
 }
 
-// Remove duplicate RomM tiles left behind by earlier sessions, keeping one.
+// Remove duplicate Ludo tiles left behind by earlier sessions, keeping one.
 // Returns the surviving appId (or null if none).
 async function cleanupRommShortcuts(): Promise<number | null> {
   try {
@@ -12826,7 +13035,7 @@ async function cleanupRommShortcuts(): Promise<number | null> {
   } catch (e) { console.error('[RomM] cleanupRommShortcuts', e); return null; }
 }
 
-// Bring the RomM tile into a known-good state: collapse duplicates to one,
+// Bring the Ludo tile into a known-good state: collapse duplicates to one,
 // repair the survivor's name + sentinel, repaint art, and bind the launch
 // intercept. Safe to call repeatedly. Returns the surviving appId (or null).
 // Run this when the shortcut store is ready (e.g. on Settings open), not only
@@ -12905,11 +13114,11 @@ async function addRommShortcut(force = false): Promise<number | null> {
   if ((window as any).__rommDesktop) return null;
   try {
     // Never create while the shortcut store is empty/unloaded: the existing
-    // RomM tile may simply not be visible yet, and AddShortcut here is exactly
-    // how duplicate "RomM" entries were piling up on each Steam restart.
+    // Ludo tile may simply not be visible yet, and AddShortcut here is exactly
+    // how duplicate "Ludo" entries were piling up on each Steam restart.
     if (!force && !_shortcutStoreReady()) return null;
     const apps = _sc()?.Apps;
-    if (!apps?.AddShortcut) { toaster.toast({ title: 'RomM', body: 'Steam shortcuts API unavailable on this build.' }); return null; }
+    if (!apps?.AddShortcut) { toaster.toast({ title: 'Ludo', body: 'Steam shortcuts API unavailable on this build.' }); return null; }
     const exe = await rommShortcutExe();
     let appId = await findRommShortcut();
     if (appId == null) {
@@ -12937,13 +13146,13 @@ async function addRommShortcut(force = false): Promise<number | null> {
     return appId;
   } catch (e) {
     console.error('[RomM] addRommShortcut', e);
-    toaster.toast({ title: 'RomM', body: 'Could not add the library tile.' });
+    toaster.toast({ title: 'Ludo', body: 'Could not add the library tile.' });
     return null;
   }
 }
 
 
-// Intercept the RomM tile's launch → cancel the no-op run and open the browser.
+// Intercept the Ludo tile's launch → cancel the no-op run and open the browser.
 function registerRommLaunchIntercept() {
   try {
     if (_rommActionReg) return;
@@ -13062,7 +13271,7 @@ export default definePlugin(() => {
   // Register the launch intercept IMMEDIATELY — independent of tile
   // reconciliation.  The intercept checks the appid/name at fire time, so it
   // is safe to bind before the shortcut store is ready.  This fixes the bug
-  // where clicking the RomM tile in Big Picture did nothing until the user
+  // where clicking the Ludo tile in Big Picture did nothing until the user
   // opened the Decky panel (which triggered reconcileRommTile → register…).
   registerRommLaunchIntercept();
   registerRommSessionEndWatch();
@@ -13143,7 +13352,7 @@ export default definePlugin(() => {
     } catch (e) { console.error('[RomM] startup update check', e); }
   })();
 
-  // Re-bind the launch intercept if the RomM tile was added in a prior session,
+  // Re-bind the launch intercept if the Ludo tile was added in a prior session,
   // and auto-open the setup wizard once when no connection is configured.
   (async () => {
     let configured = false;
