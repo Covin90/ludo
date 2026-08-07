@@ -46,6 +46,26 @@ const notifyNetworkState = callable<[boolean], any>("notify_network_state");
 // uploads) and absent on collection-wide ones.
 const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean }> }>("drain_notifications");
 const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
+// Re-reads one platform and reconciles that slice. Takes a slug (what the
+// platform groups are keyed by) or a numeric id.
+const resyncPlatform = callable<[string], any>("resync_platform");
+const checkLibraryStale = callable<[], any>("check_library_stale");
+const getLibraryAutoUpdate = callable<[], any>("get_library_auto_update");
+const setLibraryAutoUpdate = callable<[boolean], any>("set_library_auto_update");
+
+// What a refresh actually did, for the completion toast. The backend already
+// phrases the counts ("12 added, 1 removed"); this only supplies the wording for
+// the quiet case, which is by far the common one.
+//
+// "Up to date." used to be shown unconditionally, which is the message that
+// makes a refresh that silently found nothing indistinguishable from one that
+// worked — the same reason argosy-launcher reports added/updated/removed rather
+// than a bare success.
+function _refreshSummary(res: any): string {
+  const r = res?.reconciled;
+  if (r && (r.added || r.removed || r.updated)) return res.message || 'Library updated.';
+  return 'No changes — your library matches RomM.';
+}
 // `rom_id` is present only on entries that name a single rom (downloads), and
 // only on entries written since it was added — older persisted logs lack it.
 const getRecentActivity = callable<[number], { events: Array<{ kind: string, title: string, detail: string, timestamp: number, rom_id?: number }> }>("get_recent_activity");
@@ -10754,7 +10774,7 @@ function SettingsPage() {
   const [rdDetected, setRdDetected] = useState<boolean>(false);
   const [rdButton, setRdButton] = useState<boolean>(false);
 
-  // Desktop-only: the RomM tile in Steam's library. Unlike the Deck plugin —
+  // Desktop-only: the Ludo tile in Steam's library. Unlike the Deck plugin —
   // which owns its tile through SteamClient's live API — the desktop shell has
   // no SteamClient and the backend edits shortcuts.vdf, so the tile only shows
   // up after Steam restarts. `tileNote` carries that hint to the row subtitle.
@@ -10785,7 +10805,7 @@ function SettingsPage() {
   const [shapeReady, setShapeReady] = useState<boolean>(false);
 
   useEffect(() => {
-    // The "RomM" tile is mandatory and auto-created at plugin load. Reconcile
+    // The "Ludo" tile is mandatory and auto-created at plugin load. Reconcile
     // here too (the shortcut store is reliably ready by the time Settings opens)
     // to sweep duplicates and repair the survivor's exe/name/art after updates.
     // Deliberately not awaited: nothing on this page renders from it, and
@@ -10827,6 +10847,26 @@ function SettingsPage() {
       .then((v) => { _setResumeStatesPref(!!v); setResumeStates(!!v); })
       .catch(() => { /* leave the last known value */ });
   }, []);
+  const [autoUpdateLib, setAutoUpdateLib] = useState<boolean>(true);
+  useEffect(() => {
+    getLibraryAutoUpdate()
+      .then((r) => setAutoUpdateLib(r?.enabled !== false))
+      .catch(() => { /* keep the default */ });
+  }, []);
+  const handleAutoUpdateLibToggle = async (enabled: boolean) => {
+    setAutoUpdateLib(enabled);
+    try {
+      const r = await setLibraryAutoUpdate(enabled);
+      if (r && r.success === false) throw new Error(r.message || 'failed');
+      // Turning it back on doesn't retro-apply anything by itself, but a
+      // pending "your library changed" offer is now redundant with the next
+      // connect — leave it standing rather than guess; the banner clears
+      // itself on any successful refresh.
+    } catch {
+      setAutoUpdateLib(!enabled);
+    }
+  };
+
   const handleResumeStatesToggle = async (enabled: boolean) => {
     setResumeStates(enabled);
     _setResumeStatesPref(enabled);
@@ -10863,7 +10903,7 @@ function SettingsPage() {
       const r = await setSteamTile(enabled, spec?.exe || '', spec?.startDir || '', spec?.args || '');
       if (r?.success) {
         setTileState((s) => ({ ...s, installed: enabled }));
-        // "Restart Steam to see the RomM tile" is exactly what the row's own
+        // "Restart Steam to see the Ludo tile" is exactly what the row's own
         // subtitle already says, so echoing it back reads as a warning about
         // something new. Keep the note for the case the subtitle does NOT
         // cover: Steam wasn't running, so the tile is simply there.
