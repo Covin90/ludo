@@ -2371,12 +2371,79 @@ function PlatformTile({ group, onOpen, focusRef, focusable }: { group: LibGroup;
     if (typeof focusRef === 'function') focusRef(el);
     else if (focusRef) (focusRef as any).current = el;
   };
+
+  // Re-read this one platform from RomM. The automatic check only reacts to a
+  // platform's server count changing, which cannot see an add and a delete that
+  // net out — and cannot be hurried by someone who already knows they just
+  // added games here. This walks it unconditionally, in seconds, where a
+  // library-wide refresh is minutes.
+  const [resyncing, setResyncing] = useState(false);
+  const doResync = async () => {
+    if (resyncing) return;
+    setResyncing(true);
+    try {
+      // slug when the group carries one (RomM's own identifier), else the
+      // display key — resync_platform resolves either against /api/platforms.
+      const res = await resyncPlatform(String(group.slug || group.key));
+      if (res?.success) {
+        toaster.toast({ title: `${group.label} synced`, body: res.message || 'No changes' });
+        libCacheDelete(`platform:${group.key}`);
+        _broadcastLibRefresh();
+      } else if (res?.busy) {
+        toaster.toast({ title: 'Already refreshing', body: 'A library fetch is in progress.' });
+      } else {
+        toaster.toast({ title: 'Sync failed', body: res?.message ?? 'Unknown error' });
+      }
+    } catch (e) {
+      toaster.toast({ title: 'Sync failed', body: String(e) });
+    } finally {
+      setResyncing(false);
+    }
+  };
+  const openMenu = () => showModal(
+    <PlatformActionsModal
+      label={group.label} slug={group.slug || group.fs_slug || undefined}
+      count={group.count} downloaded={group.downloaded ?? undefined}
+      resyncing={resyncing} onSync={doResync} onOpen={() => onOpen(group)} />,
+  );
+
+  // Y opens this menu while the tile is focused — published to the page root,
+  // which owns the button handler. Cleared on blur only if we are still the
+  // current holder: focus moves as leave-then-enter on some transitions, and a
+  // blind clear on blur would drop the tile that just took over.
+  const openRef = useRef(openMenu);
+  openRef.current = openMenu;
+  const claimFocus = () => _setFocusedPlatform({ label: group.label, open: () => openRef.current() });
+  const releaseFocus = () => { if (_focusedPlatform?.label === group.label) _setFocusedPlatform(null); };
+  useEffect(() => releaseFocus, []);
+
+  // Hold A as well, exactly as CollectionTile does it — the grid already
+  // teaches that idiom, and it comes with the ⋯ chip that advertises itself.
+  const holdTimer = useRef<any>(null);
+  const held = useRef(false);
+  const onBtnDown = (e: any) => {
+    if (e?.detail?.button !== GamepadButton.OK || e?.detail?.is_repeat) return;
+    held.current = false;
+    clearTimeout(holdTimer.current);
+    holdTimer.current = setTimeout(() => { held.current = true; openMenu(); }, 500);
+  };
+  const onActivate = () => {
+    clearTimeout(holdTimer.current);
+    if (held.current) { held.current = false; return; } // hold opened the menu
+    onOpen(group);
+  };
+  useEffect(() => () => clearTimeout(holdTimer.current), []);
+
   return (
     <Focusable noFocusRing className="romm-ptile-wrap"
       {...({ focusable: focusable !== false } as any)}
       ref={setRefs}
-      onActivate={() => onOpen(group)} onClick={() => onOpen(group)}
-      onFocus={() => { setFocused(true); _tileFocusScrub(selfRef.current, group.label); }} onBlur={() => setFocused(false)}
+      onActivate={onActivate} onClick={() => onOpen(group)}
+      onButtonDown={onBtnDown}
+      onOKActionDescription="Open"
+      onContextMenu={(e: any) => { e.preventDefault(); e.stopPropagation(); openMenu(); }}
+      onFocus={() => { setFocused(true); claimFocus(); _tileFocusScrub(selfRef.current, group.label); }}
+      onBlur={() => { setFocused(false); releaseFocus(); }}
       onMouseEnter={() => setFocused(true)} onMouseLeave={() => setFocused(false)}
       style={{ cursor: 'pointer' }}
     >
@@ -2394,7 +2461,25 @@ function PlatformTile({ group, onOpen, focusRef, focusable }: { group: LibGroup;
         transform: 'scale(1)',
         transition: 'background 0.15s, border-color 0.15s, transform 0.15s, box-shadow 0.15s',
         ...V2Focus.tile(focused),
+        position: 'relative',
       }}>
+        {/* Same ⋯ HOLD chip CollectionTile uses, so the actions affordance
+            reads identically on both grids — and is clickable for mouse users
+            on the desktop shell. */}
+        {focused && (
+          <div
+            onClick={(e: any) => { e.stopPropagation(); openMenu(); }}
+            style={{
+              position: 'absolute', bottom: '6px', right: '6px', zIndex: 3,
+              display: 'flex', alignItems: 'center', gap: '4px',
+              padding: '2px 6px', borderRadius: V2.radiusChip,
+              background: 'rgba(0,0,0,0.62)', color: V2.fg,
+              fontSize: '9px', fontWeight: 700, letterSpacing: '0.02em',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.5)', pointerEvents: 'auto',
+            }}>
+            <FaEllipsisH size={9} /><span>{resyncing ? 'SYNCING' : 'HOLD'}</span>
+          </div>
+        )}
         <div className="romm-ptile-ic" style={{
           width: '72px', height: '72px', display: 'grid', placeItems: 'center',
           color: focused ? V2.brandHover : V2.fg2, opacity: focused ? 1 : 0.9,
@@ -3362,6 +3447,113 @@ function CollectionActionsModal({ title, isCollection, isVirtual, isSynced, miss
       </Focusable>
     </ModalRoot>
   );
+}
+
+// Per-platform actions from the platforms grid, in the account-menu chrome.
+// This was a Steam `showContextMenu` and looked borrowed — Steam's menu carries
+// its own typography, radius and highlight, so it read as a different product
+// dropped into the middle of ours. Every other menu in the library (account,
+// collection, folder) is this glass panel, so this one is too.
+function PlatformActionsModal({ label, slug, count, downloaded, resyncing, onSync, onOpen, closeModal }:
+  {
+    label: string; slug?: string; count?: number; downloaded?: number;
+    resyncing: boolean; onSync: () => void; onOpen: () => void; closeModal?: () => void;
+  }) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
+  const sub = [
+    count != null ? `${count.toLocaleString()} ${count === 1 ? 'game' : 'games'}` : '',
+    downloaded ? `${downloaded.toLocaleString()} downloaded` : '',
+  ].filter(Boolean).join('  ·  ');
+  return (
+    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}
+      className="romm-modal-collapse" modalClassName="romm-modal-collapse">
+      <Focusable noFocusRing className="romm-ui"
+        onCancelButton={() => closeModal?.()}
+        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
+        style={{
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(7,7,15,0.45)',
+          WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
+        }}>
+        <style>{`
+          ${V2_FOCUS_STYLE}
+          .romm-modal-collapse, .romm-modal-collapse > div {
+            background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important;
+          }
+          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }
+        `}</style>
+        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
+        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
+          position: 'relative', width: '270px', maxWidth: '90vw', boxSizing: 'border-box',
+          fontFamily: V2.font, color: V2.fg, padding: '8px',
+          display: 'flex', flexDirection: 'column',
+          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
+          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
+          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
+          boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
+          maxHeight: '82vh', overflowY: 'auto',
+          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
+        }}>
+          {/* Identity header — the platform's own icon and name, in the slot
+              UserMenuModal gives the avatar. The menu is opened from a grid of
+              near-identical cards, so it has to say which one it belongs to. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '6px 8px 12px', minWidth: 0 }}>
+            <div style={{ width: '30px', height: '30px', flexShrink: 0, display: 'grid', placeItems: 'center', color: V2.fg2 }}>
+              <PlatformIcon slug={slug} size={30} />
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <div style={{
+                fontSize: '13px', fontWeight: 700, color: V2.fg, lineHeight: 1.3,
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}>{label}</div>
+              {sub && <div style={{
+                fontSize: '10.5px', fontWeight: 600, color: V2.fgMuted,
+                marginTop: '2px', whiteSpace: 'nowrap',
+              }}>{sub}</div>}
+            </div>
+          </div>
+          <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
+          <UserMenuRow icon={<FaGamepad size={15} />} label="Open platform"
+            onSelect={() => { closeModal?.(); onOpen(); }} />
+          <UserMenuRow
+            icon={<FaSync size={15} style={resyncing ? { animation: 'spin 1s linear infinite' } : undefined} />}
+            label={resyncing ? 'Syncing…' : 'Sync this platform'} disabled={resyncing}
+            onSelect={() => { if (resyncing) return; closeModal?.(); onSync(); }} />
+          {/* BIOS is a property of the platform, so it belongs here for the same
+              reason CollectionActionsModal only offers it on platforms. */}
+          {slug && (
+            <UserMenuRow icon={<FaMicrochip size={15} />} label="BIOS files"
+              onSelect={() => { closeModal?.(); showModal(<BiosDetailModal slug={slug} platformName={label} />); }} />
+          )}
+        </Focusable>
+      </Focusable>
+    </ModalRoot>
+  );
+}
+
+// The focused platform tile's actions menu, published so the library page's Y
+// handler can reach it. Y opens the account menu everywhere EXCEPT a focused
+// platform tile, where the platform's own menu is the more useful thing and the
+// account menu is still one press away on ☰ Start. A module-level handle rather
+// than prop drilling: the handler lives on the page root, five components above
+// the tile, and only ever wants whichever tile is focused right now.
+let _focusedPlatform: { label: string; open: () => void } | null = null;
+const _focusedPlatformSubs = new Set<(p: typeof _focusedPlatform) => void>();
+function _setFocusedPlatform(p: typeof _focusedPlatform) {
+  _focusedPlatform = p;
+  _focusedPlatformSubs.forEach((fn) => { try { fn(p); } catch { /* ignore */ } });
+}
+function useFocusedPlatform() {
+  const [p, setP] = useState(_focusedPlatform);
+  useEffect(() => {
+    const fn = (v: typeof _focusedPlatform) => setP(v);
+    _focusedPlatformSubs.add(fn);
+    setP(_focusedPlatform);
+    return () => { _focusedPlatformSubs.delete(fn); };
+  }, []);
+  return p;
 }
 
 // True on viewports with top-bar room to spare (external monitor / desktop Big
