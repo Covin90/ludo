@@ -484,6 +484,17 @@ div[class*="v2pf-"] > div {
   flex: none;
   display: flex;
   align-items: center;
+  /* The slot sets no size of its own, so a logo that sizes itself in
+     percentages resolves against nothing and renders at the artwork's natural
+     size — which drags the toast to its max-width and makes it several times
+     taller than the text beside it. Callers should pass a sized node; this is
+     the backstop for when they don't. */
+  max-width: 96px;
+  max-height: 76px;
+}
+.shim-toast-logo > * {
+  max-width: 100%;
+  max-height: 100%;
 }
 .shim-toast-logo:empty {
   display: none;
