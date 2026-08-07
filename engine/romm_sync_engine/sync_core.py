@@ -5684,7 +5684,7 @@ class RetroArchInterface:
 
         We harvest the IDs from the live foreground Steam-tracked process (the
         `reaper`/shortcut that currently owns a SteamOverlayGameId) so the overlay
-        binds to whatever shortcut the user launched from (e.g. the RomM tile).
+        binds to whatever shortcut the user launched from (e.g. our tile).
         """
         overlay = {}
         preload_paths = []
@@ -15313,7 +15313,7 @@ class SteamShortcutManager:
             return False
 
 
-# ── Desktop "RomM" library tile ──────────────────────────────────────────────
+# ── Desktop "Ludo" library tile ──────────────────────────────────────────────
 #
 # The Decky plugin creates its Big Picture tile through SteamClient.Apps.
 # AddShortcut, a live API that only exists inside Steam's own UI process. The
@@ -15323,7 +15323,7 @@ class SteamShortcutManager:
 # the file when it exits, so a tile written while Steam is running is lost —
 # hence is_steam_running() and the restart hint.
 
-DESKTOP_TILE_NAME = 'RomM'
+DESKTOP_TILE_NAME = 'Ludo'
 DESKTOP_TILE_TAG = 'romm-sync-desktop'  # identifies the tile across exe changes
 
 # Bundled artwork -> Steam's grid/ filename suffix for a non-Steam shortcut.
@@ -15395,7 +15395,7 @@ def _tile_tags(shortcut):
 
 
 def _write_desktop_tile_artwork(config_dir, appid, assets_dir):
-    """Copy the bundled RomM artwork into Steam's grid/ dir for `appid`.
+    """Copy the bundled artwork into Steam's grid/ dir for `appid`.
 
     Steam names custom art by the shortcut's UNSIGNED appid. Non-fatal: a tile
     with no art still works, it just shows a generic capsule.
@@ -15421,6 +15421,18 @@ def _write_desktop_tile_artwork(config_dir, appid, assets_dir):
     return written
 
 
+def _delete_desktop_tile_artwork(config_dir, appid):
+    """Delete the tile artwork filed under `appid`. Non-fatal."""
+    unsigned = appid if appid >= 0 else appid + 0x100000000
+    for suffix in _DESKTOP_TILE_ART.values():
+        art = Path(config_dir) / 'grid' / f"{unsigned}{suffix}"
+        try:
+            if art.exists():
+                art.unlink()
+        except OSError as e:
+            logging.debug(f"Could not delete tile artwork {art.name}: {e}")
+
+
 def find_desktop_tile(shortcuts):
     """Return (index, shortcut) for our tile in a parsed shortcuts list, or (None, None)."""
     for i, sc in enumerate(shortcuts):
@@ -15430,7 +15442,7 @@ def find_desktop_tile(shortcuts):
 
 
 def get_desktop_tile_status():
-    """Report whether the RomM tile exists, for the desktop Settings toggle.
+    """Report whether the tile exists, for the desktop Settings toggle.
 
     Returns {'available', 'installed', 'appid', 'steam_running', 'reason'}.
     """
@@ -15450,7 +15462,7 @@ def get_desktop_tile_status():
 
 def add_desktop_tile(exe, start_dir='', launch_options='', icon='', assets_dir=None,
                      name=DESKTOP_TILE_NAME):
-    """Create (or update) the RomM tile in shortcuts.vdf.
+    """Create (or update) our tile in shortcuts.vdf.
 
     `exe` is the desktop shell's launch command as Steam stores it — quoted when
     it contains spaces, exactly like the entries Steam writes itself, because the
@@ -15504,6 +15516,12 @@ def add_desktop_tile(exe, start_dir='', launch_options='', icon='', assets_dir=N
                 'steam_running': is_steam_running(),
                 'message': f'Could not write shortcuts.vdf: {e}'}
 
+    # The appid is a hash of exe+name, so an exe change — or a change of display
+    # name — renumbers the tile and orphans the art filed under the old id.
+    old_appid = (existing or {}).get('appid')
+    if old_appid is not None and old_appid != appid:
+        _delete_desktop_tile_artwork(config_dir, old_appid)
+
     if assets_dir:
         _write_desktop_tile_artwork(config_dir, appid, assets_dir)
 
@@ -15513,13 +15531,13 @@ def add_desktop_tile(exe, start_dir='', launch_options='', icon='', assets_dir=N
         'appid': appid,
         'created': created,
         'steam_running': running,
-        'message': ('Restart Steam to see the RomM tile' if running
-                    else 'RomM added to your Steam library'),
+        'message': (f'Restart Steam to see the {name} tile' if running
+                    else f'{name} added to your Steam library'),
     }
 
 
 def remove_desktop_tile():
-    """Remove the RomM tile and its artwork. Returns {'success', 'message'}."""
+    """Remove our tile and its artwork. Returns {'success', 'message'}."""
     config_dir = find_steam_config_dir()
     if not config_dir:
         return {'success': False, 'steam_running': False,
@@ -15530,7 +15548,7 @@ def remove_desktop_tile():
     idx, existing = find_desktop_tile(shortcuts)
     if existing is None:
         return {'success': True, 'steam_running': is_steam_running(),
-                'message': 'No RomM tile to remove'}
+                'message': 'No library tile to remove'}
 
     appid = existing.get('appid')
     shortcuts.pop(idx)
@@ -15542,16 +15560,9 @@ def remove_desktop_tile():
                 'message': f'Could not write shortcuts.vdf: {e}'}
 
     if appid is not None:
-        unsigned = appid if appid >= 0 else appid + 0x100000000
-        for suffix in _DESKTOP_TILE_ART.values():
-            arch = config_dir / 'grid' / f"{unsigned}{suffix}"
-            try:
-                if arch.exists():
-                    arch.unlink()
-            except OSError as e:
-                logging.debug(f"Could not delete tile artwork {arch.name}: {e}")
+        _delete_desktop_tile_artwork(config_dir, appid)
 
     running = is_steam_running()
     return {'success': True, 'steam_running': running,
-            'message': ('Restart Steam to drop the RomM tile' if running
-                        else 'RomM removed from your Steam library')}
+            'message': ('Restart Steam to drop the library tile' if running
+                        else 'Removed from your Steam library')}
