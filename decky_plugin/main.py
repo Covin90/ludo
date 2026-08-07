@@ -5002,6 +5002,74 @@ class Plugin:
         return {p['id']: (p.get('rom_count') or 0)
                 for p in platforms if p.get('id') is not None}
 
+    def _rom_exists_on_server(self, rom_id: int):
+        """True / False / None (couldn't tell) for one ROM id.
+
+        The counterpart to reconciliation, and much cheaper: one request, and a
+        404 is the server answering definitively rather than something inferred
+        from counts. Only 404 is treated as absence — a 500, a timeout or a
+        proxy error says nothing about whether the ROM is there, and deleting a
+        library entry on that basis would be a data-loss bug wearing a fix's
+        clothes.
+        """
+        try:
+            r = self._romm_client.session.get(
+                urljoin(self._romm_client.base_url, f'/api/roms/{rom_id}'),
+                timeout=15)
+        except Exception as e:
+            logging.debug(f"Existence probe for rom {rom_id} failed: {e}")
+            return None
+        if r.status_code == 404:
+            return False
+        if r.status_code == 200:
+            return True
+        return None
+
+    def _forget_deleted_rom(self, rom_id: int) -> bool:
+        """Drop a ROM the server has confirmed is gone. Returns True if changed.
+
+        The backstop for the one thing counts cannot see: an add and a delete of
+        equal size inside one platform leaves rom_count identical, so the
+        reconcile never looks, and the entry survives as a tile that fails when
+        you touch it. Finding it in advance costs a walk of the whole platform —
+        minutes on a large one, to remove a single row. Confirming it at the
+        moment it actually matters costs one request.
+
+        The platform's baseline is decremented to match. It recorded what the
+        server held at our last walk; we have now applied one deletion from that
+        same server, so leaving it alone would make the platform read as changed
+        on the next reconcile and trigger exactly the walk this avoids.
+        """
+        idx = self._games_index()
+        g = idx.get(rom_id)
+        if not g:
+            return False
+        # A downloaded game is never swept, here or anywhere else. The file is
+        # on disk and playable offline; losing the server row is a reason to
+        # mark it, not to take it away. Same rule as _preserve_orphaned_downloads.
+        if g.get('is_downloaded') and Path(g.get('local_path') or '').exists():
+            if g.get('is_orphan'):
+                return False
+            g['is_orphan'] = True
+            logging.info(f"Rom {rom_id} ({g.get('name')}) is gone from RomM but "
+                         f"downloaded — kept and marked orphaned")
+            self._persist_snapshot_throttled()
+            return True
+
+        self._available_games = [x for x in self._available_games
+                                 if x.get('rom_id') != rom_id]
+        pid = (g.get('romm_data') or {}).get('platform_id')
+        if pid is not None and self._library_platform_totals:
+            base = self._library_platform_totals.get(pid)
+            if base:
+                self._library_platform_totals[pid] = max(0, base - 1)
+        if self._library_server_total:
+            self._library_server_total = max(0, self._library_server_total - 1)
+        logging.info(f"Rom {rom_id} ({g.get('name')}) no longer exists on RomM "
+                     f"— removed from the library")
+        self._persist_snapshot()
+        return True
+
     @classmethod
     def _server_watermark(cls, rows: list, fallback: str) -> str:
         """The timestamp to use as the next `updated_after`.
@@ -6588,10 +6656,21 @@ class Plugin:
                                       'platform_name': pname}])
                         except Exception as e:
                             logging.debug(f"BIOS fetch after download: {e}")
+                    # A failed download is the moment to ask whether the ROM is
+                    # still there at all. Counts cannot see an add and a delete
+                    # that net out inside one platform, so a deleted game can
+                    # survive as a tile — and this is where the user finds out,
+                    # by pressing it. One request settles it, against the walk
+                    # of the entire platform that finding it in advance costs.
+                    gone = False
+                    if not ok and self._rom_exists_on_server(rom_id) is False:
+                        gone = self._forget_deleted_rom(rom_id)
                     self._download_progress[rom_id] = {
                         'percent': 100 if ok else 0, 'downloaded': 0, 'total': 0,
                         'speed': 0, 'eta': 0, 'state': 'done' if ok else 'error',
-                        'message': msg or ('Downloaded' if ok else 'Download failed'),
+                        'message': ('This game is no longer on RomM.' if gone
+                                    else msg or ('Downloaded' if ok else 'Download failed')),
+                        'removed': gone,
                     }
                     _record_activity('download' if ok else 'error',
                                      'Downloaded' if ok else 'Download failed',

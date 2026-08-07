@@ -627,13 +627,17 @@ function ToastCover({ romId, hasCover }: { romId: number; hasCover: boolean }) {
 // Polls get_download_progress until the background download reaches a terminal
 // state, resolving with the outcome. The download itself is kicked off by
 // download_game (which returns immediately); this drives completion + the toast.
-async function awaitDownload(romId: number): Promise<{ ok: boolean; message?: string }> {
+async function awaitDownload(romId: number): Promise<{ ok: boolean; message?: string; removed?: boolean }> {
   for (; ;) {
     let p: any;
     try { p = await getDownloadProgress(romId); }
     catch { await new Promise((r) => setTimeout(r, 500)); continue; }
     if (p?.state === 'done') return { ok: true };
-    if (p?.state === 'error') return { ok: false, message: p.message };
+    // `removed` means the backend confirmed with the server that this ROM is
+    // gone and dropped it from the library. A different outcome from a failed
+    // download, and it needs different words: nothing went wrong, the game
+    // isn't there any more.
+    if (p?.state === 'error') return { ok: false, message: p.message, removed: !!p.removed };
     if (p?.state === 'idle') return { ok: false, message: 'Download did not start' };
     await new Promise((r) => setTimeout(r, 400));
   }
@@ -1374,6 +1378,12 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
           // the user.
           onClick: () => openGameById(game.rom_id, game.name, "/romm-sync-library"),
         });
+      }
+      else if (res.removed) {
+        // Not a failure. The game was deleted on RomM and we have just found
+        // out the only way counts allow — by touching it.
+        toaster.toast({ title: 'No longer on RomM', body: `${game.name} has been removed from your server.` });
+        libCacheDrop(game.rom_id);
       }
       else toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
     } catch (e) { toaster.toast({ title: 'Download failed', body: String(e) }); }
@@ -4407,6 +4417,20 @@ function libCacheSetDownloaded(romId: number, downloaded: boolean) {
   // "Downloaded" row (and any other mounted grid) would only pick it up on the
   // next tab switch. Bulk syncs already broadcast after the batch (see
   // runCollectionBatch); mirror that here for the single-game path.
+  _broadcastLibRefresh();
+}
+// Remove a game from every cached group. Called when the server has confirmed
+// the ROM is gone — the backend has already dropped it from the library, but
+// the cached lists (its platform, any collections, Home) would keep serving the
+// tile until the next full refetch, which is exactly the phantom this exists to
+// clear. Mirrors libCacheSetDownloaded's fan-out rather than invalidating
+// everything, so nothing else has to be re-fetched.
+function libCacheDrop(romId: number) {
+  _dlSucceeded.delete(romId);
+  for (const [key, list] of _libGamesCache) {
+    if (!list.some((g) => g.rom_id === romId)) continue;
+    libCacheSet(key, list.filter((g) => g.rom_id !== romId));
+  }
   _broadcastLibRefresh();
 }
 // Find a cached LibGame by rom id, across every group it might sit in. Used to
