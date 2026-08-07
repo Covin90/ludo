@@ -6370,12 +6370,92 @@ function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
 // offline will sync on reconnect. Self-hides when online so the normal case is
 // untouched. Reads connection/snapshot_fetched_at/pending_saves from
 // get_service_status (see main.py get_service_status).
+// "Your library moved on RomM" — the announce half of the detect/apply split.
+// Same frame as OfflineBanner (dot + title + detail, identical geometry) so the
+// library never has two visual grammars for "something is up", with one action
+// on the right. Deliberately NOT a toast: a toast is a fire-and-forget report of
+// something that already happened, and this is a standing offer that has to
+// survive being ignored, tabbed away from, and come back to.
+function StaleLibraryBanner({ status }: { status: any }) {
+  const stale = useStaleLibrary();
+  const [busy, setBusy] = useState(false);
+  const [focused, setFocused] = useState(false);
+  // A fetch in flight already draws the loading banner, and stacking this on
+  // top would offer an Update button for work that is running.
+  if (!stale || status?.library_progress) return null;
+
+  const bits = [];
+  if (stale.added) bits.push(`${stale.added.toLocaleString()} added`);
+  if (stale.removed) bits.push(`${stale.removed.toLocaleString()} removed`);
+  // Name the platforms while the list is short enough to read — that is what
+  // turns "something changed" into "I know what this is and whether I care".
+  // The SUBJECT of the headline, not a trailing clause: as a suffix on the
+  // second line it landed as "from your last sync in Game Boy Advance", which
+  // reads as though the sync itself happened in GBA.
+  const what = stale.platforms.length === 0 ? 'Your library'
+    : stale.platforms.length <= 3 ? stale.platforms.join(', ')
+      : `${stale.platforms.length} platforms`;
+
+  const onUpdate = async () => {
+    if (busy) return;
+    setBusy(true);
+    try { await _applyStaleUpdate(); } finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: '10px',
+      margin: '0 16px 8px', padding: '8px 12px',
+      background: V2.surface, border: `1px solid ${V2.borderStrong}`,
+      borderRadius: V2.radiusMd, fontSize: '12px',
+    }}>
+      <div style={{
+        width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
+        background: V2.brand, boxShadow: `0 0 6px ${V2.brand}`,
+      }} />
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div style={{ fontWeight: 600, color: V2.fg }}>
+          {/* Row counts, pre-grouping — so this says what changed on the
+              server, not how many library entries will appear. */}
+          {bits.length ? `${what} changed on RomM — ${bits.join(', ')}`
+            : `${what} changed on RomM`}
+        </div>
+        <div style={{ color: V2.fgMuted, marginTop: '1px' }}>
+          {busy
+            ? 'Fetching the platforms that changed…'
+            : "You're still seeing your last sync."}
+        </div>
+      </div>
+      <Focusable noFocusRing
+        onActivate={onUpdate} onClick={onUpdate}
+        onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
+        onMouseEnter={() => setFocused(true)} onMouseLeave={() => setFocused(false)}
+        style={{
+          flexShrink: 0, padding: '5px 14px', borderRadius: V2.radiusPill,
+          cursor: busy ? 'default' : 'pointer', fontSize: '12px', fontWeight: 700,
+          whiteSpace: 'nowrap', opacity: busy ? 0.6 : 1,
+          background: focused ? V2.brandHover : V2.brand, color: '#fff',
+          border: `1px solid ${focused ? V2.brandHover : V2.brand}`,
+          transition: 'background 0.15s, border-color 0.15s',
+        }}>
+        {busy ? 'Updating…' : 'Update'}
+      </Focusable>
+    </div>
+  );
+}
+
 function OfflineBanner({ status }: { status: any }) {
   const conn = status?.connection;
   // A library fetch in flight is worth a banner even when the connection is
   // healthy — that IS the normal case, since auth completes long before the
   // fetch does. Without this the loading state was unreachable in practice.
-  const loading = status?.library_progress;
+  // ...but only when there is nothing else to look at. From the second run on,
+  // the library is already on screen and the sticky fetch toast is narrating
+  // the walk wherever the user goes — the banner then said the same thing a
+  // second time, directly above it. On a first run the toast can't do the job
+  // alone: the page behind it is empty, and the emptiness is the thing that
+  // needs explaining. So the progress-only banner is the first-run banner.
+  const loading = status?.library_progress && !status?.snapshot_fetched_at;
   if (!conn || (conn === 'online' && !loading)) return null;
 
   // Distinguish "the Deck has no internet" from "the Deck is online but the
@@ -6559,6 +6639,27 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   const [bgUri, setBgUri] = useState<string | null>(null);
   const svcStatus = useServiceStatus();
 
+  // Staleness check lives here, at the page root, NOT in a panel. It used to
+  // fire from GroupsPanel's platform mode, so the banner only appeared once you
+  // happened to visit Platforms — Home could sit on an out-of-date library
+  // indefinitely without a word. The banner has always rendered above all four
+  // tabs; only its trigger was tab-bound. Re-runs when the status poll changes
+  // the fields it gates on; _maybeCheckStale owns its own throttle and
+  // already-announced guard, so extra calls are free.
+  const svcRef = useRef(svcStatus);
+  svcRef.current = svcStatus;
+  useEffect(() => {
+    _maybeCheckStale(svcStatus);
+  }, [svcStatus?.connection, svcStatus?.library_ready, !!svcStatus?.library_progress]);
+  // ...plus a tick, because the deps above can stay put for hours while someone
+  // browses. The interval is deliberately shorter than _STALE_CHECK_MS and does
+  // no work of its own — it just gives the throttle something to fire on when
+  // the window comes round.
+  useEffect(() => {
+    const t = setInterval(() => _maybeCheckStale(svcRef.current), 60 * 1000);
+    return () => clearInterval(t);
+  }, []);
+
   // Panels mount lazily on first visit, then STAY mounted (hidden with
   // display:none) — see GroupsPanel's comment for the measured remount cost.
   const seenRef = useRef<Record<string, boolean>>({});
@@ -6707,13 +6808,25 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   const openUserMenu = () => showModal(
     <UserMenuModal username={chrome.username} role={chrome.role} avatar={chrome.avatar} />,
   );
+  // Which platform tile (if any) currently holds gamepad focus — decides what Y
+  // does and what the footer calls it.
+  const focusedPlatform = useFocusedPlatform();
+  const platformY = active === 'platforms' && !!focusedPlatform;
 
   const onButtonDown = (evt: any) => {
     const b = evt?.detail?.button;
     if (b === GamepadButton.BUMPER_LEFT) cycle(-1);
     else if (b === GamepadButton.BUMPER_RIGHT) cycle(1);
     else if (b === GamepadButton.SELECT) { playSteamSound('deck_ui_show_modal'); libNavigate("/romm-sync-settings"); }
-    else if (b === GamepadButton.OPTIONS) openUserMenu();               // Y → account menu
+    // Y → the focused platform's own menu when there is one, account menu
+    // otherwise. On the platforms grid the platform is what Y is nearest to and
+    // what someone pressing it there means; the account menu stays one press
+    // away on ☰ Start, and the footer hint below follows the same condition so
+    // the label never disagrees with what the button does.
+    else if (b === GamepadButton.OPTIONS) {
+      if (active === 'platforms' && focusedPlatform) focusedPlatform.open();
+      else openUserMenu();
+    }
     else if (b === GamepadButton.START) openUserMenu();                 // ☰ Start → account menu
     // L2/R2 → alphabet fast-scroll on the platform/collection grids (repeats
     // allowed so holding the trigger keeps scrubbing).
@@ -6751,13 +6864,14 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
     <Focusable noFocusRing onButtonDown={onButtonDown}
       onSecondaryButton={onSecondary} onCancelButton={onExit}
       actionDescriptionMap={{ [GamepadButton.SELECT]: 'Settings', [GamepadButton.START]: 'Account' }}
-      onOptionsActionDescription="Account"
+      onOptionsActionDescription={platformY ? 'Platform' : 'Account'}
       onSecondaryActionDescription={chrome.rdEnabled ? 'RetroDECK' : undefined}>
       <V2NavBar active={active} onTab={onTab} activeRef={navPillRef} chrome={chrome} onLaunchRd={launchRd} />
 
       <div style={{ height: '8px' }} />
 
       <OfflineBanner status={svcStatus} />
+      <StaleLibraryBanner status={svcStatus} />
 
       {/* All four panels stay mounted once visited; only the active one is
           displayed. Unmounting on switch rebuilt every cover <img> and cost
