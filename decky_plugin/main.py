@@ -4294,6 +4294,410 @@ class Plugin:
                     out[sid] = pid
         return out
 
+    # How far back a client-clock watermark is dragged before it is trusted.
+    #
+    # `updated_after` compares OUR clock against the server's `updated_at`. A
+    # Deck that cold-boots with a drifted RTC and stamps a watermark minutes
+    # ahead of the server makes every add inside that window invisible to the
+    # incremental — permanently, since the watermark only moves forward. The
+    # cushion buys the overlap back: re-reading a few minutes of already-seen
+    # rows is free (the merge is idempotent), while missing them is not.
+    #
+    # Belt and braces alongside _server_watermark: the cushion needs nothing
+    # from the server, so it still applies when the rows carry no usable
+    # updated_at.
+    _WATERMARK_SKEW_CUSHION_S = 300
+
+    @staticmethod
+    def _describe_changes(reconcile: dict) -> str:
+        """"12 added, 1 removed" — or '' when there is nothing to report.
+
+        Only counts that are non-zero appear, so the common quiet refresh says
+        nothing rather than "0 added, 0 removed", which reads as a failure.
+        """
+        if not reconcile:
+            return ''
+        parts = [f"{reconcile[k]} {label}"
+                 for k, label in (('added', 'added'), ('removed', 'removed'),
+                                  ('updated', 're-read'))
+                 if reconcile.get(k)]
+        if not parts:
+            return ''
+        return ', '.join(parts)
+
+    @staticmethod
+    def _platform_matches(platform: dict, wanted) -> bool:
+        """Does this /api/platforms row identify the platform the caller named?
+
+        Accepts an id or a slug, because the two callers hold different things:
+        reconciliation works in ids, while the frontend's platform groups are
+        keyed by slug and never see an id at all.
+        """
+        if wanted is None:
+            return False
+        if platform.get('id') == wanted:
+            return True
+        text = str(wanted).strip().lower()
+        return text in {str(platform.get(k) or '').strip().lower()
+                        for k in ('id', 'slug', 'fs_slug')} - {''}
+
+    def _reconcile_platforms(self, only_platform=None, force_platforms=None) -> dict:
+        """Bring the library back in step with the server, one platform at a time.
+
+        /api/platforms carries every platform's `rom_count` for free, so one
+        cheap call says which platforms changed size since we last walked them.
+        Those are re-walked; the rest are left alone. The set difference within
+        a re-walked platform is what was added and what was deleted — no
+        arithmetic, so nothing has to correct for sibling grouping, and adds and
+        deletes fall out of the same pass. (argosy-launcher reconciles the same
+        way, by set difference per platform, though it re-walks unconditionally
+        because it keeps no watermark at all.)
+
+        Compares server-against-server: today's rom_count against the count
+        recorded when we last walked that platform. A local entry count would be
+        meaningless here — grouping makes it smaller than the server's by an
+        amount only a walk can know.
+
+        `force_platforms` is a set of platform ids to walk whatever their count
+        says. It closes the one blind spot counts have: an add and a delete of
+        equal size inside one platform leaves rom_count untouched and is
+        invisible here. But such a change contains an add by definition, and
+        `updated_after` returns that added row — so the caller already holds
+        proof the platform moved and passes the id in. See its use in
+        `refresh_from_romm` for why only genuinely-new ids qualify.
+
+        Returns a stats dict. `checked` is None when the platform list was
+        unusable, which is NOT the same as nothing having changed: the caller
+        must not stamp a watermark on the strength of a reconciliation that
+        never happened.
+        """
+        stats = {'checked': None, 'walked': [], 'added': 0, 'removed': 0,
+                 'updated': 0, 'incomplete': False}
+
+        platforms = self._romm_client.get_platforms() or []
+        if not platforms:
+            logging.warning("Reconcile: no platforms returned; skipping")
+            return stats
+
+        baselines = self._library_platform_totals
+        if baselines is None and only_platform is not None:
+            # An explicit resync is not a comparison, so a missing baseline is
+            # no reason to skip it. Start one; the walk below fills in the entry
+            # for the platform it reads.
+            baselines = self._library_platform_totals = {}
+        if baselines is None:
+            # Nothing to compare against — the library in memory came from a
+            # snapshot or a walk that predates baseline tracking. Adopt what the
+            # server reports rather than re-walking all of it: the global count
+            # probe still guards this refresh, and the next real change to any
+            # platform will now be caught.
+            self._library_platform_totals = {
+                p['id']: (p.get('rom_count') or 0)
+                for p in platforms if p.get('id') is not None}
+            logging.info(f"Reconcile: adopted baselines for "
+                         f"{len(self._library_platform_totals)} platforms")
+            stats['checked'] = len(platforms)
+            return stats
+
+        changed = []
+        for p in platforms:
+            pid = p.get('id')
+            if pid is None or (only_platform is not None
+                               and not self._platform_matches(p, only_platform)):
+                continue
+            count = p.get('rom_count') or 0
+            base = baselines.get(pid)
+            # A platform we have never walked (base is None) counts as changed
+            # even at zero ROMs — it may have appeared since, and adopting its
+            # count without reading it would hide everything already in it.
+            if (base is None or base != count or only_platform is not None
+                    or (force_platforms and pid in force_platforms)):
+                changed.append((pid, p, count))
+
+        stats['checked'] = len(platforms) if only_platform is None else len(changed)
+        if not changed:
+            return stats
+
+        names = ', '.join(str(p.get('display_name') or p.get('name') or p.get('slug'))
+                          for _, p, _ in changed)
+        logging.info(f"Reconcile: {len(changed)} platform(s) changed on the "
+                     f"server — re-walking {names}")
+
+        download_dir = Path(self._settings.get('Download', 'rom_directory',
+                                               _default_roms_dir())).expanduser()
+        by_id = {g['rom_id']: g for g in self._available_games if g.get('rom_id')}
+        before_ids = set(by_id)
+        touched_ids = set()   # ids the walks actually returned
+
+        for index, (pid, platform, count) in enumerate(changed):
+            name = (platform.get('display_name') or platform.get('name')
+                    or platform.get('slug') or 'Unknown')
+            slug = platform.get('slug') or platform.get('fs_slug')
+            # Narrated like a cold fetch — same _library_progress the sticky
+            # toast and the banner read, so a reconcile that turns out to be
+            # long explains itself wherever the user is.
+            self._library_progress = {
+                'loaded': 0, 'total': count, 'platform_name': name,
+                'platform_slug': slug,
+                'platform_index': index + 1, 'platform_count': len(changed),
+            }
+
+            def _progress(kind, payload, _n=name, _s=slug, _i=index, _c=count):
+                if kind == 'loaded' and isinstance(payload, dict):
+                    # _s is re-stated on every tick, not just in the seed dict
+                    # above. This replaces _library_progress wholesale, so a key
+                    # it omits is GONE from the next poll — the platform icon
+                    # appeared for a single frame and then vanished for the rest
+                    # of the walk, which is the whole span it exists to label.
+                    self._library_progress = {
+                        **payload, 'total': _c, 'platform_name': _n,
+                        'platform_slug': _s,
+                        'platform_index': _i + 1, 'platform_count': len(changed)}
+
+            rows, _ = self._romm_client.get_platform_roms(
+                pid, rom_count=count, progress_callback=_progress,
+                trim_fields=ROM_TRIM_FIELDS)
+
+            if getattr(self._romm_client, 'last_fetch_incomplete', False):
+                # A short walk cannot tell a deleted ROM from a dropped page,
+                # and the sweep below is the one operation where guessing is
+                # unrecoverable. Skip this platform entirely — its baseline is
+                # left stale on purpose, so the next reconcile retries it.
+                logging.warning(f"Reconcile: {name} walk incomplete — leaving it "
+                                f"untouched, will retry next refresh")
+                stats['incomplete'] = True
+                continue
+
+            # Replace this platform's slice wholesale: drop every local entry
+            # belonging to it, then put back exactly what the server just sent.
+            # That IS the set difference — absences are deletions and new ids
+            # are additions, both without a separate diff pass.
+            for rid, g in list(by_id.items()):
+                if (g.get('romm_data') or {}).get('platform_id') == pid:
+                    del by_id[rid]
+            for row in rows:
+                rid = row.get('id')
+                if rid is not None:
+                    by_id[rid] = self._game_entry(row, download_dir)
+                    touched_ids.add(rid)
+
+            self._library_platform_totals[pid] = count
+            stats['walked'].append(name)
+
+        self._library_progress = None
+
+        games = list(by_id.values())
+        # The orphan veto, same as every other delete path: a downloaded game
+        # that left the server is kept and marked, never removed from under
+        # someone who has the file on disk. Applied BEFORE the counts are taken
+        # — a game it rescues was not removed, and reporting it as removed would
+        # describe something that did not happen.
+        orphans = self._preserve_orphaned_downloads(games, self._available_games)
+        if orphans:
+            logging.info(f"Reconcile: kept {orphans} downloaded game(s) no longer on RomM")
+
+        after_ids = {g['rom_id'] for g in games if g.get('rom_id')}
+        stats['added'] = len(after_ids - before_ids)
+        stats['removed'] = len(before_ids - after_ids)
+        # Rows the walk returned for ids we already had. Not "changed" — we do
+        # not diff field by field — but "re-read", which is what a wholesale
+        # slice replacement can honestly claim.
+        stats['updated'] = len(touched_ids & before_ids)
+
+        self._available_games = games
+        return stats
+
+    @staticmethod
+    def _game_entry(rom: dict, download_dir: Path) -> dict:
+        """One library entry from one (grouped) server row.
+
+        Extracted because four walks now need it — connect, full refresh, the
+        incremental merge, and per-platform reconciliation — and the three that
+        predate this had drifted apart by hand: the full-refresh copy dropped
+        `created_at` and `variant_count`, and the incremental copy additionally
+        dropped `is_multi_disc`/`disc_count`/`sibling_roms`, so refreshing a
+        multi-disc game stripped the disc metadata off an entry that had it.
+        Divergence between them is always a bug — the entry a game gets should
+        not depend on which code path last saw it.
+        """
+        platform_slug = rom.get('platform_slug', 'Unknown')
+        file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
+        local_path, is_downloaded = _resolve_download_path(
+            download_dir, platform_slug, file_name)
+        local_size = 0
+        if is_downloaded and local_path.exists():
+            if local_path.is_dir():
+                local_size = sum(f.stat().st_size
+                                 for f in local_path.rglob('*') if f.is_file())
+            else:
+                local_size = local_path.stat().st_size
+        is_md = _detect_multi_disc(local_path, is_downloaded)
+        return {
+            'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
+            # RomM's metadata title (e.g. "Mario Party 7") — used for display;
+            # 'name' stays the filename stem because the save-sync/local
+            # matching keys on it.
+            'display_name':    rom.get('name'),
+            'rom_id':          rom.get('id'),
+            'platform':        _platform_label(rom),
+            'platform_slug':   platform_slug,
+            'file_name':       file_name,
+            'is_downloaded':   is_downloaded,
+            'is_multi_disc':   is_md[0],
+            'disc_count':      is_md[1],
+            'local_path':      str(local_path) if is_downloaded else None,
+            'local_size':      local_size,
+            'cover_path':      rom.get('path_cover_small'),
+            'cover_path_large': rom.get('path_cover_large'),
+            'created_at':      rom.get('created_at'),
+            # See _variant_count — must be taken here, while the grouped-away
+            # pieces are still on the row.
+            'variant_count':   (1 + len(rom.get('sibling_roms') or [])
+                                + len(rom.get('_region_save_siblings') or [])),
+            '_sibling_files':  rom.get('_sibling_files', []),
+            'sibling_roms':    rom.get('sibling_roms', []),
+            # Ids only — the pieces grouping dropped from sibling_roms (folder
+            # members / per-region ROMs). Kept so raw server rows can be folded
+            # back onto this entry; see _variant_parent_index.
+            '_region_variant_ids': [s.get('id') for s
+                                    in (rom.get('_region_save_siblings') or [])
+                                    if s.get('id')],
+            'romm_data': {
+                'fs_name':         rom.get('fs_name'),
+                'fs_name_no_ext':  rom.get('fs_name_no_ext'),
+                'fs_size_bytes':   rom.get('fs_size_bytes', 0),
+                'platform_id':     rom.get('platform_id'),
+                'platform_slug':   rom.get('platform_slug'),
+                # Member files (multi-disc / multi-FILE regional ROMs); the
+                # save-sync matcher maps a launched member back to this parent
+                # ROM. Requires with_files=true in get_roms.
+                'files':           rom.get('files', []),
+            },
+        }
+
+    @staticmethod
+    def _platform_row_counts(raw_rows: list) -> dict:
+        """{platform_id: row count} over server rows.
+
+        NOT usable as a reconciliation baseline — see _probe_platform_baselines.
+        `get_roms` groups regional variants before it returns, so counting its
+        output yields ENTRIES, not rows, and every platform holding a grouped
+        game reads as permanently changed against /api/platforms.
+        """
+        counts = {}
+        for row in raw_rows or ():
+            pid = (row or {}).get('platform_id')
+            if pid is not None:
+                counts[pid] = counts.get(pid, 0) + 1
+        return counts
+
+    def _probe_platform_baselines(self):
+        """{platform_id: rom_count} straight from /api/platforms, or None.
+
+        The baseline reconciliation compares against, so it has to be measured
+        the same way the comparison will be: by the server, in server rows.
+        Deriving it from the rows a walk returned was the bug — `get_roms`
+        collapses regional variants (gb: 1413 rows -> 1037 entries), so the
+        stored baseline undershot rom_count on every platform with siblings and
+        the next connect re-walked nearly the whole library to "fix" a
+        difference that was never real.
+
+        Call this BEFORE the walk it will describe. A ROM added mid-walk is then
+        absent from the library but also absent from the baseline, so the counts
+        disagree next time and that platform is re-read. Sampling afterwards
+        would record a ROM we never fetched as already accounted for, and
+        nothing would ever go looking for it.
+        """
+        try:
+            platforms = self._romm_client.get_platforms() or []
+        except Exception as e:
+            logging.warning(f"Couldn't probe platform baselines: {e}")
+            return None
+        if not platforms:
+            return None
+        return {p['id']: (p.get('rom_count') or 0)
+                for p in platforms if p.get('id') is not None}
+
+    @classmethod
+    def _server_watermark(cls, rows: list, fallback: str) -> str:
+        """The timestamp to use as the next `updated_after`.
+
+        Prefers the newest `updated_at` the server itself just sent, which is in
+        the server's own clock and therefore immune to skew between the two
+        machines. Falls back to the caller's client-clock stamp, cushioned.
+
+        Only ever moves the watermark BACKWARDS relative to the fallback: rows
+        are what the server had when it built the response, so the newest of
+        them is at or before the fetch, and taking the later of the two would
+        reintroduce the gap this exists to close.
+        """
+        cushioned = fallback
+        try:
+            cushioned = (datetime.fromisoformat(fallback)
+                         - timedelta(seconds=cls._WATERMARK_SKEW_CUSHION_S)).isoformat()
+        except Exception:
+            pass
+
+        newest = None
+        for row in rows or ():
+            ts = (row or {}).get('updated_at')
+            if isinstance(ts, str) and ts and (newest is None or ts > newest):
+                newest = ts
+        if not newest:
+            return cushioned
+        # String compare is only valid on identically-shaped ISO 8601; parse
+        # both rather than trust that the server's format matches ours.
+        try:
+            if datetime.fromisoformat(newest.replace('Z', '+00:00')) < datetime.fromisoformat(cushioned):
+                return newest
+        except Exception:
+            return cushioned
+        return cushioned
+
+    @staticmethod
+    def _preserve_orphaned_downloads(new_games: list, previous_games: list) -> int:
+        """Carry forward downloaded games the server stopped returning.
+
+        Both full-walk paths rebuild the library purely from server rows, so a
+        game deleted on RomM vanishes from the library on the next walk. That is
+        correct for a game we never had — but if it is on disk, dropping the
+        entry strands the file: unlisted, unplayable through Ludo, and still
+        occupying the space. The user's copy outlives the server's.
+
+        So absence retires the *server* relationship, not the game. The entry is
+        appended back marked `is_orphan`, which is what the frontend should key
+        any "no longer on RomM" treatment off, and its rom_id is left intact so
+        an undelete (or a rescan that finds it again) re-merges cleanly on the
+        next walk rather than colliding.
+
+        Deliberately narrow: only rows whose file is still verifiably on disk
+        survive. Everything else is a genuine deletion and goes.
+
+        Mutates `new_games` in place; returns how many were preserved.
+        """
+        if not previous_games:
+            return 0
+        server_ids = {g.get('rom_id') for g in new_games if g.get('rom_id') is not None}
+        preserved = 0
+        for old in previous_games:
+            rom_id = old.get('rom_id')
+            if rom_id is None or rom_id in server_ids:
+                continue
+            if not old.get('is_downloaded'):
+                continue
+            local_path = old.get('local_path')
+            # Re-check the disk rather than trusting the flag: a snapshot
+            # hydrated from an earlier session can assert a download the user
+            # has since deleted, and preserving that would resurrect an entry
+            # backed by nothing.
+            if not (local_path and Path(local_path).exists()):
+                continue
+            entry = dict(old)
+            entry['is_orphan'] = True
+            new_games.append(entry)
+            preserved += 1
+        return preserved
+
     @staticmethod
     def _variant_downloads(game: dict) -> dict:
         """{variant_rom_id: {file_name, local_path, name}} recorded on a parent.
