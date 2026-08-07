@@ -1149,6 +1149,7 @@ class Plugin:
             pass
         self._snapshot_fetched_at = None
         self._library_server_total = None
+        self._library_platform_totals = None
         self._last_full_fetch_time = None
         self._library_progress = None
         self._announce_library = None
@@ -1226,6 +1227,16 @@ class Plugin:
                 # Absent in snapshots written before this existed; hydrate reads
                 # it as None and that connect simply fetches.
                 'server_total': self._library_server_total,
+                # Per-platform baselines for the next connect's reconcile. Without
+                # these a cold start has nothing to compare /api/platforms against
+                # and has to re-walk the whole library to find one added ROM.
+                # JSON keys are strings; hydrate coerces them back to ints.
+                # _v2: the first build wrote grouped ENTRY counts here, which
+                # made almost every platform look changed. Those are unusable
+                # and indistinguishable from good ones, so the key is versioned
+                # rather than migrated — an old snapshot simply has no baselines
+                # and fetches once.
+                'platform_totals_v2': self._library_platform_totals or None,
                 'collections': self._romm_collections or [],
                 'virtual_collections': self._romm_virtual_collections or [],
                 'platform_slug_to_name': self._platform_slug_to_name or {},
@@ -1306,6 +1317,15 @@ class Plugin:
             self._platform_slug_to_name = data.get('platform_slug_to_name') or {}
             self._snapshot_fetched_at = data.get('fetched_at')
             self._library_server_total = data.get('server_total')
+            totals = data.get('platform_totals_v2')
+            if isinstance(totals, dict) and totals:
+                # Absent in snapshots written before this existed; None then, and
+                # the connect reconcile adopts baselines instead of comparing.
+                try:
+                    self._library_platform_totals = {
+                        int(k): int(v) for k, v in totals.items()}
+                except (TypeError, ValueError):
+                    logging.warning("Snapshot platform totals unusable; ignoring")
             logging.info(f"Hydrated {len(self._available_games)} games from snapshot "
                          f"(fetched {self._snapshot_fetched_at})")
             return self._snapshot_fetched_at
@@ -1516,9 +1536,86 @@ class Plugin:
                         updated_after=self._snapshot_fetched_at)
                     skip_fetch = (changed == 0)
 
-            if skip_fetch:
-                logging.info(f"Library unchanged since {self._snapshot_fetched_at} "
-                             f"({len(self._available_games)} games); skipping fetch")
+            # Neither probe passed, so something moved — but "something moved"
+            # is not a reason to re-read the whole library. Adding one GBA ROM
+            # failed both probes and cost a 365s full walk on a 20k instance,
+            # when the platform that changed is a 2.2s walk. Same reconcile the
+            # incremental refresh uses: /api/platforms says which platforms
+            # changed size, and only those are re-read. Needs baselines, which
+            # is why the snapshot now carries them.
+            # Automatic updates turned off: the server moved, and we stop there.
+            # The hydrated library stays exactly as it is and the frontend's
+            # staleness check raises the banner with an Update button, which is
+            # the consented half of the same split. Only ever a choice between
+            # "now" and "when you say so" — a first run has nothing to hold on
+            # to, so it fetches regardless of the setting.
+            hold_for_consent = (
+                not skip_fetch and bool(self._available_games)
+                and bool(self._snapshot_fetched_at)
+                and not self._library_auto_update())
+
+            reconciled = None
+            if (not skip_fetch and not hold_for_consent
+                    and self._available_games and self._snapshot_fetched_at
+                    and self._library_platform_totals):
+                # Claimed for the same reason the fetch below claims it: this
+                # owns _available_games until the swap.
+                self._library_busy = True
+                # Stamped before the walk, not after — see the fetch path.
+                reconcile_stamp = datetime.now(timezone.utc).isoformat()
+                try:
+                    reconciled = self._reconcile_platforms()
+                except Exception as e:
+                    logging.warning(f"Connect reconcile failed ({e}); fetching instead")
+                    reconciled = None
+                finally:
+                    self._library_progress = None
+                if reconciled and reconciled['checked'] is None:
+                    # The platform list was unusable, so nothing was compared.
+                    # Fetch rather than declare the library current.
+                    reconciled = None
+
+            if reconciled is not None:
+                logging.info(
+                    f"Connect: reconciled {reconciled['checked']} platform(s) — "
+                    f"walked {reconciled['walked'] or 'none'}, "
+                    f"+{reconciled['added']} / -{reconciled['removed']} "
+                    f"({len(self._available_games)} games)")
+                # A short walk leaves its platform's baseline stale on purpose;
+                # clearing the global total makes the next connect ask again
+                # instead of skipping on a total the library doesn't hold.
+                if reconciled['incomplete']:
+                    self._library_server_total = None
+                else:
+                    probed = self._romm_client.count_roms()
+                    if probed is not None:
+                        self._library_server_total = probed
+                self._last_full_fetch_time = reconcile_stamp
+                self._snapshot_fetched_at = reconcile_stamp
+                self._persist_snapshot()
+                self._init_bios_tracking()
+                # Say what it did. This walk is automatic — it happens before
+                # the user has touched anything — so without a word at the end
+                # the app just spins a banner and silently changes the library
+                # under them. Only when something actually moved: a reconcile
+                # that walked nothing is not news. Not the one-shot 'ready'
+                # latch; this is per-occurrence.
+                if reconciled['added'] or reconciled['removed']:
+                    self._announce_library = {
+                        'kind': 'updated',
+                        'added': reconciled['added'],
+                        'removed': reconciled['removed'],
+                        'platforms': reconciled['walked'],
+                    }
+            elif skip_fetch or hold_for_consent:
+                if hold_for_consent:
+                    logging.info(
+                        f"Library changed on the server, but automatic updates are "
+                        f"off — holding {len(self._available_games)} cached games "
+                        f"until the user asks")
+                else:
+                    logging.info(f"Library unchanged since {self._snapshot_fetched_at} "
+                                 f"({len(self._available_games)} games); skipping fetch")
                 # The hydrated snapshot IS the current server state, so it counts
                 # as a completed fetch — get_service_status reports library_ready
                 # from this, and refresh_library uses it as its incremental base.
@@ -1529,14 +1626,30 @@ class Plugin:
                 if kind == 'loaded' and isinstance(payload, dict):
                     self._library_progress = payload
 
-            if skip_fetch:
+            if skip_fetch or hold_for_consent or reconciled is not None:
                 roms_result = None
             else:
                 fetch_started = time.time()
+                # Claimed for the same reason refresh_from_romm claims it: this
+                # walk owns _available_games for its whole duration, and a
+                # refresh merging into it midway would be merging into a library
+                # that is about to be replaced wholesale.
+                self._library_busy = True
+                # Stamped BEFORE the walk, not after it. This is minutes on a
+                # large library, and a watermark taken at the end excludes
+                # everything added during the run: a ROM added 10s in, to a
+                # platform the walk had already passed, carries an updated_at
+                # below the watermark and is skipped by every incremental after
+                # it. Starting the window early re-reads a few rows instead,
+                # which the merge absorbs idempotently. refresh_from_romm always
+                # got this right (see its current_time); this path did not.
+                fetch_stamp = datetime.now(timezone.utc).isoformat()
                 # Bound before the try so the finally below can always read
                 # them: if the count probe raises, an unbound local there would
                 # replace the real exception with a NameError.
                 known_total, resumed = None, {}
+                # Sampled before the walk on purpose — see _probe_platform_baselines.
+                pending_baselines = self._probe_platform_baselines()
                 try:
                     # Seed the total BEFORE fetching. Pages arrive whole and in
                     # parallel, so the count itself barely moves until they land
@@ -1598,61 +1711,15 @@ class Plugin:
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                         _default_roms_dir())).expanduser()
                 for rom in raw_games:
-                    platform_slug = rom.get('platform_slug', 'Unknown')
-                    file_name     = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
-                    local_path, is_downloaded = _resolve_download_path(
-                        download_dir, platform_slug, file_name)
-                    local_size    = 0
-                    if is_downloaded and local_path.exists():
-                        if local_path.is_dir():
-                            local_size = sum(f.stat().st_size
-                                             for f in local_path.rglob('*') if f.is_file())
-                        else:
-                            local_size = local_path.stat().st_size
-                    is_md = _detect_multi_disc(local_path, is_downloaded)
-                    games.append({
-                        'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
-                        # RomM's metadata title (e.g. "Mario Party 7") — used for
-                        # display; 'name' stays the filename stem because the
-                        # save-sync/local matching keys on it.
-                        'display_name':    rom.get('name'),
-                        'rom_id':          rom.get('id'),
-                        'platform':        _platform_label(rom),
-                        'platform_slug':   platform_slug,
-                        'file_name':       file_name,
-                        'is_downloaded':   is_downloaded,
-                        'is_multi_disc':   is_md[0],
-                        'disc_count':      is_md[1],
-                        'local_path':      str(local_path) if is_downloaded else None,
-                        'local_size':      local_size,
-                        'cover_path': rom.get('path_cover_small'),
-                        'cover_path_large': rom.get('path_cover_large'),
-                        'created_at':      rom.get('created_at'),
-                        # See _variant_count — must be taken here, while the
-                        # grouped-away pieces are still on the row.
-                        'variant_count':   (1 + len(rom.get('sibling_roms') or [])
-                                            + len(rom.get('_region_save_siblings') or [])),
-                        '_sibling_files':  rom.get('_sibling_files', []),
-                        'sibling_roms':    rom.get('sibling_roms', []),
-                        # Ids only — the pieces grouping dropped from
-                        # sibling_roms (folder members / per-region ROMs). Kept
-                        # so raw server rows can be folded back onto this entry;
-                        # see _variant_parent_index.
-                        '_region_variant_ids': [s.get('id') for s
-                                                in (rom.get('_region_save_siblings') or [])
-                                                if s.get('id')],
-                        'romm_data': {
-                            'fs_name':         rom.get('fs_name'),
-                            'fs_name_no_ext':  rom.get('fs_name_no_ext'),
-                            'fs_size_bytes':   rom.get('fs_size_bytes', 0),
-                            'platform_id':     rom.get('platform_id'),
-                            'platform_slug':   rom.get('platform_slug'),
-                            # Member files (multi-disc / multi-FILE regional ROMs);
-                            # the save-sync matcher maps a launched member back to
-                            # this parent ROM. Requires with_files=true in get_roms.
-                            'files':           rom.get('files', []),
-                        },
-                    })
+                    games.append(self._game_entry(rom, download_dir))
+                # Only a complete walk can say a game is gone. A short fetch is
+                # missing rows for reasons that have nothing to do with the
+                # server's contents, and every one of them would look deleted.
+                if not incomplete:
+                    orphans = self._preserve_orphaned_downloads(games, self._available_games)
+                    if orphans:
+                        logging.info(f"Kept {orphans} downloaded game(s) no longer on RomM")
+
                 # The swap. Everything downstream — the snapshot, BIOS
                 # tracking, the auto-sync get_games_callback — reads the
                 # attribute, so rebinding is enough (the incremental branch in
@@ -1680,7 +1747,14 @@ class Plugin:
                                               'games': len(self._available_games),
                                               'files': server_total}
 
-                self._last_full_fetch_time = datetime.now(timezone.utc).isoformat()
+                # A complete walk is the only thing that can establish the
+                # per-platform baselines, because it is the only thing that has
+                # seen every row — but the numbers come from the /api/platforms
+                # probe taken before it started, not from the rows it returned.
+                if not incomplete and pending_baselines:
+                    self._library_platform_totals = pending_baselines
+
+                self._last_full_fetch_time = self._server_watermark(raw_games, fetch_stamp)
                 self._snapshot_fetched_at = self._last_full_fetch_time
                 self._persist_snapshot()
                 # Library is fetched on connect and on manual refresh (the reference
@@ -1723,6 +1797,14 @@ class Plugin:
         except Exception as e:
             logging.error(f"Connection error: {e}", exc_info=True)
             return False
+        finally:
+            # Held from the moment the fetch starts until the rebuilt library is
+            # swapped in and persisted, which is several hundred lines below the
+            # fetch itself — releasing it with the fetch would leave the swap
+            # unprotected, which is the half that actually mutates the library.
+            # Cleared unconditionally: a connect that raises must not leave
+            # refreshes locked out.
+            self._library_busy = False
 
     def _init_collection_sync(self):
         """Create and start CollectionSyncManager from current settings."""
