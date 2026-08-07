@@ -2816,8 +2816,34 @@ class RomMClient:
             # Ludo made. `limit` is deliberately ignored on this branch; the
             # page size is ours to choose, not the caller's.
             if offset == 0 and (limit == 500 or updated_after is not None):
+                # A full walk goes per platform so the fetch can say what it is
+                # syncing. An incremental one does not: `updated_after` cuts
+                # across every platform, so per-platform would turn one filtered
+                # walk into a request per platform, most of them returning
+                # nothing. It stays a flat filtered walk.
+                if updated_after is None:
+                    per_platform = self._fetch_all_games_by_platform(
+                        progress_callback, trim_fields, resumed_pages, page_sink)
+                    # None means the platform list was unusable — not an error,
+                    # just no basis for the per-platform walk. Fall through to
+                    # the flat one rather than failing the fetch.
+                    if per_platform is not None:
+                        return per_platform
+                # A checkpoint written per platform cannot be replayed into a
+                # flat walk: its offsets restart at zero for every platform and
+                # mean nothing against a library-wide ordering. Drop them rather
+                # than mix two coordinate systems — the pages are re-fetched,
+                # which is slow, not wrong.
+                flat_resume = resumed_pages
+                if resumed_pages and any(isinstance(k, tuple) for k in resumed_pages):
+                    flat_resume = {k: v for k, v in resumed_pages.items()
+                                   if not isinstance(k, tuple)}
+                # The per-platform sink takes a third argument. Flat pages have
+                # no platform, so bind it away rather than push the distinction
+                # into _fetch_pages_parallel.
+                flat_sink = (lambda off, rows: page_sink(off, rows, None)) if page_sink else None
                 return self._fetch_all_games_chunked(progress_callback, trim_fields,
-                                                    resumed_pages, page_sink,
+                                                    flat_resume, flat_sink,
                                                     updated_after)
             else:
                 # Specific pagination request: one explicit slice of the library.
@@ -3288,15 +3314,252 @@ class RomMClient:
             self.last_fetch_incomplete = True
             return [], 0
         
+    def _fetch_all_games_by_platform(self, progress_callback, trim_fields=None,
+                                     resumed_pages=None, page_sink=None):
+        """Fetch the whole library one platform at a time.
+
+        Same rows as _fetch_all_games_chunked, walked in a different order and
+        narrated differently. The point is the narration: a single number
+        climbing to 11,842 tells the user nothing about what is being synced,
+        while "Commodore 64 — 3,200 of 9,400" plus a platform icon does. Modelled
+        on argosy-launcher, which syncs per platform for the same reason.
+
+        The cost is page packing: each platform ends on a partial page, so the
+        library takes one extra request per platform. Measured on a real 11,842
+        game library — 128 pages against 119, nine requests, ~7.5%. It buys
+        per-platform resume and, later, exact deletion detection, since a
+        platform walked to completion is a definitive statement about which of
+        its ROMs still exist.
+
+        Sequential across platforms, which costs nothing: the page walk itself is
+        already single-worker (see max_workers in _fetch_pages_parallel), so
+        there was never any cross-platform concurrency to give up.
+
+        resumed_pages is keyed (platform_id, offset) here rather than by offset
+        alone — offsets restart at zero for every platform, so the flat keying
+        would have every platform replaying the first platform's pages.
+        """
+        try:
+            with PerformanceTimer("API fetch - per-platform sync") as timer:
+                platforms = self.get_platforms() or []
+                if not platforms:
+                    # No platform list, no per-platform walk. The caller falls
+                    # back rather than failing: an empty library and an
+                    # unreachable /api/platforms look identical from here.
+                    print("⚠️ No platforms returned; falling back to a flat library walk")
+                    return None
+
+                # rom_count comes free on /api/platforms, so every platform's
+                # size is known before a single ROM is fetched.
+                sized = []
+                for p in platforms:
+                    pid = p.get('id')
+                    count = p.get('rom_count') or 0
+                    if pid is None or count <= 0:
+                        continue
+                    sized.append((count, pid, p))
+                if not sized:
+                    print("⚠️ No platform reported any ROMs; falling back to a flat walk")
+                    return None
+
+                # Largest first, tie-broken by id for a deterministic order.
+                # Three reasons: resume banks the most rows soonest; the long
+                # stall lands at "1 of 13" where a climbing game counter reads as
+                # working, rather than at "12 of 13" where it reads as hung; and
+                # the tail of tiny platforms then flicks past as visible
+                # progress. NOT the server's /api/platforms order, which argosy
+                # uses but RomM does not guarantee.
+                sized.sort(key=lambda t: (-t[0], t[1]))
+
+                library_total = sum(c for c, _, _ in sized)
+                platform_total = len(sized)
+                print(f"📚 Fetching {library_total:,} games across {platform_total} platforms "
+                      f"(largest first)...")
+
+                all_games = []
+                loaded_base = 0
+                any_incomplete = False
+
+                for index, (count, pid, platform) in enumerate(sized):
+                    name = (platform.get('display_name') or platform.get('name')
+                            or platform.get('slug') or 'Unknown')
+                    slug = platform.get('slug') or platform.get('fs_slug')
+                    pages_needed = (count + LIBRARY_PAGE_SIZE - 1) // LIBRARY_PAGE_SIZE
+
+                    # This platform's slice of the checkpoint, re-keyed to the
+                    # plain offsets _fetch_pages_parallel expects. Keeping the
+                    # composite key out of that method leaves its resume and sink
+                    # plumbing untouched.
+                    platform_resume = {
+                        off: rows for (rp, off), rows in (resumed_pages or {}).items()
+                        if rp == pid
+                    }
+                    platform_sink = None
+                    if page_sink:
+                        def platform_sink(offset, rows, _pid=pid):
+                            page_sink(offset, rows, _pid)
+
+                    if progress_callback:
+                        progress_callback('page', f'⟳ {name} ({index + 1}/{platform_total})')
+
+                    games = self._fetch_pages_parallel(
+                        count, LIBRARY_PAGE_SIZE, pages_needed, progress_callback,
+                        trim_fields, platform_resume, platform_sink,
+                        platform_id=pid, loaded_base=loaded_base,
+                        progress_extra={
+                            'total': library_total,
+                            'platform_name': name,
+                            'platform_slug': slug,
+                            'platform_index': index + 1,
+                            'platform_count': platform_total,
+                        })
+
+                    # Set per call, so it has to be harvested before the next
+                    # platform overwrites it.
+                    if self.last_fetch_incomplete:
+                        any_incomplete = True
+
+                    # Prove the filter actually applied, once, on the first
+                    # platform that returns anything. A server that recognises
+                    # neither `platform_id` nor `platform_ids` answers every
+                    # request with the whole library, and the walk would then
+                    # assemble one copy of it per platform — 13x the rows, all
+                    # duplicates, with nothing downstream the wiser. Abandoning
+                    # the walk hands get_roms a None and it falls back to the
+                    # flat one, which is correct on any server.
+                    if index == 0 and games:
+                        seen = {g.get('platform_id') for g in games
+                                if g.get('platform_id') is not None}
+                        if seen and seen != {pid}:
+                            print(f"⚠️ Server ignored the platform filter (asked for {pid}, "
+                                  f"got {sorted(seen)[:5]}) — falling back to a flat walk")
+                            self.last_fetch_incomplete = False
+                            return None
+
+                    all_games.extend(games)
+                    # The base advances by the RAW row count, not len(games):
+                    # _fetch_pages_parallel groups sibling ROMs before returning,
+                    # so the grouped list is shorter than what was fetched and
+                    # the progress readout would drift further behind the real
+                    # total with every platform.
+                    loaded_base += count if not self.last_fetch_incomplete else len(games)
+                    timer.checkpoint(f"{name}: {count} games")
+
+                self.last_fetch_incomplete = any_incomplete
+                return all_games, library_total
+
+        except Exception as e:
+            print(f"❌ Per-platform fetch error: {e}")
+            self.last_fetch_incomplete = True
+            return [], 0
+
+    def get_platform_roms(self, platform_id, rom_count=None, progress_callback=None,
+                          trim_fields=None):
+        """Walk one platform completely. Returns (games, server_row_count).
+
+        The unit reconciliation works in: a platform whose server `rom_count`
+        disagrees with what we last walked is re-walked here, and the set
+        difference against the local rows for that platform is what was added or
+        deleted. Scoping it this way is the whole point — the alternative to
+        re-reading one platform is re-reading the library.
+
+        `rom_count` may be passed by a caller that already read /api/platforms,
+        which is the normal path (reconciliation reads that list to decide which
+        platforms to walk at all); omitted, it costs one filtered count probe.
+
+        Sets last_fetch_incomplete, which callers MUST check before treating an
+        absent row as deleted — a short walk is missing rows for reasons that
+        have nothing to do with the server's contents.
+        """
+        if not self.ensure_authenticated():
+            self.last_fetch_incomplete = True
+            return [], 0
+
+        try:
+            if rom_count is None:
+                rom_count = self.count_platform_roms(platform_id)
+                if rom_count is None:
+                    self.last_fetch_incomplete = True
+                    return [], 0
+
+            if rom_count <= 0:
+                # An empty platform is a complete answer, not a failed walk: the
+                # sweep needs to be able to conclude "everything here is gone".
+                self.last_fetch_incomplete = False
+                return [], 0
+
+            pages_needed = (rom_count + LIBRARY_PAGE_SIZE - 1) // LIBRARY_PAGE_SIZE
+            games = self._fetch_pages_parallel(
+                rom_count, LIBRARY_PAGE_SIZE, pages_needed, progress_callback,
+                trim_fields, platform_id=platform_id,
+                progress_extra={'total': rom_count})
+
+            # Same proof the full per-platform walk takes, and for the same
+            # reason: a server that filters on neither spelling answers with the
+            # whole library, and here that would hand the sweep a row set from
+            # every platform — which, scoped to one platform, reads as nothing
+            # deleted and a great many things added.
+            if games:
+                seen = {g.get('platform_id') for g in games
+                        if g.get('platform_id') is not None}
+                if seen and seen != {platform_id}:
+                    print(f"⚠️ Server ignored the platform filter (asked for "
+                          f"{platform_id}, got {sorted(seen)[:5]}) — refusing to "
+                          f"reconcile this platform")
+                    self.last_fetch_incomplete = True
+                    return [], 0
+
+            return games, rom_count
+
+        except Exception as e:
+            print(f"❌ Platform fetch error ({platform_id}): {e}")
+            self.last_fetch_incomplete = True
+            return [], 0
+
+    def count_platform_roms(self, platform_id):
+        """How many ROMs the server holds for one platform. None if unanswerable.
+
+        Same limit=1 probe as count_roms, with the platform filter — see there
+        for why one row costs a fraction of a page. Both spellings again: a
+        server that filtered on neither would answer with the library total and
+        send the reconciliation to walk a platform forever.
+        """
+        if not self.ensure_authenticated():
+            return None
+        try:
+            response = self.session.get(
+                urljoin(self.base_url, '/api/roms'),
+                params={'limit': 1, 'offset': 0, 'fields': 'id',
+                        'platform_id': platform_id, 'platform_ids': platform_id},
+                timeout=15)
+            if response.status_code != 200:
+                print(f"❌ Platform count probe: HTTP {response.status_code}")
+                return None
+            return response.json().get('total')
+        except Exception as e:
+            print(f"❌ Platform count probe error: {e}")
+            return None
+
     def _fetch_pages_parallel(self, total_items, page_size, pages_needed, progress_callback,
                               trim_fields=None, resumed_pages=None, page_sink=None,
-                              updated_after=None):
+                              updated_after=None, platform_id=None,
+                              loaded_base=0, progress_extra=None):
         """Fetch every page, in parallel, streaming rows into one list.
 
         resumed_pages: {offset: rows} already fetched by an interrupted run, used
             in place of a request. page_sink: called (offset, rows) for each page
             fetched here, so a caller can checkpoint. Both optional; the engine
             owns neither the storage nor the policy, only the plumbing.
+
+        platform_id: narrows the walk to one platform. `total_items`/`pages_needed`
+            must then describe that platform, not the library, since they drive
+            the offsets.
+
+        loaded_base / progress_extra: for a caller walking several platforms in
+            turn. This method only ever sees one platform's numbers, so the base
+            carries what earlier platforms already loaded and the extra carries
+            the library-wide totals and the platform's identity — without them
+            the progress readout would restart from zero on every platform.
         """
         """Memory-optimized: Stream and process games in smaller chunks"""
         import concurrent.futures
@@ -3354,6 +3617,16 @@ class RomMClient:
                 return page_num, resumed_pages[offset], True
 
             page_params = {}
+            if platform_id is not None:
+                # Both spellings, deliberately. argosy-launcher sends the pair
+                # for the same reason — RomM has carried `platform_id` and
+                # `platform_ids` across versions and which one filters depends on
+                # the server. A server that ignores the unknown one is harmless;
+                # a server that ignores BOTH would silently return the whole
+                # library per platform, which the row check in the caller
+                # catches.
+                page_params['platform_id'] = platform_id
+                page_params['platform_ids'] = platform_id
             if updated_after:
                 # Applied per page so the filter and the pagination agree; the
                 # count probe used the same filter, so offsets line up.
@@ -3524,8 +3797,16 @@ class RomMClient:
                         # multi-second fetch — a spinner keeps spinning after the
                         # fetch has died.
                         progress_callback('loaded', {
-                            'loaded': loaded,
+                            'loaded': loaded_base + loaded,
                             'total': total_items,
+                            # Per-platform walk only: the platform's own numbers
+                            # plus its identity. A platform bar alone is useless
+                            # on a lopsided library (one platform is 79% of the
+                            # measured one), so the within-platform count has to
+                            # be carried alongside it, not instead of it.
+                            **(progress_extra or {}),
+                            **({'platform_loaded': loaded,
+                                'platform_total': total_items} if platform_id is not None else {}),
                         })
                         # Unchanged shape; cadence is now the fixed batch_size
                         # above rather than max_workers. Consumers outside this
