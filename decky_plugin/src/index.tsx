@@ -1313,6 +1313,23 @@ function useAutoFocus(ready: boolean, dep?: any) {
 // `stateThumb` is fetched by the ROW, not here: one batched call fills every
 // card at once (see loadStateThumbs). Until it lands the card shows whatever art
 // it would otherwise have had, so the row never flashes empty.
+// One pill treatment per cover. The platform chip flips to a light scrim when
+// its own logo is dark (PlatformIcon reports the tone; see its onTone effect),
+// and every other corner badge follows it — a white platform chip sitting
+// beside black region/disc/flag chips on the same cover reads as two unrelated
+// systems rather than one set of badges.
+function coverPill(dark: boolean) {
+  return {
+    background: dark ? 'rgba(255,255,255,0.82)' : 'rgba(0,0,0,0.78)',
+    border: dark ? '1px solid rgba(0,0,0,0.18)' : '1px solid rgba(255,255,255,0.12)',
+    color: dark ? 'rgba(0,0,0,0.82)' : V2.fg,
+  };
+}
+// Semantic accents restated for the light pill: V2.warning and V2.success are
+// picked to carry on a dark scrim and both wash out on the white one.
+const pillWarning = (dark: boolean) => (dark ? '#b45309' : V2.warning);
+const pillSuccess = (dark: boolean) => (dark ? '#15803d' : V2.success);
+
 const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef, index, onFocusIdx, focusable, resume, stateThumb }:
   { game: LibGame; onOpen: (g: LibGame) => void; onActiveCover: (uri: string | null) => void; focusRef?: React.Ref<any>; index?: number; onFocusIdx?: (i: number) => void; focusable?: boolean; resume?: boolean; stateThumb?: string | null }) {
   const wide = !!game.screenshot || !!stateThumb;
@@ -1669,13 +1686,12 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
           <div style={{
             position: 'absolute', top: '7px', right: '7px', zIndex: 2,
             padding: '3px', borderRadius: '50%',
-            background: iconDark ? 'rgba(255,255,255,0.82)' : 'rgba(0,0,0,0.78)',
-            border: iconDark ? '1px solid rgba(0,0,0,0.18)' : '1px solid rgba(255,255,255,0.12)',
+            ...coverPill(iconDark),
             lineHeight: 0, transition: 'background 0.2s ease, border-color 0.2s ease',
           }}>
             <div style={{
               width: '22px', height: '22px', display: 'flex',
-              alignItems: 'center', justifyContent: 'center', color: V2.fg,
+              alignItems: 'center', justifyContent: 'center', color: 'inherit',
             }}>
               <PlatformIcon slug={game.platform_slug} size={22} onTone={setIconDark} />
             </div>
@@ -1699,8 +1715,9 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             position: 'absolute', left: '7px', top: '7px', zIndex: 2,
             display: 'inline-flex', alignItems: 'center', gap: '4px',
             padding: '2px 6px', borderRadius: V2.radiusPill, fontSize: '10px', fontWeight: 600,
-            background: 'rgba(0,0,0,0.78)', border: '1px solid rgba(255,255,255,0.12)', color: V2.fg,
-            opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
+            ...coverPill(iconDark),
+            opacity: focused ? 0 : 1,
+            transition: 'opacity 0.18s ease, background 0.2s ease, border-color 0.2s ease',
           }}>
             <FaGlobe size={9} />{game.region_count}
           </div>
@@ -1724,13 +1741,16 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             position: 'absolute', left: '7px', top: '7px', zIndex: 2,
             display: 'inline-flex', alignItems: 'center', gap: '5px',
             padding: '2px 6px', borderRadius: V2.radiusPill, fontSize: '10px', fontWeight: 600,
-            background: 'rgba(0,0,0,0.78)', border: `1px solid ${V2.warning}`, color: V2.warning,
-            opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
+            ...coverPill(iconDark),
+            // Keeps its warning tone, restated for whichever scrim it landed on.
+            border: `1px solid ${pillWarning(iconDark)}`, color: pillWarning(iconDark),
+            opacity: focused ? 0 : 1,
+            transition: 'opacity 0.18s ease, background 0.2s ease, border-color 0.2s ease',
           }}>
             {dl && (
               <span style={{
                 width: '7px', height: '7px', borderRadius: '50%',
-                background: V2.success, flexShrink: 0,
+                background: pillSuccess(iconDark), flexShrink: 0,
               }} />
             )}
             <FaUnlink size={9} />
@@ -1746,8 +1766,9 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             position: 'absolute', left: '7px', bottom: '7px', zIndex: 2,
             display: 'inline-flex', alignItems: 'center', gap: '4px',
             padding: '2px 6px', borderRadius: V2.radiusPill, fontSize: '10px', fontWeight: 600,
-            background: 'rgba(0,0,0,0.78)', border: '1px solid rgba(255,255,255,0.12)', color: V2.fg,
-            opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
+            ...coverPill(iconDark),
+            opacity: focused ? 0 : 1,
+            transition: 'opacity 0.18s ease, background 0.2s ease, border-color 0.2s ease',
           }}>
             {discsAreRegion
               ? <><FaGlobe size={9} />{discs.length || game.disc_count || ''}</>
@@ -1779,8 +1800,8 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
                     display: 'inline-flex', alignItems: 'center', gap: '2px',
                     padding: '2px 5px', borderRadius: V2.radiusPill,
                     fontSize: '10px', lineHeight: 1.2, whiteSpace: 'nowrap',
-                    background: 'rgba(0,0,0,0.78)',
-                    border: '1px solid rgba(255,255,255,0.12)', color: V2.fg,
+                    ...coverPill(iconDark),
+                    transition: 'background 0.2s ease, border-color 0.2s ease',
                   }}>
                   {vals!.slice(0, 3).map((v) => <span key={v}>{toEmoji(v)}</span>)}
                 </div>
