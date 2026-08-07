@@ -4370,13 +4370,76 @@ const FETCH_TOAST_MAX_MS = 30 * 60 * 1000;
 function LibraryFetchToastBody() {
   const st = useServiceStatus();
   const prog = st?.library_progress;
+  // Per-platform walk: name the platform and count within it, with the
+  // library-wide position alongside. Both numbers are required — the platform
+  // bar alone is nearly useless on a lopsided library (one platform is 79% of
+  // the measured one, so it would read "1 of 13" for most of the sync), and the
+  // library counter alone is the bare number this work exists to replace.
+  // Fixed box. The toast sizes itself to its content, so without this every
+  // digit the counter gains and every platform name of a different length
+  // resizes the whole notification — it visibly jitters for the entire fetch.
+  // A fixed width plus two fixed single-line rows makes the frame constant and
+  // lets only the glyphs inside it change.
+  const box = (rows: React.ReactNode) => (
+    <span style={{
+      display: 'block', width: '210px',
+      // Proportional digits are individually different widths, so a counter
+      // rendered in them shuffles sideways as it climbs even inside a fixed box.
+      fontVariantNumeric: 'tabular-nums',
+    }}>{rows}</span>
+  );
+  const line = (content: React.ReactNode, extra?: React.CSSProperties) => (
+    <span style={{
+      display: 'block', whiteSpace: 'nowrap', overflow: 'hidden',
+      textOverflow: 'ellipsis', ...extra,
+    }}>{content}</span>
+  );
+
+  if (prog?.platform_name && prog?.platform_total > 0) {
+    const pl = (prog.platform_loaded ?? 0).toLocaleString();
+    const pt = prog.platform_total.toLocaleString();
+    // Name on its own line so a long one ("Super Nintendo Entertainment
+    // System") ellipsises instead of wrapping and changing the toast's HEIGHT
+    // — the same jitter in the other axis.
+    return box(<>
+      {line(prog.platform_name)}
+      {line(<>{`${pl} of ${pt}`}
+        <span style={{ opacity: 0.6 }}>{`  ·  ${prog.platform_index}/${prog.platform_count}`}</span>
+      </>)}
+    </>);
+  }
   if (prog?.total > 0) {
-    return <>{`${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} games`}</>;
+    return box(line(`${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} games`));
   }
   // Before the first page lands there's no total to divide by, and the fetch is
   // dismissed the instant progress clears — so this covers the opening seconds
   // and the single frame between the last page and the dismiss.
-  return <>Fetching from RomM…</>;
+  return box(line('Fetching from RomM…'));
+}
+
+// The toast's logo slot, live. `logo` is snapshotted at push time exactly like
+// every other toast option, so a static icon would freeze on whichever platform
+// happened to be current when the toast was raised. It is a ReactNode rendered
+// inside the host's own tree though, so the same self-subscribing trick that
+// keeps the body counting keeps the icon in step with the platform.
+function LibraryFetchToastLogo() {
+  const st = useServiceStatus();
+  const slug = st?.library_progress?.platform_slug;
+  if (!slug) return null;
+  return (
+    // Explicit pixel box, like ToastCover's img. PlatformIcon renders at
+    // width/height 100%, so it has no size of its own — and the logo slot is
+    // `flex: none` with no width, so a percentage there resolves against
+    // nothing and the artwork renders at its natural size, stretching the whole
+    // toast. Wider than tall because platform art is mostly wordmarks;
+    // objectFit: contain does the rest.
+    <div style={{
+      width: '52px', height: '32px', flex: 'none',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <PlatformIcon slug={slug} size={28} />
+    </div>
+  );
 }
 
 const checkForNotifications = async () => {
@@ -4425,8 +4488,13 @@ const checkForNotifications = async () => {
         // pure noise — only a fetch long enough to be worth narrating gets one.
         if (!_fetchToast && _fetchSamples >= 2) {
           _fetchToast = toaster.toast({
-            title: 'Loading your library…',
+            // A scoped walk is an update, not a load — the library is already
+            // on screen and only the platforms that moved are being re-read.
+            // Snapshotted at push time like the rest of the toast, which is
+            // fine: a walk doesn't change kind halfway through.
+            title: fetching.platform_name ? 'Updating your library…' : 'Loading your library…',
             body: <LibraryFetchToastBody />,
+            logo: <LibraryFetchToastLogo />,
             duration: FETCH_TOAST_MAX_MS,
             // Silent: this one announces a wait the user didn't ask about, and
             // it can fire on any cold start. The completion toast keeps its chime.
@@ -4461,6 +4529,24 @@ const checkForNotifications = async () => {
             duration: 6000,
             onClick: () => { try { Navigation.Navigate('/romm-sync-library'); } catch { /* ignore */ } },
           });
+        } else if (ann.kind === 'updated') {
+          // A reconcile ran on connect and changed something. Names the
+          // platforms, because "your library changed" while a banner counts
+          // through 17,000 c64 ROMs is exactly the moment the user wants to
+          // know WHICH platform is being read and why.
+          const bits: string[] = [];
+          if (ann.added) bits.push(`${ann.added.toLocaleString()} added`);
+          if (ann.removed) bits.push(`${ann.removed.toLocaleString()} removed`);
+          const where = (ann.platforms || []).length
+            ? ` in ${(ann.platforms as string[]).slice(0, 3).join(', ')}`
+            + ((ann.platforms.length > 3) ? ` +${ann.platforms.length - 3} more` : '')
+            : '';
+          toaster.toast({
+            title: 'Library updated',
+            body: `${bits.join(', ') || 'Synced'}${where}`,
+            duration: 6000,
+            onClick: () => { try { Navigation.Navigate('/romm-sync-library'); } catch { /* ignore */ } },
+          });
         } else {
           toaster.toast({
             title: "Couldn't load your library",
@@ -4469,7 +4555,13 @@ const checkForNotifications = async () => {
             onClick: () => { try { Navigation.Navigate('/romm-sync-settings'); } catch { /* ignore */ } },
           });
         }
+        // Released after the ack, not latched for the session: 'updated' is
+        // repeatable, and a permanent latch would let the first announcement
+        // silence every later one. The ack has cleared the backend's copy by
+        // here, so the next poll has nothing to re-toast. Released even when
+        // the ack fails, or a single failed round trip would mute it for good.
         try { await ackLibraryAnnouncement(); } catch { /* retried next load */ }
+        finally { _annShown = false; }
       }
     } catch { /* transient */ }
 
@@ -6319,7 +6411,19 @@ function OfflineBanner({ status }: { status: any }) {
     // null until a fetch has succeeded once.
     const firstRun = !status?.snapshot_fetched_at;
     const meanwhile = firstRun ? '' : ' — you can play your downloaded games meanwhile';
-    if (prog?.total > 0) {
+    if (prog?.platform_name && prog?.platform_total > 0) {
+      // A scoped walk — reconciliation re-reading the platforms that actually
+      // changed, not the library. The banner used to report only the raw
+      // counter, so a 17,000-ROM c64 walk looked identical to a full fetch of
+      // a library that size and gave no hint why it was happening. The toast
+      // has carried platform_name/index all along; this is the same payload.
+      title = 'Updating your library…';
+      detail = `${prog.platform_name} — `
+        + `${(prog.platform_loaded ?? 0).toLocaleString()} of `
+        + `${prog.platform_total.toLocaleString()}`
+        + (prog.platform_count > 1 ? ` · platform ${prog.platform_index} of ${prog.platform_count}` : '')
+        + `${meanwhile}.`;
+    } else if (prog?.total > 0) {
       title = 'Loading your library…';
       detail = `${(prog.loaded ?? 0).toLocaleString()} of ${prog.total.toLocaleString()} games${meanwhile}.`;
     } else {
