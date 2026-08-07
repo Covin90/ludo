@@ -13,7 +13,7 @@ import subprocess
 import shutil
 import os
 import ctypes
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -156,7 +156,13 @@ resume_file = CONFIG_DIR / 'library_resume.ndjson'
 # so replaying them under the new one would mix two orderings — the exact case
 # _resume_begin's docstring warns about, which the total/page_size checks cannot
 # catch because neither of those moved.
-RESUME_SCHEMA = 2
+#
+# Bumped to 3 when the full walk went per platform. Offsets restart at zero for
+# every platform now, so an offset alone no longer identifies a page: a v2
+# checkpoint replayed under v3 keying would serve the first platform's rows to
+# every platform. Neither the total nor the page_size check would catch it —
+# both are unchanged by the switch.
+RESUME_SCHEMA = 3
 # Same 24h bound Argosy puts on its sync-resume generation: past that, the
 # library has probably moved on and replaying stale pages is worse than refetching.
 RESUME_TTL_SECONDS = 24 * 3600
@@ -581,6 +587,23 @@ class Plugin:
     # Timestamp for efficient polling with updated_after parameter
     _last_full_fetch_time: str = None  # ISO 8601 datetime of last full data fetch
 
+    # Set while a library fetch/refresh owns the library, so a second one can be
+    # turned away instead of interleaving with it. Two refresh buttons already
+    # existed with only per-component busy state between them, and the automatic
+    # trigger below makes the collision routine rather than theoretical.
+    _library_busy: bool = False
+
+    # Per-platform server ROM counts as of the last time we walked each platform,
+    # {platform_id: ungrouped count}. The reconciliation baseline: a platform
+    # whose /api/platforms rom_count no longer matches its entry here has changed
+    # since we last read it — in either direction — and is re-walked.
+    #
+    # Deliberately NOT compared against local entry counts. Grouping collapses
+    # regional variants (see _library_server_total), so a local count can never
+    # be held against a server count; server-vs-server is the only comparison
+    # that means anything, and it needs no arithmetic to correct for grouping.
+    _library_platform_totals: dict = None
+
     # ISO 8601 fetched_at of the data currently in memory, sourced either from the
     # persisted snapshot (cold start) or the last live fetch. Drives the "library
     # from N ago" copy in the offline banner. None until hydrated/fetched.
@@ -996,11 +1019,17 @@ class Plugin:
     def _resume_begin(self, total, page_size):
         """Open a checkpoint for a fetch about to start, replaying any usable one.
 
-        Returns {offset: rows} for pages an interrupted attempt already fetched.
-        A checkpoint is only reused when it describes the same server, the same
-        ROM count and the same page size — if any of those moved, the offsets no
-        longer point at the same rows and replaying them would silently build a
-        library out of two different servers or two different orderings.
+        Returns {(platform_id, offset): rows} for pages an interrupted attempt
+        already fetched. A checkpoint is only reused when it describes the same
+        server, the same ROM count and the same page size — if any of those
+        moved, the offsets no longer point at the same rows and replaying them
+        would silently build a library out of two different servers or two
+        different orderings.
+
+        The key is a pair because the walk is per platform and offsets restart
+        at zero for each one. `platform_id` is None for pages from a flat walk
+        (an incremental fetch, or the fallback when /api/platforms is unusable),
+        which keeps the two kinds of page from ever matching each other.
         """
         url = self._settings.get('RomM', 'url') if self._settings else ''
         resumed = {}
@@ -1031,7 +1060,7 @@ class Plugin:
                                              f"the {len(resumed)} complete pages")
                                 break
                             if isinstance(page.get('rows'), list):
-                                resumed[page['offset']] = page['rows']
+                                resumed[(page.get('platform'), page['offset'])] = page['rows']
                     if resumed:
                         logging.info(f"Resuming fetch: {len(resumed)} of "
                                      f"{-(-total // page_size)} pages already on disk")
@@ -1056,12 +1085,17 @@ class Plugin:
             self._resume_handle = None
         return {}
 
-    def _resume_write_page(self, offset, rows):
-        """Append one fetched page. Called from the fetch's worker threads."""
+    def _resume_write_page(self, offset, rows, platform_id=None):
+        """Append one fetched page. Called from the fetch's worker threads.
+
+        platform_id is None for a flat walk; the pair (platform, offset) is what
+        identifies the page on replay.
+        """
         handle = self._resume_handle
         if not handle:
             return
-        line = json.dumps({'offset': offset, 'rows': rows}, separators=(',', ':')) + '\n'
+        line = json.dumps({'platform': platform_id, 'offset': offset, 'rows': rows},
+                          separators=(',', ':')) + '\n'
         with self._resume_lock:
             handle.write(line)
             # Flushed per page: an unflushed buffer is exactly what a suspend or
@@ -4242,8 +4276,13 @@ class Plugin:
         would re-toast at the worst moments.
         """
         try:
+            # 'ready'/'failed' are once per device and latch. 'updated' reports a
+            # reconcile that just changed the library and must be able to fire
+            # again next time something changes — latching it would silence
+            # every future one.
+            latching = (self._announce_library or {}).get('kind') != 'updated'
             self._announce_library = None
-            if self._settings:
+            if self._settings and latching:
                 self._settings.set('UI', 'library_announced', 'true')
             return {'success': True}
         except Exception as e:
@@ -5421,6 +5460,11 @@ class Plugin:
             'has_cover':     bool(g.get('cover_path') or g.get('path_cover_small')),
             'platform_slug': g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug'),
         }
+        # Only set when true: the frontend caches serialized games in
+        # localStorage, and an always-present false on every row is pure weight
+        # across a library this size.
+        if g.get('is_orphan'):
+            s['is_orphan'] = True
         if g.get('is_multi_disc'):
             s['is_multi_disc'] = True
             s['disc_count'] = g.get('disc_count', 0)
@@ -6056,7 +6100,7 @@ class Plugin:
     async def get_plugin_logo(self):
         """Return the plugin's bundled logo as a base64 data URI + raw base64.
 
-        Used by the frontend to paint custom artwork on the optional 'RomM'
+        Used by the frontend to paint custom artwork on the optional 'Ludo'
         Steam library shortcut (SteamClient.SetCustomArtworkForApp wants raw
         base64, while <img> wants a data URI).
         """
@@ -6076,7 +6120,7 @@ class Plugin:
 
         Keys are Steam's eAppArtworkAssetType values:
             0 grid (portrait), 1 hero, 2 logo (transparent), 3 header, 4 icon.
-        The frontend paints these onto the optional 'RomM' library shortcut via
+        The frontend paints these onto the optional 'Ludo' library shortcut via
         SetCustomArtworkForApp. PNGs are pre-rendered (scripts/gen_romm_artwork.py)
         and bundled, so no SVG/PIL work happens at runtime.
         """
@@ -6141,7 +6185,7 @@ class Plugin:
 
     async def set_steam_tile(self, enabled: bool, exe: str = '', start_dir: str = '',
                              launch_options: str = ''):
-        """Add or remove the RomM tile in Steam's shortcuts.vdf.
+        """Add or remove the Ludo tile in Steam's shortcuts.vdf.
 
         `exe`/`start_dir`/`launch_options` describe how to relaunch THIS shell and
         come from the Electron main process (window.__rommDesktop.launchSpec) —
@@ -7581,7 +7625,7 @@ class Plugin:
 
         On gamescope the Steam overlay only renders over a game Steam itself
         launched. So instead of spawning the emulator from the Decky daemon, the
-        frontend triggers SteamClient.Apps.RunGame on the "RomM" tile, whose exe
+        frontend triggers SteamClient.Apps.RunGame on the "Ludo" tile, whose exe
         is bin/romm-session-host. This method does everything launch_game does
         *except* the final spawn: it runs the pre-launch save-sync and resolves
         the exact argv, then writes it to the spec file the host reads and execs.
